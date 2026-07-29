@@ -33,7 +33,8 @@ def _ssh(ssh_host: str, cmd: str, timeout: int = 60) -> subprocess.CompletedProc
 
 def _in_container(ssh_host: str, container: str, user: str, repo_path: str, cmd: str,
                   timeout: int = 600) -> subprocess.CompletedProcess:
-    inner = f"docker exec {container} sudo -u {user} bash -lc {shlex.quote(cmd)}"
+    user_prefix = f"sudo -u {user} " if user and user != "root" else ""
+    inner = f"docker exec {container} {user_prefix}bash -lc {shlex.quote(cmd)}"
     return _ssh(ssh_host, inner, timeout=timeout)
 
 

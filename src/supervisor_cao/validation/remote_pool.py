@@ -43,8 +43,10 @@ def _ssh(ssh_host: str, cmd: str, timeout: int = 60) -> subprocess.CompletedProc
 def _remote_repo_cmd(ssh_host: str, user: str, repo_path: str, container: str,
                      git_cmd: str, timeout: int = 60) -> subprocess.CompletedProcess:
     """Run a git command inside the container as the validation user."""
-    # docker exec <container> sudo -u <user> git -C <repo> <cmd>
-    inner = f"docker exec {container} sudo -u {user} git -C {shlex.quote(repo_path)} {git_cmd}"
+    # docker exec <container> [sudo -u <user>] git -C <repo> <cmd>
+    # skip sudo when user is root (containers may not have sudo, and root runs as root)
+    user_prefix = f"sudo -u {user} " if user and user != "root" else ""
+    inner = f"docker exec {container} {user_prefix}git -C {shlex.quote(repo_path)} {git_cmd}"
     return _ssh(ssh_host, inner, timeout=timeout)
 
 
@@ -103,7 +105,7 @@ def acquire_lock(ssh_host: str, container: str, task_id: str, candidate_sha: str
 
 def release_lock(ssh_host: str, container: str) -> bool:
     lock_file = f"/tmp/scao-{container}.lock"
-    r = _ssh(ssh_host, f"rm -f {lock_file} && echo RELEASED", timeout=10)
+    r = _ssh(ssh_host, f"rm -f {lock_file} && echo RELEASED", timeout=25)
     return r.returncode == 0 and "RELEASED" in r.stdout
 
 
