@@ -42,6 +42,38 @@ Deterministic policy layer (state machine, budgets, SHA, locks, sync gates)
 Platform stops at `READY_FOR_HUMAN_REVIEW`. No auto-merge. No base-branch
 changes. No force push.
 
+### Verification results
+
+| Test | Result |
+|------|--------|
+| Unit tests (state machine, budget, schemas, SHA, locks, windows sync, config, secret scan) | 51 passed |
+| Integration tests (planner, executor fix, verifier fail, stale, budget, pool, windows blocked, happy path) | 10 passed |
+| E2E (temp-repo full flow: state + budget + worktree + commit + push + verify + review + draft PR + windows sync) | 13/13 passed |
+| Stability (10 consecutive E2E runs) | 10/10 passed |
+| Supervisor benchmark (GLM 5.2 + Qwen 3.7 Max) | both 4/4, Qwen primary (faster) |
+| pandas read-only smoke | 3 PASS (config, origin/dev, Windows repo dirty-detect) |
+| `supervisor-cao doctor` | CAO/OpenCode/Codex/uv/tmux/projects/pinned-SHA all ✓ |
+| Secret scan (pre-push) | clean, no private files tracked |
+
+### Known limitations
+
+- **kpserver SSH not configured**: remote validation pool (2 containers, conda,
+  pool locks) is `LIMITATION`. The deterministic `remote_pool.py` and
+  `run-verification` scripts are implemented and unit-tested, but the live SSH
+  alias must be configured in `~/.ssh/config` to reach the 920B pool.
+- **WSL2 network restricted**: iKuuuVPN TUN hijacks DNS (fake-ip) and blocks
+  direct github/pypi. CAO was installed offline via a local wheelhouse
+  (`uv tool install --offline --find-links`). `supervisor-cao upgrade` requires
+  network or a refreshed wheelhouse.
+- **Codex CLI on Windows path**: Codex CLI (`codex.exe`) lives in the Codex
+  Desktop install dir. Set `CODEX_BIN` env var to its path, or symlink it.
+- **CAO OpenCode provider experimental**: multi-agent callback uses inbox
+  polling fallback (CAO issues #203/#115). Long-task message delivery and
+  recovery need live CAO multi-agent testing before unattended runs.
+- **Supervisor benchmark is a capability probe**: full CAO `handoff`/`assign`/
+  `send_message` multi-agent testing requires a live `cao-server` + worker
+  sessions, not just `opencode run`.
+
 ## Quick start
 
 ```bash
