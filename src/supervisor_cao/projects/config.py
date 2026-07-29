@@ -17,7 +17,7 @@ from typing import Any
 
 import yaml
 
-REPO_CONFIG_DIR = Path(__file__).resolve().parents[2] / "config" / "examples"
+REPO_CONFIG_DIR = Path(__file__).resolve().parents[3] / "config" / "examples"
 LOCAL_CONFIG_DIR = Path.home() / ".config" / "supervisor-cao" / "projects"
 
 
