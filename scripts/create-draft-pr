@@ -69,7 +69,7 @@ def build_pr_body(task_id: str, plan_summary: str, baseline_sha: str, candidate_
         *[f"- `{p}`" for p in artifact_paths],
         "",
         "### Known risks",
-        *[f"- {r}" for r in known_risks] if known_risks else ["- (none identified)"],
+        *([f"- {r}" for r in known_risks] if known_risks else ["- (none identified)"]),
         "",
         "---",
         "_This is a Draft PR. Not marked Ready for Review. Do not auto-merge._",

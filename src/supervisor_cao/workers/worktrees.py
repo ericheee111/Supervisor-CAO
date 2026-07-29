@@ -78,7 +78,12 @@ def add_executor_worktree(main_repo: str, project: str, task_id: str) -> Path:
     """Create the writable executor worktree on agent/<task-id>. Idempotent."""
     p = paths_for(project, task_id)
     if p.executor.exists() and (p.executor / ".git").exists():
-        return p.executor
+        # validate the worktree is still functional (not a stale reference)
+        r = _run(["git", "-C", str(p.executor), "rev-parse", "--git-dir"], check=False)
+        if r.returncode == 0:
+            return p.executor
+        # stale: prune and recreate
+        _run(["git", "-C", main_repo, "worktree", "prune"], check=False)
     p.executor.mkdir(parents=True, exist_ok=True)
     branch = f"agent/{task_id}"
     _run(["git", "-C", main_repo, "worktree", "add", str(p.executor), branch], check=False)
