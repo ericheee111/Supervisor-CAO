@@ -59,7 +59,7 @@ def up():
 @cli.command()
 def down():
     """Stop the platform: shutdown all CAO tmux sessions."""
-    rc, out = _wsl_run("cao shutdown --all 2>&1 || true")
+    rc, out = _wsl_run("timeout 10 cao shutdown --all 2>&1 || true", timeout=15)
     click.echo(out.strip() or "cao sessions stopped")
 
 
@@ -71,7 +71,7 @@ def doctor():
     rc, out = _wsl_run("cao --version 2>&1")
     checks.append(("CAO", "ok" if rc == 0 else "MISSING", out.strip().splitlines()[0] if out.strip() else ""))
     # cao-server
-    rc2, out2 = _wsl_run("curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9889/health 2>/dev/null || echo DOWN")
+    rc2, out2 = _wsl_run("curl -s --max-time 3 -o /dev/null -w '%{http_code}' http://127.0.0.1:9889/health 2>/dev/null || echo DOWN", timeout=10)
     checks.append(("cao-server", "ok" if "200" in out2 else "down", out2.strip()))
     # OpenCode
     rc3, out3 = _wsl_run("opencode --version 2>&1")
@@ -123,7 +123,7 @@ def run(project, task_file):
 @cli.command()
 def status():
     """Show platform status: cao-server, sessions, tasks."""
-    rc, out = _wsl_run("curl -s http://127.0.0.1:9889/health 2>/dev/null || echo DOWN")
+    rc, out = _wsl_run("curl -s --max-time 3 http://127.0.0.1:9889/health 2>/dev/null || echo DOWN", timeout=10)
     click.echo(f"cao-server: {'UP' if 'ok' in out.lower() or '200' in out else 'DOWN'}")
     store = StateStore()
     tasks = store.list()
