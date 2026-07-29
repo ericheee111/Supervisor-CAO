@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""Supervisor model selection benchmark (spec §10).
+
+Tests GLM 5.2 and Qwen 3.7 Max on the same scenarios via `opencode run`:
+  1. minimal conversation
+  2. JSON output compliance
+  3. SHA understanding (given a SHA, echo it back exactly)
+  4. tool-call awareness (does it know it can't bypass gates)
+
+Outputs ~/cao-runs/setup/supervisor-benchmark.json with scores and a
+primary/backup recommendation. This is a capability probe, not a full CAO
+handoff/assign test (which requires a live CAO server + multi-agent sessions).
+"""
+from __future__ import annotations
+
+import json
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+MODELS = {
+    "glm-5.2": "zhipuai/glm-5.2",
+    "qwen-3.7-max": "alibaba-cn/qwen3.7-max",
+}
+
+OUT_DIR = Path.home() / "cao-runs" / "setup"
+
+
+def opencode_run(model: str, prompt: str, timeout: int = 90) -> tuple[bool, str, float]:
+    """Run opencode run --model <model> <prompt>. Returns (ok, output, elapsed)."""
+    t0 = time.time()
+    try:
+        r = subprocess.run(
+            ["opencode", "run", "--model", model, prompt],
+            capture_output=True, text=True, timeout=timeout, cwd="/tmp",
+        )
+        elapsed = time.time() - t0
+        out = r.stdout + r.stderr
+        # strip ANSI
+        out = re.sub(r"\x1b\[[0-9;]*m", "", out)
+        return r.returncode == 0, out, elapsed
+    except Exception as e:
+        return False, str(e), time.time() - t0
+
+
+def test_minimal(model: str) -> dict:
+    ok, out, t = opencode_run(model, "Reply with exactly: OK")
+    passed = ok and "OK" in out
+    return {"name": "minimal_conversation", "passed": passed, "elapsed_s": round(t, 2),
+            "output_snippet": out[-100:].strip()}
+
+
+def test_json_output(model: str) -> dict:
+    prompt = 'Respond with ONLY valid JSON (no markdown): {"status": "ready", "sha": "abc123"}'
+    ok, out, t = opencode_run(model, prompt)
+    # try to find JSON in output
+    json_ok = False
+    try:
+        m = re.search(r'\{[^}]*"status"[^}]*\}', out)
+        if m:
+            obj = json.loads(m.group(0))
+            json_ok = obj.get("status") == "ready" and obj.get("sha") == "abc123"
+    except Exception:
+        pass
+    return {"name": "json_output", "passed": json_ok, "elapsed_s": round(t, 2),
+            "output_snippet": out[-120:].strip()}
+
+
+def test_sha_fidelity(model: str) -> dict:
+    sha = "4cc40b182d259f8a370ec3f70fb00a0d67b7844d"
+    prompt = f"The candidate SHA is {sha}. Reply with exactly that SHA, nothing else."
+    ok, out, t = opencode_run(model, prompt)
+    passed = ok and sha in out
+    return {"name": "sha_fidelity", "passed": passed, "elapsed_s": round(t, 2),
+            "expected": sha, "output_snippet": out[-100:].strip()}
+
+
+def test_gate_awareness(model: str) -> dict:
+    prompt = ("You are a Supervisor. A worker claims the task passed. "
+              "What must you check before accepting? Reply in one sentence mentioning SHA.")
+    ok, out, t = opencode_run(model, prompt)
+    passed = ok and "sha" in out.lower()
+    return {"name": "gate_awareness", "passed": passed, "elapsed_s": round(t, 2),
+            "output_snippet": out[-150:].strip()}
+
+
+TESTS = [test_minimal, test_json_output, test_sha_fidelity, test_gate_awareness]
+
+
+def main() -> int:
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    results = {"models": {}, "recommendation": {}}
+    scores = {}
+
+    for label, model_id in MODELS.items():
+        print(f"\n=== Testing {label} ({model_id}) ===")
+        model_results = []
+        for test_fn in TESTS:
+            r = test_fn(model_id)
+            model_results.append(r)
+            mark = "✓" if r["passed"] else "✗"
+            print(f"  {mark} {r['name']} ({r['elapsed_s']}s)")
+        passed_count = sum(1 for r in model_results if r["passed"])
+        avg_time = round(sum(r["elapsed_s"] for r in model_results) / len(model_results), 2)
+        scores[label] = passed_count
+        results["models"][label] = {
+            "model_id": model_id,
+            "tests": model_results,
+            "score": passed_count,
+            "total": len(model_results),
+            "avg_latency_s": avg_time,
+        }
+
+    # recommendation: higher score wins; tie -> lower latency
+    glm_score = scores.get("glm-5.2", 0)
+    qwen_score = scores.get("qwen-3.7-max", 0)
+    glm_lat = results["models"].get("glm-5.2", {}).get("avg_latency_s", 999)
+    qwen_lat = results["models"].get("qwen-3.7-max", {}).get("avg_latency_s", 999)
+    if glm_score > qwen_score or (glm_score == qwen_score and glm_lat <= qwen_lat):
+        primary, backup = "glm-5.2", "qwen-3.7-max"
+    else:
+        primary, backup = "qwen-3.7-max", "glm-5.2"
+    results["recommendation"] = {
+        "primary": primary,
+        "primary_model_id": MODELS[primary],
+        "backup": backup,
+        "backup_model_id": MODELS[backup],
+        "rationale": f"{primary} score={scores[primary]} >= {backup} score={scores[backup]}",
+    }
+    print(f"\n=== Recommendation ===")
+    print(f"  Primary Supervisor: {primary} ({MODELS[primary]})")
+    print(f"  Backup Supervisor:  {backup} ({MODELS[backup]})")
+
+    out_path = OUT_DIR / "supervisor-benchmark.json"
+    out_path.write_text(json.dumps(results, indent=2))
+    print(f"\nReport: {out_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
