@@ -2,7 +2,10 @@
 # supervisor-cao: launcher that runs the Python CLI via the WSL/Python environment.
 # On WSL2, runs the module directly. On Windows, delegates to WSL.
 set -e
-HERE="$(cd "$(dirname "$0")" && pwd)"
+# resolve symlinks so the script works from /usr/local/bin
+SELF="$0"
+while [ -L "$SELF" ]; do SELF="$(readlink -f "$SELF")"; done
+HERE="$(cd "$(dirname "$SELF")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
 export PYTHONPATH="$REPO/src:${PYTHONPATH:-}"
 if [ -n "$WSL_DISTRO_NAME" ] || grep -qi microsoft /proc/version 2>/dev/null; then
