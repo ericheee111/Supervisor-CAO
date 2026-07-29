@@ -88,6 +88,25 @@ supervisor-cao doctor                 # all marks green: CAO 2.3.0, cao-server
                                       # uv 0.8.6, tmux 3.4, pinned SHA matching
 ```
 
+### CAO Web UI (optional)
+
+`cao-server` serves a browser dashboard at `http://localhost:9889` for managing
+sessions, spawning agents, viewing live terminals, and inspecting agent-to-agent
+messages. The pre-built frontend bundle (`web_ui/`) is included in PyPI wheels
+but **not** in git-source or offline installs. If `http://localhost:9889`
+returns `{"detail":"Not Found"}`, build it from source (requires Node.js 18+):
+
+```bash
+cd <cao-source>/web/
+npm install && npm run build          # outputs to ../src/cli_agent_orchestrator/web_ui/
+CAO_INST=$(find ~/.local/share/uv -type d -name cli_agent_orchestrator -path "*site-packages*" | head -1)
+cp -r ../src/cli_agent_orchestrator/web_ui "$CAO_INST/web_ui"
+supervisor-cao down && supervisor-cao up   # restart to serve the UI
+```
+
+Then open `http://localhost:9889` in a browser (WSL2 mirrored networking shares
+localhost with Windows).
+
 ## Offline / restricted-network install
 
 If WSL2 has no direct internet (e.g. a fake-ip VPN hijacks DNS), pre-build a
