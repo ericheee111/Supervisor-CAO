@@ -93,16 +93,16 @@ def main() -> int:
     else:
         check("containers", False, "not configured or SSH unreachable")
 
-    # 6. Conda env + pandas import
+    # 6. Conda env + pandas import (test ALL containers, not just first)
     conda_env = cfg.remote_validation.get("conda_env", "")
     conda_path = cfg.remote_validation.get("conda_path", "/opt/miniforge3")
     user = cfg.remote_validation.get("user", "")
     repo_path = cfg.remote_validation.get("repo_path", "")
     if ssh_host and containers and conda_env:
-        c0 = containers[0]
-        rc, out = _ssh(ssh_host,
-                       f"docker exec {c0} bash -lc 'source {conda_path}/etc/profile.d/conda.sh && conda activate {conda_env} && python --version && python -c \"import pandas; print(pandas.__version__)\"'")
-        check(f"conda {conda_env} + pandas", rc == 0, out.strip()[:80] if rc == 0 else f"unreachable: {out[:80]}")
+        for c in containers:
+            rc, out = _ssh(ssh_host,
+                           f"docker exec {c} bash -lc 'source {conda_path}/etc/profile.d/conda.sh && conda activate {conda_env} && python --version && python -c \"import pandas; print(pandas.__version__)\"'")
+            check(f"conda {conda_env} + pandas ({c})", rc == 0, out.strip()[:80] if rc == 0 else f"unreachable: {out[:80]}")
     else:
         check("conda env", False, "not configured or SSH unreachable")
 

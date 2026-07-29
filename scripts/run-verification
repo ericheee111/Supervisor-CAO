@@ -46,6 +46,8 @@ def main() -> int:
     ap.add_argument("--repo-path", required=True)
     ap.add_argument("--conda-env", required=True)
     ap.add_argument("--conda-path", default="/opt/miniforge3", help="conda installation path")
+    ap.add_argument("--toolchain-enable", default="/opt/rh/gcc-toolset-12/enable",
+                    help="gcc-toolset enable script (sourced AFTER conda activate)")
     ap.add_argument("--candidate-sha", required=True)
     ap.add_argument("--task-id", required=True)
     ap.add_argument("--run-dir", default=None)
@@ -98,16 +100,18 @@ def main() -> int:
                 result["status"] = "STALE_VERIFICATION"
                 result["stale"] = True
 
-    # 4. editable install
+    # 4. editable install (activate conda, THEN gcc-toolset, export CC/CXX)
     install_cmd = (f"cd {args.repo_path} && source {args.conda_path}/etc/profile.d/conda.sh "
-                   f"&& conda activate {args.conda_env} && python -m pip install -e . --no-build-isolation 2>&1")
+                   f"&& conda activate {args.conda_env} && source {args.toolchain_enable} "
+                   f"&& export CC=gcc CXX=g++ && python -m pip install -e . --no-build-isolation 2>&1")
     rr = _in_container(args.ssh_host, args.container, args.user, args.repo_path, install_cmd, timeout=900)
     (run_dir / "install.log").write_text(rr.stdout + rr.stderr)
     result["install_ok"] = rr.returncode == 0
 
     # 5. focused pytest (minimal smoke; full scope from task config)
     pytest_cmd = (f"cd {args.repo_path} && source {args.conda_path}/etc/profile.d/conda.sh "
-                  f"&& conda activate {args.conda_env} && python -m pytest -q 2>&1 | tail -20")
+                  f"&& conda activate {args.conda_env} && source {args.toolchain_enable} "
+                  f"&& export CC=gcc CXX=g++ && python -m pytest -q 2>&1 | tail -20")
     rr = _in_container(args.ssh_host, args.container, args.user, args.repo_path, pytest_cmd, timeout=1800)
     (run_dir / "pytest.log").write_text(rr.stdout + rr.stderr)
     result["pytest_passed"] = rr.returncode == 0
