@@ -59,16 +59,13 @@ changes. No force push.
 
 ### Known limitations
 
-- **kpserver SSH not configured**: remote validation pool (2 containers, conda,
-  pool locks) is `LIMITATION`. The deterministic `remote_pool.py` and
-  `run-verification` scripts are implemented and unit-tested, but the live SSH
-  alias must be configured in `~/.ssh/config` to reach the 920B pool.
-- **WSL2 network restricted**: iKuuuVPN TUN hijacks DNS (fake-ip) and blocks
-  direct github/pypi. CAO was installed offline via a local wheelhouse
-  (`uv tool install --offline --find-links`). `supervisor-cao upgrade` requires
-  network or a refreshed wheelhouse.
-- **Codex CLI on Windows path**: Codex CLI (`codex.exe`) lives in the Codex
-  Desktop install dir. Set `CODEX_BIN` env var to its path, or symlink it.
+- **CAO Web UI not bundled (offline install)**: `http://localhost:9889` returns
+  `{"detail":"Not Found"}` at the root path. The CAO browser Web UI requires a
+  pre-built frontend bundle (`web_ui/`) that is not included in the offline
+  wheelhouse install. The HTTP API (`/health`, `/sessions`, `/agents`, `/events`)
+  and all CLI commands work normally. To get the Web UI: install CAO online
+  (`uv tool install git+...@main --upgrade`) or build the frontend from
+  `web/` with Node.js (`npm install && npm run build`).
 - **CAO OpenCode provider experimental**: multi-agent callback uses inbox
   polling fallback (CAO issues #203/#115). Long-task message delivery and
   recovery need live CAO multi-agent testing before unattended runs.
@@ -185,7 +182,7 @@ OpenCode + GLM/Qwen Supervisor
 
 ### 已知限制
 
-- **WSL2 网络受限**：iKuuuVPN 系统代理模式下网络可用，但 TUN 模式会劫持 DNS（fake-ip）。CAO 已通过离线 wheelhouse 安装（`uv tool install --offline --find-links`）。`supervisor-cao upgrade` 需网络或刷新 wheelhouse。
+- **CAO Web UI 未包含（离线安装）**：`http://localhost:9889` 根路径返回 `{"detail":"Not Found"}`。CAO 浏览器 Web UI 需要预构建的前端 bundle（`web_ui/`），离线 wheelhouse 安装未包含。HTTP API（`/health`、`/sessions`、`/agents`、`/events`）和所有 CLI 命令正常工作。如需 Web UI：在线安装 CAO（`uv tool install git+...@main --upgrade`）或用 Node.js 从 `web/` 构建前端（`npm install && npm run build`）。
 - **CAO OpenCode provider 实验性**：多 Agent callback 使用 inbox polling fallback（CAO issues #203/#115）。长任务消息回传和恢复需真实 CAO 多 Agent 实测后才能无人值守运行。
 - **Supervisor benchmark 是能力探测**：完整 CAO `handoff`/`assign`/`send_message` 多 Agent 测试需要活的 `cao-server` + worker 会话，不仅是 `opencode run`。
 
