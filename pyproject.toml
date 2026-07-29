@@ -1,0 +1,38 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "supervisor-cao"
+version = "0.1.0"
+description = "Generic, safety-first multi-agent software-development platform built on CAO"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+authors = [{ name = "ericheee111" }]
+dependencies = [
+    "click>=8.2.0",
+    "pyyaml>=6.0",
+    "jsonschema>=4.25",
+    "pydantic>=2.10.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+]
+
+[project.scripts]
+supervisor-cao = "supervisor_cao.cli.main:cli"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/supervisor_cao"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

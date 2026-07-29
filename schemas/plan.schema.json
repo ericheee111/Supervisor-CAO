@@ -1,0 +1,101 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://supervisor-cao.local/schemas/plan.schema.json",
+  "title": "Plan",
+  "description": "Validates the Codex Planner output artifact for the Supervisor-CAO platform. A plan enumerates the target files, ordered implementation steps, the test matrix, rollback conditions, and completion criteria. PUBLIC schema: sanitized, contains no secrets, hostnames, or private paths.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "plan_id",
+    "task_id",
+    "target_files",
+    "steps",
+    "test_matrix",
+    "rollback_conditions",
+    "completion_criteria",
+    "prerequisites_verified",
+    "baseline_sha",
+    "model"
+  ],
+  "properties": {
+    "plan_id": {
+      "type": "string",
+      "description": "Stable unique identifier for the plan."
+    },
+    "task_id": {
+      "type": "string",
+      "description": "Identifier of the task this plan addresses."
+    },
+    "target_files": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "List of file paths the plan intends to modify."
+    },
+    "steps": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["description"],
+        "properties": {
+          "description": {
+            "type": "string",
+            "description": "Natural-language description of the step."
+          },
+          "file": {
+            "type": "string",
+            "description": "File path the step touches, when applicable."
+          },
+          "risk_level": {
+            "type": "string",
+            "enum": ["low", "medium", "high"],
+            "description": "Assessed risk level of the step."
+          }
+        }
+      },
+      "description": "Ordered implementation steps produced by the planner."
+    },
+    "test_matrix": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Test selectors or scenarios the executor must run to validate the change."
+    },
+    "rollback_conditions": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Conditions under which the executor should roll back the change."
+    },
+    "completion_criteria": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Criteria that must all be satisfied for the plan to be considered complete."
+    },
+    "risks": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Known risks the planner identified for this plan."
+    },
+    "prerequisites_verified": {
+      "type": "boolean",
+      "description": "Whether the planner verified all prerequisites before emitting the plan."
+    },
+    "baseline_sha": {
+      "type": "string",
+      "description": "Git SHA of the baseline commit the plan is built against."
+    },
+    "model": {
+      "type": "string",
+      "description": "Identifier of the model that produced the plan."
+    }
+  }
+}

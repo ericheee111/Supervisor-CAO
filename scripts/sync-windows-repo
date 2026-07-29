@@ -1,0 +1,63 @@
+#!/usr/bin/env python3
+"""sync-windows-repo: protected Windows repo sync CLI (spec §17).
+
+Only this script may operate on the Windows repo. Fast-forward only.
+Never reset --hard, never overwrite dirty, never force checkout, never
+cherry-pick, never merge dev.
+
+Usage:
+  sync-windows-repo check --windows-repo PATH --task-branch agent/T1 --candidate-sha SHA \
+      [--tested-sha SHA] [--reviewed-sha SHA] [--review-approved] [--draft-pr-created]
+  sync-windows-repo sync --windows-repo PATH --task-branch agent/T1 --candidate-sha SHA \
+      [--tested-sha SHA] [--reviewed-sha SHA] [--review-approved] [--draft-pr-created]
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1] / "src"))
+from supervisor_cao.validation.windows_sync import check_gates, sync, WindowsSyncBlocked  # noqa: E402
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Protected Windows repository sync")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    for name in ("check", "sync"):
+        p = sub.add_parser(name)
+        p.add_argument("--windows-repo", required=True)
+        p.add_argument("--task-branch", required=True)
+        p.add_argument("--candidate-sha", required=True)
+        p.add_argument("--tested-sha", default=None)
+        p.add_argument("--reviewed-sha", default=None)
+        p.add_argument("--review-approved", action="store_true")
+        p.add_argument("--draft-pr-created", action="store_true")
+    args = ap.parse_args()
+
+    if args.cmd == "check":
+        gates = check_gates(args.windows_repo, args.task_branch, args.candidate_sha,
+                            args.tested_sha, args.reviewed_sha,
+                            args.review_approved, args.draft_pr_created)
+        print(json.dumps({
+            "all_pass": gates.all_pass,
+            **{k: v for k, v in gates.__dict__.items()},
+            "status": "READY_TO_SYNC" if gates.all_pass else "WINDOWS_SYNC_BLOCKED",
+        }, indent=2))
+        return 0 if gates.all_pass else 2
+    elif args.cmd == "sync":
+        try:
+            final = sync(args.windows_repo, args.task_branch, args.candidate_sha,
+                         args.tested_sha, args.reviewed_sha,
+                         args.review_approved, args.draft_pr_created)
+            print(json.dumps({"status": "WINDOWS_SYNCED", "windows_head": final,
+                              "matches_candidate": final == args.candidate_sha}))
+            return 0
+        except WindowsSyncBlocked as e:
+            print(json.dumps({"status": "WINDOWS_SYNC_BLOCKED", "error": str(e)}), file=sys.stderr)
+            return 2
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

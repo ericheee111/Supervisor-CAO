@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://supervisor-cao.local/schemas/implementation.schema.json",
+  "title": "Implementation",
+  "description": "Validates the Executor output artifact for the Supervisor-CAO platform. An implementation record captures the candidate commit produced by the executor, the files it changed, the number of iteration rounds, the self-check outcome, and the focused-test summary. PUBLIC schema: sanitized, contains no secrets, hostnames, or private paths.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "task_id",
+    "candidate_sha",
+    "base_sha",
+    "changed_files",
+    "commit_message",
+    "rounds",
+    "self_check_passed",
+    "focused_tests"
+  ],
+  "properties": {
+    "task_id": {
+      "type": "string",
+      "description": "Identifier of the task this implementation fulfills."
+    },
+    "candidate_sha": {
+      "type": "string",
+      "description": "Git SHA of the candidate commit produced by the executor."
+    },
+    "base_sha": {
+      "type": "string",
+      "description": "Git SHA of the base commit the candidate was built on top of."
+    },
+    "changed_files": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "List of file paths changed between base_sha and candidate_sha."
+    },
+    "commit_message": {
+      "type": "string",
+      "description": "Commit message attached to the candidate commit."
+    },
+    "rounds": {
+      "type": "integer",
+      "description": "Number of self-correction rounds the executor performed before emitting this candidate."
+    },
+    "self_check_passed": {
+      "type": "boolean",
+      "description": "Whether the executor's internal self-check passed for the candidate."
+    },
+    "focused_tests": {
+      "type": "object",
+      "description": "Summary of the focused (scoped) test run performed by the executor.",
+      "additionalProperties": false,
+      "required": ["run", "passed", "summary"],
+      "properties": {
+        "run": {
+          "type": "boolean",
+          "description": "Whether the focused test suite was actually executed."
+        },
+        "passed": {
+          "type": "boolean",
+          "description": "Whether the focused test suite passed."
+        },
+        "summary": {
+          "type": "string",
+          "description": "Short human-readable summary of the focused test result."
+        }
+      }
+    }
+  }
+}

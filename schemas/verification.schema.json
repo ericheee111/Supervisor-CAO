@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://supervisor-cao.local/schemas/verification.schema.json",
+  "title": "Verification",
+  "description": "Validates the Verifier output artifact for the Supervisor-CAO platform. A verification record captures whether the candidate passed both local (WSL) and remote (containerized) verification, the environment used, paths to evidence logs, and whether the result is stale. PUBLIC schema: sanitized, contains no secrets, hostnames, or private paths.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "task_id",
+    "candidate_sha",
+    "tested_sha",
+    "passed"
+  ],
+  "properties": {
+    "task_id": {
+      "type": "string",
+      "description": "Identifier of the task being verified."
+    },
+    "candidate_sha": {
+      "type": "string",
+      "description": "Git SHA of the candidate commit submitted for verification."
+    },
+    "tested_sha": {
+      "type": "string",
+      "description": "Git SHA actually built and tested (may differ from candidate_sha if the verifier rebased or amended)."
+    },
+    "passed": {
+      "type": "boolean",
+      "description": "Overall pass/fail verdict for the verification."
+    },
+    "wsl_results": {
+      "type": "object",
+      "description": "Results of the local WSL build and pytest run.",
+      "additionalProperties": false,
+      "required": ["build", "pytest_passed", "summary"],
+      "properties": {
+        "build": {
+          "type": "boolean",
+          "description": "Whether the local build succeeded."
+        },
+        "pytest_passed": {
+          "type": "boolean",
+          "description": "Whether the local pytest run passed."
+        },
+        "summary": {
+          "type": "string",
+          "description": "Short human-readable summary of the local WSL run."
+        }
+      }
+    },
+    "remote_results": {
+      "type": "object",
+      "description": "Results of the remote containerized verification run.",
+      "additionalProperties": false,
+      "required": ["container", "install_ok", "correctness_passed", "summary"],
+      "properties": {
+        "container": {
+          "type": "string",
+          "description": "Identifier of the container image used for the remote run."
+        },
+        "install_ok": {
+          "type": "boolean",
+          "description": "Whether the package installed successfully in the remote container."
+        },
+        "correctness_passed": {
+          "type": "boolean",
+          "description": "Whether the correctness test suite passed in the remote container."
+        },
+        "asv_result": {
+          "type": "object",
+          "description": "Optional ASV (airspeed velocity) benchmark result payload from the remote run.",
+          "additionalProperties": true
+        },
+        "summary": {
+          "type": "string",
+          "description": "Short human-readable summary of the remote run."
+        }
+      }
+    },
+    "environment": {
+      "type": "object",
+      "description": "Description of the verification environment (toolchain, OS, arch, dependency versions).",
+      "additionalProperties": true
+    },
+    "logs": {
+      "type": "object",
+      "description": "Paths to evidence log files produced during verification.",
+      "additionalProperties": false,
+      "properties": {
+        "build_log": {
+          "type": "string",
+          "description": "Path to the build log file."
+        },
+        "pytest_log": {
+          "type": "string",
+          "description": "Path to the pytest log file."
+        },
+        "asv_log": {
+          "type": "string",
+          "description": "Path to the ASV benchmark log file."
+        },
+        "remote_log": {
+          "type": "string",
+          "description": "Path to the remote container run log file."
+        }
+      }
+    },
+    "stale": {
+      "type": "boolean",
+      "default": false,
+      "description": "Whether this verification result is stale (e.g. the baseline moved after the run). Defaults to false."
+    }
+  }
+}

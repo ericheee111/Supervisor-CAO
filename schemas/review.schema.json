@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://supervisor-cao.local/schemas/review.schema.json",
+  "title": "Review",
+  "description": "Validates the Codex Reviewer findings artifact for the Supervisor-CAO platform. A review records the reviewer's decision (APPROVED or CHANGES_REQUESTED) and a structured list of findings, each with severity, category, location, claim, evidence, and a recommended direction. PUBLIC schema: sanitized, contains no secrets, hostnames, or private paths.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "review_id",
+    "task_id",
+    "candidate_sha",
+    "reviewed_sha",
+    "decision",
+    "findings",
+    "summary",
+    "model"
+  ],
+  "properties": {
+    "review_id": {
+      "type": "string",
+      "description": "Stable unique identifier for the review."
+    },
+    "task_id": {
+      "type": "string",
+      "description": "Identifier of the task whose candidate is being reviewed."
+    },
+    "candidate_sha": {
+      "type": "string",
+      "description": "Git SHA of the candidate commit submitted for review."
+    },
+    "reviewed_sha": {
+      "type": "string",
+      "description": "Git SHA actually reviewed (may differ from candidate_sha if the reviewer rebased or checked out a different ref)."
+    },
+    "decision": {
+      "type": "string",
+      "enum": ["APPROVED", "CHANGES_REQUESTED"],
+      "description": "Reviewer's overall decision on the candidate."
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "severity", "category", "file", "claim", "evidence", "recommended_direction"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Stable identifier for the finding, unique within the review."
+          },
+          "severity": {
+            "type": "string",
+            "enum": ["P0", "P1", "P2", "P3"],
+            "description": "Severity of the finding: P0 (blocker) through P3 (nit)."
+          },
+          "category": {
+            "type": "string",
+            "description": "Category of the finding (e.g. 'correctness', 'performance', 'style')."
+          },
+          "file": {
+            "type": "string",
+            "description": "Path of the file the finding concerns."
+          },
+          "line": {
+            "type": "integer",
+            "description": "Line number in the file the finding concerns, when applicable."
+          },
+          "claim": {
+            "type": "string",
+            "description": "Concise statement of the issue the finding raises."
+          },
+          "failure_scenario": {
+            "type": "string",
+            "description": "Concrete scenario under which this finding could cause a failure, when applicable."
+          },
+          "evidence": {
+            "type": "string",
+            "description": "Evidence supporting the finding (e.g. quoted code, log excerpt, test output)."
+          },
+          "recommended_direction": {
+            "type": "string",
+            "description": "Suggested direction for resolving the finding (not a prescriptive patch)."
+          }
+        }
+      },
+      "description": "Structured list of review findings."
+    },
+    "summary": {
+      "type": "string",
+      "description": "Short human-readable summary of the review."
+    },
+    "model": {
+      "type": "string",
+      "description": "Identifier of the model that produced the review."
+    }
+  }
+}

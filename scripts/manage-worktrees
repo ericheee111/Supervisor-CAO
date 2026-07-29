@@ -1,0 +1,83 @@
+#!/usr/bin/env python3
+"""manage-worktrees: CLI wrapper for worktree lifecycle (spec §12).
+
+Usage:
+  manage-worktrees create --main-repo PATH --project pandas --task-id T1
+  manage-worktrees add-readonly --main-repo PATH --project pandas --task-id T1 --role verifier [--sha SHA]
+  manage-worktrees clean --main-repo PATH --project pandas --task-id T1
+  manage-worktrees current-sha --repo PATH
+  manage-worktrees commit-push --repo PATH --branch agent/T1 --message "..."
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1] / "src"))
+from supervisor_cao.workers.worktrees import (  # noqa: E402
+    add_executor_worktree, add_readonly_worktree, create_task_branch,
+    current_sha, commit_and_push, remove_worktrees, fetch_main,
+)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Supervisor-CAO worktree manager")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p_create = sub.add_parser("create", help="create task branch + executor worktree")
+    p_create.add_argument("--main-repo", required=True)
+    p_create.add_argument("--project", required=True)
+    p_create.add_argument("--task-id", required=True)
+    p_create.add_argument("--base-branch", default="dev")
+
+    p_ro = sub.add_parser("add-readonly", help="add verifier/reviewer worktree")
+    p_ro.add_argument("--main-repo", required=True)
+    p_ro.add_argument("--project", required=True)
+    p_ro.add_argument("--task-id", required=True)
+    p_ro.add_argument("--role", required=True, choices=["verifier", "reviewer"])
+    p_ro.add_argument("--sha", default=None)
+
+    p_clean = sub.add_parser("clean", help="remove worktrees for a task")
+    p_clean.add_argument("--main-repo", required=True)
+    p_clean.add_argument("--project", required=True)
+    p_clean.add_argument("--task-id", required=True)
+
+    p_sha = sub.add_parser("current-sha", help="print HEAD sha of a repo")
+    p_sha.add_argument("--repo", required=True)
+
+    p_cp = sub.add_parser("commit-push", help="commit all + push branch (no force)")
+    p_cp.add_argument("--repo", required=True)
+    p_cp.add_argument("--branch", required=True)
+    p_cp.add_argument("--message", required=True)
+
+    p_fetch = sub.add_parser("fetch", help="fetch origin, print base sha")
+    p_fetch.add_argument("--main-repo", required=True)
+    p_fetch.add_argument("--base-branch", default="dev")
+
+    args = ap.parse_args()
+    try:
+        if args.cmd == "create":
+            sha = create_task_branch(args.main_repo, args.task_id, args.base_branch)
+            wt = add_executor_worktree(args.main_repo, args.project, args.task_id)
+            print(f"branch=agent/{args.task_id} sha={sha} executor={wt}")
+        elif args.cmd == "add-readonly":
+            wt = add_readonly_worktree(args.main_repo, args.project, args.task_id, args.role, args.sha)
+            print(f"{args.role}={wt}")
+        elif args.cmd == "clean":
+            remove_worktrees(args.project, args.task_id, args.main_repo)
+            print("cleaned")
+        elif args.cmd == "current-sha":
+            print(current_sha(args.repo))
+        elif args.cmd == "commit-push":
+            sha = commit_and_push(args.repo, args.branch, args.message)
+            print(f"sha={sha}")
+        elif args.cmd == "fetch":
+            print(fetch_main(args.main_repo, args.base_branch))
+    except Exception as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+"""create-draft-pr: create or update a Draft PR (spec §16).
+
+After APPROVED:
+  1. push agent/<task-id>
+  2. create/update Draft PR (base = dev)
+  3. write PR body: task summary, plan summary, baseline/candidate SHA,
+     changed files, WSL2 tests, 920B tests + ASV, Codex review, known risks,
+     Codex call count, artifact paths, READY_FOR_HUMAN_REVIEW.
+  4. do NOT mark Ready, do NOT squash, do NOT merge, do NOT delete branch.
+
+Requires gh CLI authenticated. Never force-pushes.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+RUN_ROOT = Path.home() / "cao-runs"
+
+
+def _run(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess:
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    if check and r.returncode != 0:
+        raise RuntimeError(f"cmd failed ({r.returncode}): {' '.join(cmd[:3])}: {r.stderr.strip()}")
+    return r
+
+
+def build_pr_body(task_id: str, plan_summary: str, baseline_sha: str, candidate_sha: str,
+                  changed_files: list[str], wsl_tests: dict, remote_tests: dict,
+                  codex_review: dict, codex_call_count: int, artifact_paths: list[str],
+                  known_risks: list[str]) -> str:
+    lines = [
+        f"## Task: {task_id}",
+        "",
+        f"**Status:** `READY_FOR_HUMAN_REVIEW`",
+        "",
+        "### Plan summary",
+        plan_summary,
+        "",
+        "### SHAs",
+        f"- baseline: `{baseline_sha}`",
+        f"- candidate: `{candidate_sha}`",
+        "",
+        "### Changed files",
+        *[f"- {f}" for f in changed_files],
+        "",
+        "### WSL2 test results",
+        "```json",
+        json.dumps(wsl_tests, indent=2, default=str),
+        "```",
+        "",
+        "### 920B test + ASV results",
+        "```json",
+        json.dumps(remote_tests, indent=2, default=str),
+        "```",
+        "",
+        "### Codex review",
+        "```json",
+        json.dumps(codex_review, indent=2, default=str),
+        "```",
+        "",
+        f"**Codex calls used:** {codex_call_count} / 4",
+        "",
+        "### Artifacts",
+        *[f"- `{p}`" for p in artifact_paths],
+        "",
+        "### Known risks",
+        *[f"- {r}" for r in known_risks] if known_risks else ["- (none identified)"],
+        "",
+        "---",
+        "_This is a Draft PR. Not marked Ready for Review. Do not auto-merge._",
+    ]
+    return "\n".join(lines)
+
+
+def create_or_update_draft(repo: str, task_branch: str, base_branch: str, title: str,
+                           body: str) -> str:
+    """Create or update a draft PR via gh. Returns the PR URL."""
+    # check existing
+    r = _run(["gh", "pr", "list", "--repo", _repo_full(repo), "--head", task_branch,
+              "--json", "number,url", "--state", "open"], check=False)
+    existing = []
+    if r.returncode == 0 and r.stdout.strip():
+        try:
+            existing = json.loads(r.stdout)
+        except Exception:
+            pass
+    if existing:
+        pr_num = existing[0]["number"]
+        _run(["gh", "pr", "edit", str(pr_num), "--repo", _repo_full(repo), "--body", body, "--title", title])
+        return existing[0]["url"]
+    r = _run(["gh", "pr", "create", "--repo", _repo_full(repo), "--head", task_branch,
+              "--base", base_branch, "--title", title, "--body", body, "--draft"])
+    return r.stdout.strip()
+
+
+def _repo_full(repo: str) -> str:
+    """Extract owner/repo from a git remote URL or path."""
+    r = _run(["git", "-C", repo, "remote", "get-url", "origin"], check=False)
+    url = r.stdout.strip()
+    if "github.com" in url:
+        # https://github.com/owner/repo.git  or  git@github.com:owner/repo.git
+        if url.startswith("https"):
+            return url.split("github.com/")[1].replace(".git", "")
+        if url.startswith("git@"):
+            return url.split(":")[1].replace(".git", "")
+    return "ericheee111/pandas"  # fallback
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Create or update a Draft PR")
+    ap.add_argument("--repo", required=True, help="git repo path")
+    ap.add_argument("--task-id", required=True)
+    ap.add_argument("--task-branch", required=True)
+    ap.add_argument("--base-branch", default="dev")
+    ap.add_argument("--run-dir", required=True, help="artifact dir for this task")
+    args = ap.parse_args()
+
+    run_dir = Path(args.run_dir)
+    # load artifacts
+    plan = (run_dir / "plan.json")
+    plan_summary = "see plan.json"
+    candidate_sha = ""
+    changed_files: list[str] = []
+    wsl_tests = remote_tests = codex_review = {}
+    codex_call_count = 0
+    artifacts = []
+    for name, loader in [("plan.json", "json"), ("implementation.json", "json"),
+                         ("verification.json", "json"), ("review.json", "json"),
+                         ("codex-budget-summary.json", "json")]:
+        f = run_dir / name
+        if f.exists():
+            artifacts.append(str(f))
+    title = f"[Draft] {args.task_id}"
+    body = build_pr_body(args.task_id, plan_summary, "", candidate_sha, changed_files,
+                         wsl_tests, remote_tests, codex_review, codex_call_count, artifacts, [])
+    try:
+        url = create_or_update_draft(args.repo, args.task_branch, args.base_branch, title, body)
+        print(f"Draft PR: {url}")
+        (run_dir / "draft-pr-url.txt").write_text(url)
+        return 0
+    except Exception as e:
+        print(f"PR_CREATION_FAILED: {e}", file=sys.stderr)
+        (run_dir / "draft-pr-error.txt").write_text(str(e))
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

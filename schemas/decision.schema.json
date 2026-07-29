@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://supervisor-cao.local/schemas/decision.schema.json",
+  "title": "Decision",
+  "description": "Validates the Codex Judge arbitration artifact for the Supervisor-CAO platform. A decision records the judge's ruling on a disputed review finding: uphold, overturn, or modify, along with the rationale, evidence cited, and whether new evidence was introduced. PUBLIC schema: sanitized, contains no secrets, hostnames, or private paths.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "decision_id",
+    "task_id",
+    "dispute_id",
+    "candidate_sha",
+    "ruling",
+    "rationale",
+    "evidence_cited",
+    "new_evidence_present",
+    "model"
+  ],
+  "properties": {
+    "decision_id": {
+      "type": "string",
+      "description": "Stable unique identifier for the decision."
+    },
+    "task_id": {
+      "type": "string",
+      "description": "Identifier of the task whose dispute is being arbitrated."
+    },
+    "dispute_id": {
+      "type": "string",
+      "description": "Identifier of the dispute being arbitrated."
+    },
+    "candidate_sha": {
+      "type": "string",
+      "description": "Git SHA of the candidate commit under dispute."
+    },
+    "ruling": {
+      "type": "string",
+      "enum": ["uphold_finding", "overturn_finding", "modify_finding"],
+      "description": "The judge's ruling on the disputed finding."
+    },
+    "rationale": {
+      "type": "string",
+      "description": "The judge's rationale for the ruling."
+    },
+    "evidence_cited": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "List of evidence references (e.g. log paths, finding ids, code excerpts) cited in support of the ruling."
+    },
+    "new_evidence_present": {
+      "type": "boolean",
+      "description": "Whether the judge introduced new evidence not previously available to the reviewer or executor."
+    },
+    "model": {
+      "type": "string",
+      "description": "Identifier of the model that produced the decision."
+    }
+  }
+}

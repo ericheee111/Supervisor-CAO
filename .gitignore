@@ -1,0 +1,78 @@
+# ===================================================================
+# Supervisor-CAO .gitignore
+# Public repository. NEVER commit secrets, internal hosts, containers,
+# usernames, private paths, or private requirement docs.
+# ===================================================================
+
+# --- Private requirement / design docs (local only) ---
+*.private.md
+Supervisor-CAO项目设计方案.private.md
+Supervisor-CAO项目设计方案.md
+
+# --- Local config and state (live in ~/.config/supervisor-cao) ---
+*.local.yaml
+*.local.yml
+*.local.json
+secrets.env
+.env
+.env.*
+models.local.yaml
+config/local/*
+!config/local/.gitkeep
+
+# --- Runtime state and logs ---
+cao-runs/
+runs/
+logs/
+state/
+*.log
+*.pid
+*.lock
+*.db
+*.sqlite
+*.sqlite3
+*.sqlite-shm
+*.sqlite-wal
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- Credentials and provider state ---
+credentials/
+auth/
+auth.json
+opencode.jsonc
+oh-my-openagent.json
+config.toml
+.opencode/
+.codex/
+
+# --- Local caches used during bootstrap (offline wheelhouse, CAO source) ---
+.cache/
+cao-src/
+wheels/
+*.tar.gz
+*.whl
+*.zip
+.doh_*
+.scao_*
+.install_cao.sh
+
+# --- Virtualenvs ---
+.venv/
+venv/
+
+# --- Editor / OS ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*~

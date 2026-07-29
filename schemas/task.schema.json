@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://supervisor-cao.local/schemas/task.schema.json",
+  "title": "Task",
+  "description": "Validates a task description artifact exchanged between agents in the Supervisor-CAO platform. A task declares the work to be performed, its baseline, and the acceptance criteria the result must satisfy. PUBLIC schema: sanitized, contains no secrets, hostnames, or private paths.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["task_id", "project", "description"],
+  "properties": {
+    "task_id": {
+      "type": "string",
+      "description": "Stable unique identifier for the task."
+    },
+    "project": {
+      "type": "string",
+      "description": "Project the task belongs to."
+    },
+    "description": {
+      "type": "string",
+      "description": "Natural-language description of the work to be performed."
+    },
+    "baseline_sha": {
+      "type": "string",
+      "description": "Git SHA of the baseline (reference) commit the task is measured against."
+    },
+    "benchmark_selector": {
+      "type": "string",
+      "description": "Selector expression identifying the benchmark subset to run."
+    },
+    "performance_acceptance": {
+      "type": "object",
+      "description": "Performance acceptance criterion the candidate must satisfy.",
+      "additionalProperties": false,
+      "required": ["threshold", "direction"],
+      "properties": {
+        "threshold": {
+          "type": "number",
+          "description": "Numeric threshold value against which the measured metric is compared."
+        },
+        "direction": {
+          "type": "string",
+          "enum": ["lower_better", "higher_better"],
+          "description": "Interpretation of the metric: 'lower_better' means values <= threshold pass; 'higher_better' means values >= threshold pass."
+        }
+      }
+    },
+    "regression_threshold": {
+      "type": "number",
+      "description": "Maximum tolerated performance regression relative to baseline, expressed as a fraction (e.g. 0.05 for 5%)."
+    },
+    "required_test_scope": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "List of test scope selectors (e.g. module paths or markers) that must be exercised."
+    },
+    "base_branch": {
+      "type": "string",
+      "default": "dev",
+      "description": "Base branch the task branch is created from. Defaults to 'dev'."
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO-8601 timestamp marking when the task was created."
+    }
+  }
+}

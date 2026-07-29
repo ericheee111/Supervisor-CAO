@@ -1,0 +1,60 @@
+# pandas project example configuration (PUBLIC, sanitized).
+# Real hosts, container names, usernames and paths go in the private
+# ~/.config/supervisor-cao/projects/pandas.local.yaml (never committed).
+# Placeholders below MUST be filled by the local config at runtime.
+name: pandas
+base_branch: dev
+task_branch_prefix: agent/
+
+# WSL Linux filesystem path for the agent's clone. Real value is private.
+wsl_repo: "~/projects/pandas"
+# Windows repository path (private). Platform sync script reads it from local config.
+windows_repo: "<WINDOWS_REPO_PATH>"
+
+# Project-default verification rules (spec §13). Task-level overrides may
+# tighten but must provide: baseline_sha, benchmark selector, acceptance
+# threshold, regression threshold, test scope.
+default_verification:
+  wsl_quick:
+    build: true
+    focused_pytest: true
+    candidate_sha_check: true
+  remote_pool:
+    editable_install: true
+    correctness_tests: true
+    asv: true
+    log_collection: true
+  report:
+    structured: true
+
+# Remote validation pool (private details in local config). Sanitized here.
+remote_validation:
+  ssh_host: "<SSH_HOST>"
+  containers: ["<CONTAINER_A>", "<CONTAINER_B>"]
+  user: "<REMOTE_USER>"
+  repo_path: "<REMOTE_REPOSITORY_PATH>"
+  conda_env: "<CONDA_ENVIRONMENT>"
+
+# Executor loop limits (spec §12).
+executor_limits:
+  max_rounds: 8
+  max_no_progress_rounds: 2
+  push_every_valid_candidate: true
+  require_clean_worktree: true
+  require_commit: true
+
+# Codex budget per task (spec §8). Enforced in code, not by the Supervisor.
+codex_budget:
+  max_calls_per_task: 4
+  planner: 1
+  full_review: 1
+  incremental_review: 1
+  judge: 1
+
+# Task-level overrides MUST supply (no guessing allowed, spec §13):
+#   baseline_sha: <SHA>
+#   benchmark_selector: <asv selector>
+#   performance_acceptance: <threshold>
+#   regression_threshold: <max regression>
+#   required_test_scope: <list>
+# Missing critical performance params -> NEEDS_HUMAN.

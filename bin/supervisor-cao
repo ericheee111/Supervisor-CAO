@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# supervisor-cao: launcher that runs the Python CLI via the WSL/Python environment.
+# On WSL2, runs the module directly. On Windows, delegates to WSL.
+set -e
+HERE="$(cd "$(dirname "$0")" && pwd)"
+REPO="$(cd "$HERE/.." && pwd)"
+if [ -n "$WSL_DISTRO_NAME" ] || grep -qi microsoft /proc/version 2>/dev/null; then
+    # we are in WSL
+    exec python3 -m supervisor_cao.cli.main "$@"
+else
+    # Windows host: delegate to WSL, forwarding the repo path
+    WSL_REPO=$(wslpath -a "$REPO" 2>/dev/null || echo "$REPO")
+    exec wsl.exe -d Ubuntu-24.04 bash -lc "cd '$WSL_REPO' && PYTHONPATH='$WSL_REPO/src' python3 -m supervisor_cao.cli.main $*"
+fi

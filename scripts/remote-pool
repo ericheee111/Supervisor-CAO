@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+"""remote-pool: CLI for the 920B validation pool (spec §14).
+
+Deterministic pool management. Supervisor only reads these return values:
+  AVAILABLE / BUSY / UNHEALTHY / DIRTY / UNREACHABLE
+
+Usage:
+  remote-pool status --ssh-host H --containers C1,C2 --user U --repo-path P
+  remote-pool acquire --ssh-host H --container C --task-id T [--candidate-sha SHA]
+  remote-pool release --ssh-host H --container C
+  remote-pool select --ssh-host H --containers C1,C2 --user U --repo-path P
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1] / "src"))
+from supervisor_cao.validation.remote_pool import (  # noqa: E402
+    pool_status, acquire_lock, release_lock, select_available,
+)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="920B validation pool manager")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p_st = sub.add_parser("status")
+    p_st.add_argument("--ssh-host", required=True)
+    p_st.add_argument("--containers", required=True, help="comma-separated")
+    p_st.add_argument("--user", required=True)
+    p_st.add_argument("--repo-path", required=True)
+
+    p_acq = sub.add_parser("acquire")
+    p_acq.add_argument("--ssh-host", required=True)
+    p_acq.add_argument("--container", required=True)
+    p_acq.add_argument("--task-id", required=True)
+    p_acq.add_argument("--candidate-sha", default=None)
+
+    p_rel = sub.add_parser("release")
+    p_rel.add_argument("--ssh-host", required=True)
+    p_rel.add_argument("--container", required=True)
+
+    p_sel = sub.add_parser("select")
+    p_sel.add_argument("--ssh-host", required=True)
+    p_sel.add_argument("--containers", required=True)
+    p_sel.add_argument("--user", required=True)
+    p_sel.add_argument("--repo-path", required=True)
+
+    args = ap.parse_args()
+    if args.cmd == "status":
+        states = pool_status(args.ssh_host, args.containers.split(","), args.user, args.repo_path)
+        print(json.dumps([{"name": s.name, "status": s.status, "locked_by": s.locked_by,
+                           "detail": s.detail} for s in states], indent=2))
+    elif args.cmd == "acquire":
+        ok = acquire_lock(args.ssh_host, args.container, args.task_id, args.candidate_sha)
+        print(json.dumps({"acquired": ok, "container": args.container, "task_id": args.task_id}))
+        return 0 if ok else 1
+    elif args.cmd == "release":
+        ok = release_lock(args.ssh_host, args.container)
+        print(json.dumps({"released": ok, "container": args.container}))
+        return 0 if ok else 1
+    elif args.cmd == "select":
+        states = pool_status(args.ssh_host, args.containers.split(","), args.user, args.repo_path)
+        chosen = select_available(states)
+        print(json.dumps({"selected": chosen.name if chosen else None,
+                          "statuses": [{"name": s.name, "status": s.status} for s in states]}))
+        return 0 if chosen else 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

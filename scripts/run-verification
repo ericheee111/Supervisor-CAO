@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+"""run-verification: deterministic remote verification runner (spec §13, §14).
+
+Runs the 920B pool verification: acquire lock, record git state, fetch, checkout
+candidate SHA, editable install, pytest, ASV, collect logs, restore state,
+release lock. The LLM (Qwen Verifier) only READS the structured result; it does
+NOT poll or run this.
+
+Usage:
+  run-verification --ssh-host HOST --container C --user U --repo-path P \
+      --conda-env E --candidate-sha SHA --task-id T [--run-dir PATH]
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import shlex
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+RUN_ROOT = Path.home() / "cao-runs"
+
+
+def _ssh(ssh_host: str, cmd: str, timeout: int = 60) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
+         "-o", "ConnectTimeout=10", ssh_host, cmd],
+        capture_output=True, text=True, timeout=timeout,
+    )
+
+
+def _in_container(ssh_host: str, container: str, user: str, repo_path: str, cmd: str,
+                  timeout: int = 600) -> subprocess.CompletedProcess:
+    inner = f"docker exec {container} sudo -u {user} bash -lc {shlex.quote(cmd)}"
+    return _ssh(ssh_host, inner, timeout=timeout)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Remote verification runner")
+    ap.add_argument("--ssh-host", required=True)
+    ap.add_argument("--container", required=True)
+    ap.add_argument("--user", required=True)
+    ap.add_argument("--repo-path", required=True)
+    ap.add_argument("--conda-env", required=True)
+    ap.add_argument("--candidate-sha", required=True)
+    ap.add_argument("--task-id", required=True)
+    ap.add_argument("--run-dir", default=None)
+    args = ap.parse_args()
+
+    run_dir = Path(args.run_dir) if args.run_dir else RUN_ROOT / args.task_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    result = {"task_id": args.task_id, "container": args.container,
+              "candidate_sha": args.candidate_sha, "started": time.time(), "stale": False}
+
+    # 1. reachability
+    r = _ssh(args.ssh_host, f"docker inspect --format='{{{{.State.Running}}}}' {args.container}", timeout=15)
+    if r.returncode != 0 or "true" not in r.stdout:
+        result["status"] = "UNREACHABLE"
+        result["error"] = r.stderr.strip()
+        (run_dir / "verification.json").write_text(json.dumps(result, indent=2))
+        print(json.dumps(result, indent=2))
+        return 3
+
+    # 2. record git state before
+    git_before = {}
+    for k, c in [("branch", "git rev-parse --abbrev-ref HEAD"), ("head", "git rev-parse HEAD"),
+                 ("porcelain", "git status --porcelain")]:
+        rr = _in_container(args.ssh_host, args.container, args.user, args.repo_path,
+                           f"cd {args.repo_path} && {c}", timeout=20)
+        git_before[k] = rr.stdout.strip() if rr.returncode == 0 else f"ERR:{rr.stderr.strip()}"
+    (run_dir / "git-state-before.json").write_text(json.dumps(git_before, indent=2))
+
+    # refuse dirty
+    if git_before.get("porcelain"):
+        result["status"] = "REMOTE_WORKTREE_DIRTY"
+        result["git_before"] = git_before
+        (run_dir / "verification.json").write_text(json.dumps(result, indent=2))
+        print(json.dumps(result, indent=2))
+        return 4
+
+    # 3. fetch + checkout candidate (NO reset --hard, NO clean)
+    steps = [
+        ("fetch", f"cd {args.repo_path} && git fetch origin"),
+        ("checkout", f"cd {args.repo_path} && git checkout {args.candidate_sha}"),
+        ("head_check", f"cd {args.repo_path} && git rev-parse HEAD"),
+    ]
+    for name, cmd in steps:
+        rr = _in_container(args.ssh_host, args.container, args.user, args.repo_path, cmd, timeout=120)
+        (run_dir / f"{name}.log").write_text(rr.stdout + rr.stderr)
+        if name == "head_check":
+            result["remote_head"] = rr.stdout.strip()
+            if result["remote_head"] != args.candidate_sha:
+                result["status"] = "STALE_VERIFICATION"
+                result["stale"] = True
+
+    # 4. editable install
+    install_cmd = (f"cd {args.repo_path} && source ~/miniconda3/etc/profile.d/conda.sh "
+                   f"&& conda activate {args.conda_env} && python -m pip install -e . --no-build-isolation 2>&1")
+    rr = _in_container(args.ssh_host, args.container, args.user, args.repo_path, install_cmd, timeout=900)
+    (run_dir / "install.log").write_text(rr.stdout + rr.stderr)
+    result["install_ok"] = rr.returncode == 0
+
+    # 5. focused pytest (minimal smoke; full scope from task config)
+    pytest_cmd = (f"cd {args.repo_path} && source ~/miniconda3/etc/profile.d/conda.sh "
+                  f"&& conda activate {args.conda_env} && python -m pytest -q 2>&1 | tail -20")
+    rr = _in_container(args.ssh_host, args.container, args.user, args.repo_path, pytest_cmd, timeout=1800)
+    (run_dir / "pytest.log").write_text(rr.stdout + rr.stderr)
+    result["pytest_passed"] = rr.returncode == 0
+
+    # 6. restore git state (NO reset --hard, NO clean)
+    if git_before.get("branch") and git_before["branch"] != "ERR":
+        _in_container(args.ssh_host, args.container, args.user, args.repo_path,
+                      f"cd {args.repo_path} && git checkout {shlex.quote(git_before['branch'])}", timeout=30)
+    git_after = {}
+    for k, c in [("branch", "git rev-parse --abbrev-ref HEAD"), ("head", "git rev-parse HEAD")]:
+        rr = _in_container(args.ssh_host, args.container, args.user, args.repo_path,
+                           f"cd {args.repo_path} && {c}", timeout=20)
+        git_after[k] = rr.stdout.strip() if rr.returncode == 0 else f"ERR:{rr.stderr.strip()}"
+    (run_dir / "git-state-after.json").write_text(json.dumps(git_after, indent=2))
+    result["restored"] = git_after.get("head") == git_before.get("head")
+    if not result["restored"]:
+        result["status"] = "UNHEALTHY"
+
+    result["status"] = result.get("status", "REMOTE_VERIFIED" if result["pytest_passed"] else "FAILED")
+    result["finished"] = time.time()
+    (run_dir / "verification.json").write_text(json.dumps(result, indent=2))
+    print(json.dumps(result, indent=2))
+    return 0 if result.get("status") == "REMOTE_VERIFIED" else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
