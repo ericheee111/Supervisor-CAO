@@ -56,13 +56,13 @@ def check_reachable(ssh_host: str) -> bool:
 def container_status(ssh_host: str, container: str, user: str, repo_path: str) -> ContainerState:
     """Inspect a single container: lock + worktree cleanliness."""
     # reachability
-    r = _ssh(ssh_host, f"docker inspect --format='{{{{.State.Running}}}}' {container}", timeout=15)
+    r = _ssh(ssh_host, f"docker inspect --format='{{{{.State.Running}}}}' {container}", timeout=25)
     if r.returncode != 0 or "true" not in r.stdout:
         return ContainerState(name=container, status="UNREACHABLE", detail=r.stderr.strip())
 
     # lock check (remote flock via a lock file)
     lock_file = f"/tmp/scao-{container}.lock"
-    r = _ssh(ssh_host, f"test -f {lock_file} && cat {lock_file} || echo FREE", timeout=10)
+    r = _ssh(ssh_host, f"test -f {lock_file} && cat {lock_file} || echo FREE", timeout=20)
     out = r.stdout.strip()
     if out and out != "FREE":
         try:
@@ -97,7 +97,7 @@ def acquire_lock(ssh_host: str, container: str, task_id: str, candidate_sha: str
     # atomic create: fail if exists
     r = _ssh(ssh_host,
              f"(set -o noclobber; echo '{info}' > {lock_file}) 2>/dev/null && echo ACQUIRED || echo TAKEN",
-             timeout=10)
+             timeout=20)
     return r.returncode == 0 and "ACQUIRED" in r.stdout
 
 

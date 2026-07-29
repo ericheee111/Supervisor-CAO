@@ -44,6 +44,7 @@ def main() -> int:
     ap.add_argument("--user", required=True)
     ap.add_argument("--repo-path", required=True)
     ap.add_argument("--conda-env", required=True)
+    ap.add_argument("--conda-path", default="/opt/miniforge3", help="conda installation path")
     ap.add_argument("--candidate-sha", required=True)
     ap.add_argument("--task-id", required=True)
     ap.add_argument("--run-dir", default=None)
@@ -97,14 +98,14 @@ def main() -> int:
                 result["stale"] = True
 
     # 4. editable install
-    install_cmd = (f"cd {args.repo_path} && source ~/miniconda3/etc/profile.d/conda.sh "
+    install_cmd = (f"cd {args.repo_path} && source {args.conda_path}/etc/profile.d/conda.sh "
                    f"&& conda activate {args.conda_env} && python -m pip install -e . --no-build-isolation 2>&1")
     rr = _in_container(args.ssh_host, args.container, args.user, args.repo_path, install_cmd, timeout=900)
     (run_dir / "install.log").write_text(rr.stdout + rr.stderr)
     result["install_ok"] = rr.returncode == 0
 
     # 5. focused pytest (minimal smoke; full scope from task config)
-    pytest_cmd = (f"cd {args.repo_path} && source ~/miniconda3/etc/profile.d/conda.sh "
+    pytest_cmd = (f"cd {args.repo_path} && source {args.conda_path}/etc/profile.d/conda.sh "
                   f"&& conda activate {args.conda_env} && python -m pytest -q 2>&1 | tail -20")
     rr = _in_container(args.ssh_host, args.container, args.user, args.repo_path, pytest_cmd, timeout=1800)
     (run_dir / "pytest.log").write_text(rr.stdout + rr.stderr)
