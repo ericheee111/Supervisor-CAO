@@ -47,7 +47,13 @@ def cli():
 @cli.command()
 def up():
     """Start the platform: ensure cao-server is running."""
-    rc, out = _wsl_run("cao-server --help >/dev/null 2>&1 && pgrep -f cao-server >/dev/null && echo RUNNING || (nohup cao-server >/tmp/cao-server.log 2>&1 & sleep 2 && echo STARTED)")
+    cao_server_bin = os.environ.get("CAO_SERVER_BIN", "cao-server")
+    rc, out = _wsl_run(
+        f"pgrep -f 'uvicorn|cao.server|cao-server' >/dev/null 2>&1 && curl -s --max-time 2 http://127.0.0.1:9889/health >/dev/null 2>&1 && echo RUNNING || "
+        f"(setsid {cao_server_bin} >/tmp/cao-server.log 2>&1 < /dev/null & disown ; sleep 4 ; "
+        f"curl -s --max-time 2 http://127.0.0.1:9889/health >/dev/null 2>&1 && echo STARTED || echo FAILED)",
+        timeout=20,
+    )
     click.echo(out.strip())
     if "STARTED" in out or "RUNNING" in out:
         click.echo("cao-server up at http://127.0.0.1:9889")
@@ -58,8 +64,8 @@ def up():
 
 @cli.command()
 def down():
-    """Stop the platform: shutdown all CAO tmux sessions."""
-    rc, out = _wsl_run("timeout 10 cao shutdown --all 2>&1 || true", timeout=15)
+    """Stop the platform: shutdown all CAO tmux sessions and cao-server."""
+    rc, out = _wsl_run("timeout 10 cao shutdown --all 2>&1 || true; pkill -f 'cao-server' 2>/dev/null || true; echo STOPPED", timeout=20)
     click.echo(out.strip() or "cao sessions stopped")
 
 

@@ -4,6 +4,7 @@
 set -e
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
+export PYTHONPATH="$REPO/src:${PYTHONPATH:-}"
 if [ -n "$WSL_DISTRO_NAME" ] || grep -qi microsoft /proc/version 2>/dev/null; then
     # we are in WSL
     exec python3 -m supervisor_cao.cli.main "$@"
