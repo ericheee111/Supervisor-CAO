@@ -676,6 +676,9 @@ def _current_branch(repo: str) -> str | None:
 def _branch_pushed(repo: str, branch: str) -> bool:
     """Return True if the local branch HEAD matches its upstream (pushed)."""
     try:
+        # Fetch first so the worktree sees the latest remote refs.
+        subprocess.run(["git", "-C", repo, "fetch", "origin"],
+                       capture_output=True, text=True, timeout=30)
         r = subprocess.run(
             ["git", "-C", repo, "rev-parse", "--verify", f"origin/{branch}"],
             capture_output=True, text=True, timeout=15)
