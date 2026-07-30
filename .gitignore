@@ -24,7 +24,6 @@ config/local/*
 cao-runs/
 runs/
 logs/
-state/
 *.log
 *.pid
 *.lock
