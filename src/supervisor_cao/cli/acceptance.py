@@ -204,6 +204,12 @@ def _make_project_config(repo_dir: str, dirs: dict[str, Path], *,
         task_branch_prefix="acc/",
         wsl_repo=repo_dir,
         default_verification={"local": {"command": local_command}},
+        # Remote validation uses "local" mode: runs the real verification
+        # command directly (no SSH/Docker pool). This is NOT a local_fixture
+        # (simulated) — it runs the real command and reads the real exit code.
+        # The ssh_host="local" signals run_remote to execute locally.
+        remote_validation={"ssh_host": "local", "containers": ["local"],
+                           "user": "", "repo_path": repo_dir},
     )
 
 
@@ -228,16 +234,11 @@ def _build_gateway(dirs: dict[str, Path], cfg, *, test_mode: bool = True):
     store = StateStore(db_path=dirs["state"] / "tasks.db")
     budget = CodexBudget(db_path=dirs["budget"] / "codex.db")
     stages = StageStore(db_path=dirs["state"] / "stages.db")
-    # Build a backend factory that uses local_fixture=True for remote verification
-    # (acceptance has no real remote pool; local tests pass is the evidence).
-    # Local verification still uses the real configured command (exit code authoritative).
-    def backend_factory(cfg, *, local_fixture=False):
-        from supervisor_cao.projects.adapter import ValidationBackend
-        return ValidationBackend(cfg, local_fixture=True)
-    # real CaoClient (no fake); test_mode for draft-PR test URL
+    # real CaoClient (no fake); test_mode for draft-PR test URL.
+    # NO local_fixture — remote verification uses the "local" ssh_host mode
+    # which runs the real verification command (real exit code, not simulated).
     gw = PolicyGateway(state_store=store, budget=budget, stage_store=stages,
-                       test_mode=test_mode, run_root=dirs["runs"],
-                       backend_factory=backend_factory, local_fixture=True)
+                       test_mode=test_mode, run_root=dirs["runs"])
     # inject the acceptance config so run_next_stage uses it
     _inject_config(None, cfg)
     return gw, store, budget, stages

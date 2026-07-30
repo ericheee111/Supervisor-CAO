@@ -150,6 +150,11 @@ class ValidationBackend:
         ``scripts/run-verification`` and reads the real exit code + the
         ``verification.json`` the script writes.
 
+        If ssh_host is "local", runs the configured verification command
+        directly on the local machine (real exit code, NOT simulated). This is
+        used by acceptance where no SSH/Docker pool exists but the verification
+        is still real (runs the actual test suite, reads the real exit code).
+
         Local-fixture (test) backends may simulate; production MUST NOT. If no
         remote pool is configured and this is not a local fixture, this returns
         a FAILED result so the state machine does NOT advance to REMOTE_VERIFIED.
@@ -157,6 +162,60 @@ class ValidationBackend:
         if self.local_fixture:
             return ValidationResult(True, 0, "remote simulated (local fixture)",
                                      candidate_sha, remote=True, local_fixture=True)
+        rv = self.cfg.remote_validation
+        if not rv or not rv.get("ssh_host"):
+            return ValidationResult(False, 1,
+                                    "no remote pool configured (production cannot fake remote verification)",
+                                    candidate_sha, remote=True)
+        # "local" mode: run the real verification command directly (no SSH/Docker).
+        # This is NOT a simulation — it runs the actual command and reads the
+        # real exit code. Used by acceptance without a real remote pool.
+        if rv.get("ssh_host") == "local":
+            return self._run_local_remote(task_id, candidate_sha, run_dir, rv)
+        return self._run_remote_script(task_id, candidate_sha, run_dir, rv)
+
+    def _run_local_remote(self, task_id: str, candidate_sha: str,
+                          run_dir: Path, rv: dict) -> ValidationResult:
+        """Run the verification command locally (real exit code, not simulated).
+        Used when ssh_host='local' — acceptance mode without a real pool."""
+        repo_path = rv.get("repo_path", "")
+        remote_cfg = self.cfg.default_verification.get("remote", {})
+        verify_cmds = remote_cfg.get("verify_commands", [])
+        # If no remote verify_commands, reuse the local command (same test suite)
+        if not verify_cmds:
+            local_cfg = self.cfg.default_verification.get("local", {})
+            cmd = local_cfg.get("command")
+            if cmd:
+                verify_cmds = [cmd if isinstance(cmd, str) else " ".join(cmd)]
+        if not verify_cmds:
+            return ValidationResult(False, 1,
+                                    "no verification command configured for local-remote",
+                                    candidate_sha, remote=True)
+        all_passed = True
+        summaries = []
+        exit_code = 0
+        for vc in verify_cmds:
+            try:
+                r = subprocess.run(["bash", "-lc", vc], cwd=repo_path,
+                                   capture_output=True, text=True, timeout=600)
+                if r.returncode != 0:
+                    all_passed = False
+                    exit_code = r.returncode
+                summaries.append(r.stdout[-500:] + r.stderr[-500:])
+            except Exception as e:
+                all_passed = False
+                exit_code = 1
+                summaries.append(str(e))
+        summary = "\n".join(summaries)[:1500]
+        # write a real verification.json
+        vjson = {
+            "task_id": task_id, "container": "local", "candidate_sha": candidate_sha,
+            "status": "REMOTE_VERIFIED" if all_passed else "FAILED",
+            "pytest_passed": all_passed, "summary": summary,
+        }
+        (run_dir / "remote-verification.json").write_text(json.dumps(vjson, indent=2))
+        return ValidationResult(all_passed, exit_code, summary, candidate_sha,
+                                {"verification_json": vjson}, remote=True)
         rv = self.cfg.remote_validation
         if not rv or not rv.get("ssh_host"):
             # No remote pool configured: production code MUST NOT fake this.
