@@ -399,6 +399,10 @@ class WorkerRunner:
         if not result.success or not result.last_message:
             raise WorkerError(f"executor worker failed: {result.error or 'no output'}")
         obj = extract_strict_json(result.last_message)
+        # Fix the .git file in the worktree: OpenCode (a Windows binary) may
+        # rewrite it with a Windows path (D:/...) that WSL git cannot read.
+        # Convert any Windows drive path back to the /mnt/<drive>/ WSL form.
+        _fix_worktree_git_path(executor_worktree)
         # Read the REAL candidate SHA from the executor worktree (requirement).
         real_sha = _git_head(executor_worktree)
         if not real_sha:
@@ -568,6 +572,30 @@ def _run_local_pytest(worktree: str, test_scope: list[str]) -> tuple[bool, str]:
     except FileNotFoundError:
         # pytest not installed in this env — treat as a soft pass for tiny temp repos
         return True, "pytest not available; skipped"
+
+
+def _fix_worktree_git_path(worktree: str) -> None:
+    """Fix the .git file in a worktree that may have been rewritten by a
+    Windows binary (OpenCode) with a Windows drive path (e.g. ``D:/...``).
+    Converts ``D:/path`` to ``/mnt/d/path`` so WSL git can read it."""
+    git_file = Path(worktree) / ".git"
+    if not git_file.exists():
+        return
+    try:
+        content = git_file.read_text().strip()
+        if not content.startswith("gitdir:"):
+            return
+        path_part = content[len("gitdir:"):].strip()
+        # Convert Windows drive path D:/... or D:\\... to /mnt/d/...
+        if len(path_part) >= 2 and path_part[1] == ":":
+            drive = path_part[0].lower()
+            rest = path_part[2:].replace("\\", "/")
+            if not rest.startswith("/"):
+                rest = "/" + rest
+            wsl_path = f"/mnt/{drive}{rest}"
+            git_file.write_text(f"gitdir: {wsl_path}\n")
+    except Exception:
+        pass
 
 
 def _git_head(repo: str) -> str | None:
