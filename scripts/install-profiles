@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# install-profiles: install all Supervisor-CAO agent profiles into CAO.
+# Idempotent: safe to re-run. Uses `cao install` with the correct provider.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROFILES_DIR="$SCRIPT_DIR/../profiles"
+
+echo "Installing Supervisor-CAO profiles into CAO..."
+
+# OpenCode profiles (GLM/Qwen)
+for profile in supervisor researcher glm-executor qwen-verifier; do
+    f="$PROFILES_DIR/$profile.md"
+    if [[ -f "$f" ]]; then
+        echo "  installing $profile (opencode_cli)..."
+        cao install "$f" --provider opencode_cli 2>&1 | tail -1 || echo "  WARN: $profile install failed (may already exist)"
+    fi
+done
+
+# Codex profiles (Codex CLI)
+for profile in codex-planner codex-reviewer codex-judge; do
+    f="$PROFILES_DIR/$profile.md"
+    if [[ -f "$f" ]]; then
+        echo "  installing $profile (codex)..."
+        cao install "$f" --provider codex 2>&1 | tail -1 || echo "  WARN: $profile install failed (may already exist)"
+    fi
+done
+
+echo "Profile installation complete."
+echo "Installed profiles:"
+cao profile list 2>&1 | grep -iE "supervisor|researcher|executor|verifier|planner|reviewer|judge" || true
