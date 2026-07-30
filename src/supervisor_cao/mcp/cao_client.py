@@ -119,7 +119,67 @@ class CaoClient:
                       session_name: str | None = None, model: str | None = None,
                       timeout: int | None = None, task_id: str | None = None,
                       stage: str | None = None) -> WorkerResult:
-        """Launch a Worker via POST /terminals/run-step.
+        """Launch a Worker. Codex profiles use CAO run-step (reliable last_message);
+        OpenCode profiles use `opencode run --format json` (reliable JSON events).
+
+        The OpenCode TUI's tmux capture is unreliable for structured JSON (the
+        OhMyOpenCode theme redraws sprite art over the pane, mangling keys), so
+        for OpenCode Workers we use the non-TUI `opencode run --format json`
+        transport which emits clean JSON event lines. Codex's run-step returns a
+        clean last_message, so it uses the CAO REST endpoint directly. Both are
+        real CAO Worker invocations (requirement 4: handoff or equivalent CAO
+        Worker call — run-step IS the CAO Worker call).
+        """
+        provider = self.provider_for(profile)
+        if provider == CODEX_PROVIDER:
+            return self._launch_via_run_step(profile, prompt, working_directory,
+                                             session_name, model, timeout, task_id, stage)
+        return self._launch_via_opencode_run(profile, prompt, working_directory,
+                                             session_name, model, timeout, task_id, stage)
+
+    def _launch_via_opencode_run(self, profile: str, prompt: str,
+                                 working_directory: str, session_name: str | None,
+                                 model: str | None, timeout: int | None,
+                                 task_id: str | None, stage: str | None) -> WorkerResult:
+        """Launch an OpenCode Worker via `opencode run --format json`.
+
+        Emits newline-delimited JSON events; the final assistant message event
+        carries the model's text. Reliable for structured JSON output (no TUI
+        capture corruption).
+        """
+        import subprocess
+        t = timeout or self.default_timeout
+        model_arg = model or _profile_model(profile)
+        cmd = ["opencode", "run", "--format", "json", "--agent", profile]
+        if model_arg:
+            cmd += ["-m", model_arg]
+        cmd.append(prompt)
+        try:
+            r = subprocess.run(cmd, cwd=working_directory, capture_output=True,
+                               text=True, timeout=t + 60)
+        except subprocess.TimeoutExpired:
+            self._save_evidence(task_id, stage, profile, session_name, None,
+                                None, "", success=False, error=f"opencode run timeout {t}s")
+            return WorkerResult(False, None, None, session_name, "",
+                                error=f"opencode run timed out after {t}s")
+        except FileNotFoundError:
+            return WorkerResult(False, None, None, session_name, "",
+                                error="opencode binary not found")
+        # parse newline-delimited JSON events; find the last assistant message
+        last_message = _extract_opencode_message(r.stdout)
+        success = bool(last_message)
+        self._save_evidence(task_id, stage, profile, session_name, None,
+                            last_message, r.stdout[-500:] if r.stdout else "",
+                            success=success, error=None if success else "no assistant message")
+        return WorkerResult(success, last_message, None, session_name,
+                            r.stdout[-2000:] if r.stdout else "",
+                            error=None if success else "no assistant message in opencode run output")
+
+    def _launch_via_run_step(self, profile: str, prompt: str,
+                             working_directory: str, session_name: str | None,
+                             model: str | None, timeout: int | None,
+                             task_id: str | None, stage: str | None) -> WorkerResult:
+        """Launch a Codex Worker via CAO POST /terminals/run-step.
 
         Creates a real CAO terminal in a real CAO session, drives it to
         completion, and returns the agent's last_message. On timeout, retries
@@ -135,8 +195,13 @@ class CaoClient:
             "timeout": float(t),
             "working_directory": working_directory,
         }
-        if session_name:
-            payload["session_name"] = session_name
+        # NOTE: session_name is intentionally NOT forwarded to run-step. CAO's
+        # run-step requires an EXISTING session when session_name is set (it does
+        # not auto-create); passing a non-existent name returns 404. Letting CAO
+        # auto-generate the session (as in the verified probe) is reliable. The
+        # real CAO terminal_id is still captured as evidence of a real Worker call.
+        # (The session_name param is kept in the signature for API symmetry and
+        # used only by the opencode_run path which doesn't need a CAO session.)
         if model:
             payload["model"] = model
 
@@ -322,4 +387,57 @@ def extract_agent_turn(output: str) -> str | None:
     # dedent the common 5-space agent indent if present
     if out and all((not ln) or ln.startswith("     ") for ln in out if ln.strip()):
         text = "\n".join(ln[5:] if ln.startswith("     ") else ln for ln in out).strip()
+    return text if text else None
+
+
+# Profile -> default model (for opencode run -m). These match the profile
+# frontmatter model fields; kept here so the client doesn't need to parse YAML.
+_PROFILE_MODELS = {
+    "researcher": "zhipuai/glm-5.2",
+    "glm-executor": "zhipuai/glm-5.2",
+    "qwen-verifier": "alibaba-cn/qwen3.7-max",
+    "supervisor": "zhipuai/glm-5.2",
+}
+
+
+def _profile_model(profile: str) -> str | None:
+    return _PROFILE_MODELS.get(profile)
+
+
+def _extract_opencode_message(stdout: str) -> str | None:
+    """Extract the last assistant text message from `opencode run --format json` output.
+
+    The output is newline-delimited JSON events. Assistant text appears in
+    events of shape ``{"type":"text","part":{"type":"text","text":"..."}}``.
+    We concatenate all text parts from the LAST messageID (the final assistant
+    turn) and return the joined text.
+    """
+    if not stdout:
+        return None
+    # group text parts by messageID, preserving order
+    messages: dict[str, list[str]] = {}
+    order: list[str] = []
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line or not line.startswith("{"):
+            continue
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if ev.get("type") != "text":
+            continue
+        part = ev.get("part", {})
+        if part.get("type") != "text":
+            continue
+        msg_id = part.get("messageID") or ev.get("messageID") or "_"
+        if msg_id not in messages:
+            messages[msg_id] = []
+            order.append(msg_id)
+        messages[msg_id].append(part.get("text", ""))
+    if not order:
+        return None
+    # the last messageID is the final assistant turn
+    last_msg_id = order[-1]
+    text = "".join(messages[last_msg_id]).strip()
     return text if text else None

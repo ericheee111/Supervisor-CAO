@@ -115,6 +115,52 @@ def _find_balanced_json(text: str, start: int = 0) -> tuple[int, int] | None:
     return None
 
 
+def _sanitize_json_control_chars(chunk: str) -> str:
+    """Escape raw control characters (newline, tab, CR) that appear INSIDE JSON
+    string literals. Some Workers (notably Codex) emit literal newlines inside
+    string values (e.g. ``"multiply\\n  works"`` as a real newline), which is
+    invalid JSON. This scans the chunk and replaces control chars inside strings
+    with their escaped forms, leaving structural whitespace untouched.
+    """
+    out: list[str] = []
+    in_str: str | None = None
+    i = 0
+    n = len(chunk)
+    while i < n:
+        c = chunk[i]
+        if in_str:
+            if c == "\\":
+                # escaped char: copy both chars verbatim
+                out.append(chunk[i:i + 2])
+                i += 2
+                continue
+            if c == in_str:
+                in_str = None
+                out.append(c)
+                i += 1
+                continue
+            if c == "\n":
+                out.append("\\n")
+                i += 1
+                continue
+            if c == "\r":
+                out.append("\\r")
+                i += 1
+                continue
+            if c == "\t":
+                out.append("\\t")
+                i += 1
+                continue
+            out.append(c)
+            i += 1
+            continue
+        if c in ('"', "'"):
+            in_str = c
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
 def extract_strict_json(text: str) -> dict:
     """Extract exactly one JSON object from Worker output.
 
@@ -141,15 +187,12 @@ def extract_strict_json(text: str) -> dict:
                 break
             s, e = span
             chunk = cand[s:e]
-            # skip whitespace before this object
-            leading = cand[:s].strip()
-            if leading:
-                # non-JSON content before the object — only allow if it's a
-                # known preamble (e.g. "## Executor result"). We still record
-                # the object but flag trailing content below.
-                pass
+            # Workers may emit raw control chars inside string values (e.g. Codex
+            # wraps "multiply works" as "multiply\n  works" with a literal newline).
+            # Sanitize before parsing so valid-but-malformed JSON is recovered.
+            sanitized = _sanitize_json_control_chars(chunk)
             try:
-                obj = json.loads(chunk)
+                obj = json.loads(sanitized)
                 if isinstance(obj, dict):
                     objects.append((s, e, obj))
             except json.JSONDecodeError:
@@ -163,10 +206,15 @@ def extract_strict_json(text: str) -> dict:
     # Check trailing non-whitespace content after the single object (within the
     # candidate text that produced it).
     cand = candidates[0]
-    trailing = cand[e:].strip()
-    # Allow a trailing ``` fence marker if we extracted from a fenced block with
-    # the closing fence already consumed by the regex.
-    trailing = trailing.replace("```", "").strip()
+    trailing = cand[e:]
+    # Allow known TUI decoration that Workers emit around the JSON: markdown
+    # fences (```), horizontal rules (──, ────, ___), bullet markers (•, ◦),
+    # and the OpenCode/Codex status footer. These are structural chrome, not
+    # a second JSON object or meaningful content.
+    trailing = re.sub(r"```+", " ", trailing)
+    trailing = re.sub(r"[\u2500\u2501_]{2,}", " ", trailing)  # box-drawing rules
+    trailing = re.sub(r"^[•◦]\s*", " ", trailing, flags=re.MULTILINE)
+    trailing = trailing.strip()
     if trailing:
         raise WorkerError(f"non-JSON trailing content after object: {trailing[:120]!r}")
     return obj
