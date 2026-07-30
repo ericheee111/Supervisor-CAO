@@ -324,13 +324,17 @@ class WorkerRunner:
         obj = self._try_extract_json(task_id, stage, profile, prompt,
                                      working_directory, session_name, model,
                                      timeout, candidate_sha)
-        if obj is None:
-            # Retry with a stronger JSON-only prompt
+        # Retry up to 3 times with a stronger JSON-only prompt if the Worker
+        # output has no parseable JSON (intermittent Codex CLI issue).
+        for attempt in range(3):
+            if obj is not None:
+                break
             retry_prompt = (
-                "CRITICAL: Your previous response did not contain a valid JSON "
-                "object. You MUST output ONLY a raw JSON object now. No prose, "
-                "no markdown, no explanation, no code fences. Start with { and "
-                "end with }. Nothing before or after.\n\n" + prompt
+                f"CRITICAL (attempt {attempt+2}): Your previous response did not "
+                "contain a valid JSON object. You MUST output ONLY a raw JSON "
+                "object now. No prose, no markdown, no explanation, no code "
+                "fences. Start with { and end with }. Nothing before or after.\n\n"
+                + prompt
             )
             obj = self._try_extract_json(task_id, stage, profile, retry_prompt,
                                          working_directory, session_name, model,
