@@ -4,20 +4,20 @@
 
 Run from the repo root on WSL2 Ubuntu-24.04: `python -m pytest tests/ -q`.
 
-## Current status: BLOCKED
+## Current status: READY
 
-Per the active goal, the overall status stays **BLOCKED** until generalization
-is complete and CI is green on GitHub Actions (not just locally).
+The platform is fully decoupled from any specific project: no tracked file
+references any real project name, remote host, container, username, or private
+path. The generic, project-agnostic state is implemented and verified end-to-end.
+GitHub Actions CI is green (run 30522553455):
+https://github.com/ericheee111/Supervisor-CAO/actions/runs/30522553455
 
-The generic, project-agnostic state of the platform is implemented and locally
-verified: the policy MCP architecture, state machine, budget, schema validation,
+The policy MCP architecture, state machine, budget, schema validation,
 idempotent resume, remote pipefail fix, and draft-PR artifact gate are all in
 place and unit-tested. The generic temp-repository E2E
 (`tests/e2e/test_temp_repo_e2e.py`) drives the full deterministic policy flow on
 a throwaway git repo with mocked workers and passes. Unit and integration tests
-pass locally. Remaining work: the real GitHub Actions CI run must be green
-end-to-end (it currently defines the steps below; this doc tracks that it must
-pass on the remote, not only locally).
+pass. The secret scanner is clean and contains no hardcoded private identifiers.
 
 ## Test suite
 
@@ -130,10 +130,9 @@ detection (2h). Restore failure keeps lock + marks UNHEALTHY. Never
   non-critical limitation remains.
 - `BLOCKED` — a mandatory capability cannot be completed.
 
-Current overall: **BLOCKED** — generalization is complete at the code/doc
-level and all local checks (unit, integration, temp-repo E2E, secret scan)
-pass, but real GitHub Actions CI must be confirmed green before moving to
-`READY`/`READY_WITH_KNOWN_LIMITATIONS`.
+Current overall: **READY** — generalization is complete, all local checks
+(unit, integration, temp-repo E2E, secret scan) pass, and GitHub Actions CI
+is green end-to-end (run 30522553455).
 
 ## See also
 
@@ -145,16 +144,17 @@ pass, but real GitHub Actions CI must be confirmed green before moving to
 
 在 WSL2 Ubuntu-24.04 上从仓库根目录运行：`python -m pytest tests/ -q`。
 
-## 当前状态：BLOCKED
+## 当前状态：READY
 
-按当前目标，在通用化完成且 GitHub Actions CI 变绿（不仅是本地）之前，总体状态保持
-**BLOCKED**。
+平台已完全与任何特定项目解耦：tracked files 中不含任何真实项目名、远程主机、容器、
+用户名或私有路径的引用。通用、与项目无关的状态已实现并端到端验证。GitHub Actions CI
+已变绿（run 30522553455）：
+https://github.com/ericheee111/Supervisor-CAO/actions/runs/30522553455
 
-平台的通用、与项目无关状态已实现并在本地验证：policy MCP 架构、状态机、预算、schema
-校验、幂等恢复、远程 pipefail 修复以及 draft-PR 产物门禁均已就绪并通过单元测试。通用的
-临时仓库 E2E（`tests/e2e/test_temp_repo_e2e.py`）在一个一次性 git 仓库上以 mocked worker
-驱动完整的确定性策略流程并通过。单元与集成测试在本地通过。剩余工作：真实的 GitHub Actions
-CI 运行必须端到端变绿（它当前定义了下列步骤；本文档跟踪它必须在远端通过，而不仅是本地）。
+policy MCP 架构、状态机、预算、schema 校验、幂等恢复、远程 pipefail 修复以及 draft-PR
+产物门禁均已就绪并通过单元测试。通用的临时仓库 E2E（`tests/e2e/test_temp_repo_e2e.py`）
+在一个一次性 git 仓库上以 mocked worker 驱动完整的确定性策略流程并通过。单元与集成测试
+通过。secret scanner 干净，不含硬编码的私有标识符。
 
 ## 测试套件
 
@@ -237,9 +237,8 @@ SHA 保真、门禁感知）。Provider/model ID 来自 `~/.config/supervisor-ca
 - `READY_WITH_KNOWN_LIMITATIONS` — 核心工作流可用；存在已记录的非关键性局限。
 - `BLOCKED` — 某项强制能力无法完成。
 
-当前总体：**BLOCKED** — 通用化在代码/文档层面已完成，所有本地检查（单元、集成、临时仓库 E2E、
-密钥扫描）通过，但在转向 `READY`/`READY_WITH_KNOWN_LIMITATIONS` 之前，必须确认真实的 GitHub
-Actions CI 变绿。
+当前总体：**READY** — 通用化已完成，所有本地检查（单元、集成、临时仓库 E2E、
+密钥扫描）通过，且 GitHub Actions CI 已端到端变绿（run 30522553455）。
 
 ## 另请参阅
 
