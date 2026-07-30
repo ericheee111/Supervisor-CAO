@@ -321,7 +321,20 @@ class WorkerRunner:
             task_id=task_id, stage=stage)
         if not result.success or not result.last_message:
             raise WorkerError(f"{stage} worker failed: {result.error or 'no output'}")
-        obj = extract_strict_json(result.last_message)
+        try:
+            obj = extract_strict_json(result.last_message)
+        except WorkerError:
+            # If the last_message has no parseable JSON, try the raw terminal
+            # output fallback (the full pane may have the JSON that was
+            # truncated or surrounded by TUI chrome in last_message).
+            if result.terminal_id:
+                fb = self.client._fallback_extract(result.terminal_id)
+                if fb:
+                    obj = extract_strict_json(fb)
+                else:
+                    raise
+            else:
+                raise
         obj = validate_and_stamp(stage, obj, task_id, candidate_sha)
         _save_artifact(task_id, stage, obj, run_root=self._run_root)
         return obj
@@ -399,9 +412,16 @@ class WorkerRunner:
         # is clean. Untracked __pycache__ is handled by .gitignore.
         subprocess.run(["git", "-C", executor_worktree, "checkout", "--", "."],
                        capture_output=True, timeout=30)
-        subprocess.run(["git", "-C", executor_worktree, "clean", "-fd",
-                        "--", "__pycache__", "*.egg-info", ".eggs", "build", "dist"],
-                       capture_output=True, timeout=30)
+        # Remove untracked build artifacts directly (not relying on .gitignore
+        # since the worktree may not have the .gitignore from the main branch).
+        import shutil as _shutil
+        for pattern in ["__pycache__", "*.egg-info", ".eggs", "build", "dist",
+                        ".pytest_cache"]:
+            for p in Path(executor_worktree).rglob(pattern):
+                if p.is_dir():
+                    _shutil.rmtree(p, ignore_errors=True)
+                elif p.is_file():
+                    p.unlink(missing_ok=True)
         # Requirement: worktree must be clean after the run.
         if not _git_porcelain_clean(executor_worktree):
             raise WorkerError("executor: worktree dirty after run (uncommitted changes)")
