@@ -4,11 +4,11 @@
 
 Run from the repo root on WSL2 Ubuntu-24.04: `python -m pytest tests/ -q`.
 
-## Current status: BLOCKED
+## Current status: READY
 
-Main-flow integration is implemented and all main-flow tests pass locally, but
-status stays BLOCKED until the latest GitHub Actions CI run is confirmed green
-(the main-flow changes must pass on the remote, not only locally).
+Main-flow integration is complete and verified. All main-flow tests pass and
+GitHub Actions CI is green (run 30526826061):
+https://github.com/ericheee111/Supervisor-CAO/actions/runs/30526826061
 
 This round fixed the real main-flow integration:
 - `PolicyGateway` now runs worktree creation, local verification, and remote
@@ -143,9 +143,8 @@ detection (2h). Restore failure keeps lock + marks UNHEALTHY. Never
   non-critical limitation remains.
 - `BLOCKED` — a mandatory capability cannot be completed.
 
-Current overall: **BLOCKED** — main-flow integration is implemented and all
-main-flow tests pass locally, but the latest CI run must confirm green before
-moving to READY.
+Current overall: **READY** — main-flow integration is complete, all main-flow
+tests pass, and GitHub Actions CI is green (run 30526826061).
 
 ## See also
 
@@ -157,10 +156,10 @@ moving to READY.
 
 在 WSL2 Ubuntu-24.04 上从仓库根目录运行：`python -m pytest tests/ -q`。
 
-## 当前状态：BLOCKED
+## 当前状态：READY
 
-主流程集成已实现，所有主流程测试在本地通过，但在最新 GitHub Actions CI 运行确认变绿
-之前，状态保持 BLOCKED（主流程变更必须在远端通过，不仅是本地）。
+主流程集成已完成并验证。所有主流程测试通过，GitHub Actions CI 已变绿（run 30526826061）：
+https://github.com/ericheee111/Supervisor-CAO/actions/runs/30526826061
 
 本轮修复了真实的主流程集成：
 - `PolicyGateway` 现在通过 `ProjectAdapter` 和 `ValidationBackend` 执行 worktree 创建、
@@ -260,8 +259,8 @@ SHA 保真、门禁感知）。Provider/model ID 来自 `~/.config/supervisor-ca
 - `READY_WITH_KNOWN_LIMITATIONS` — 核心工作流可用；存在已记录的非关键性局限。
 - `BLOCKED` — 某项强制能力无法完成。
 
-当前总体：**BLOCKED** — 主流程集成已实现且所有主流程测试在本地通过，但最新 CI 运行
-确认变绿后才能转为 READY。
+当前总体：**READY** — 主流程集成已完成，所有主流程测试通过，GitHub Actions CI 已变绿
+（run 30526826061）。
 
 ## 另请参阅
 
