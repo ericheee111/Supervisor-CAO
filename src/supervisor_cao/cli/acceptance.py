@@ -402,12 +402,8 @@ def _run_review_fix(dirs: dict[str, Path], meta: dict) -> tuple[bool, dict]:
                        capture_output=True, timeout=30)
         new_sha = subprocess.run(["git", "-C", wt, "rev-parse", "HEAD"],
                                 capture_output=True, text=True, timeout=15).stdout.strip()
-        # Update the state machine with the new (unsafe) candidate
-        store.transition(task_id, TaskState.REMOTE_VERIFIED)  # already there
-        # Update candidate_sha to the unsafe version
-        store_meta = store.get(task_id)
-        store.transition(task_id, TaskState.REMOTE_VERIFIED)
-        # Hack: directly update the candidate in the DB
+        # Directly update the candidate_sha in the DB (no state transition needed;
+        # we're already at REMOTE_VERIFIED, just changing which SHA is the candidate)
         import sqlite3
         with sqlite3.connect(str(dirs["state"] / "tasks.db")) as conn:
             conn.execute("UPDATE tasks SET candidate_sha=? WHERE task_id=?",
