@@ -118,12 +118,23 @@ def install():
 @cli.command()
 @click.argument("project")
 def chat(project):
-    """Enter interactive Supervisor for a project."""
+    """Enter interactive Supervisor for a project.
+
+    Launches a real CAO supervisor session. The Supervisor profile registers
+    the supervisor-cao-policy MCP server, so the Supervisor LLM drives the
+    pipeline via run_next_stage (real CAO Workers) — it has no arbitrary bash
+    and cannot bypass the policy gates. The built-in @cao-mcp-server is NOT
+    enabled on the Supervisor.
+    """
     cfg = load_project(project)
     click.echo(f"Starting Supervisor for project '{cfg.name}' (base={cfg.base_branch})")
-    click.echo("Launches: cao launch --agents supervisor --provider opencode_cli")
+    click.echo("Launches: cao launch --agents supervisor --provider opencode_cli --auto-approve")
+    click.echo("The Supervisor drives the pipeline via @supervisor-cao-policy (run_next_stage).")
     click.echo("(Interactive CAO tmux session - run in a WSL terminal for full TUI)")
-    rc, out = _wsl_run(f"cd {cfg.wsl_repo or '.'} && cao launch --agents supervisor --provider opencode_cli 2>&1", timeout=10)
+    rc, out = _wsl_run(
+        f"cd {cfg.wsl_repo or '.'} && cao launch --agents supervisor --provider opencode_cli "
+        f"--auto-approve --headless --async 2>&1",
+        timeout=30)
     click.echo(out.strip())
 
 
@@ -144,19 +155,25 @@ def policy_mcp():
 @click.argument("project")
 @click.option("--task-file", required=True, type=click.Path(exists=True))
 @click.option("--task-id", default=None, help="task ID (default: auto from file)")
-@click.option("--dry-run", is_flag=True, help="simulate without real CAO/LLM calls")
-def run(project, task_file, task_id, dry_run):
+@click.option("--max-stages", default=30, help="safety bound on stage iterations")
+def run(project, task_file, task_id, max_stages):
     """Run a task file end-to-end through the policy-gated pipeline.
 
     Executes: Research -> Codex Plan -> GLM Implement -> Qwen Verify
     -> Codex Review -> Draft PR -> Windows Sync -> READY_FOR_HUMAN_REVIEW.
 
-    The policy gateway enforces state machine, Codex budget, SHA matching,
-    worktree isolation, and sync gates in code. The Supervisor has no
-    arbitrary bash — it goes through the gateway.
+    Each stage is driven by run_next_stage, which launches a REAL CAO Worker
+    (researcher/codex-planner/glm-executor/qwen-verifier/codex-reviewer) via
+    POST /terminals/run-step, validates the artifact against its JSON schema,
+    and advances the state machine with real SHAs. No state is advanced
+    without a real artifact. The policy gateway enforces state machine, Codex
+    budget, SHA matching, worktree isolation, and sync gates in code.
+
+    The --dry-run flag has been removed: this command always runs real Workers.
+    Use `supervisor-cao task show <id>` to inspect state and artifacts.
     """
     from supervisor_cao.mcp.policy_gateway import PolicyGateway, PolicyError
-    from supervisor_cao.state.machine import IllegalTransition, ShaMismatch
+    from supervisor_cao.state.machine import IllegalTransition, ShaMismatch, TaskState
     import yaml as _yaml
     import time as _time
 
@@ -167,99 +184,52 @@ def run(project, task_file, task_id, dry_run):
     baseline = task_data.get("baseline_sha")
 
     click.echo(f"=== Supervisor-CAO run: {tid} on {cfg.name} ===")
-    click.echo(f"Pipeline: Research -> Plan -> Implement -> Verify -> Review -> Draft PR -> Win Sync")
+    click.echo("Pipeline: Research -> Plan -> Implement -> Verify -> Review -> Draft PR -> Win Sync")
+    click.echo("(each stage launches a real CAO Worker via the policy gateway)")
 
     gw = PolicyGateway()
     run_dir = Path.home() / "cao-runs" / tid
     run_dir.mkdir(parents=True, exist_ok=True)
 
+    # health-check the cao-server before starting (real Workers need it)
+    if not gw.cao.server_health():
+        click.echo("ERROR: cao-server is not running. Start it with 'supervisor-cao up'.", err=True)
+        sys.exit(1)
+
     try:
         # 1. CREATE
-        click.echo("\n[1/8] CREATE task...")
+        click.echo("\n[create] CREATE task...")
         rec = gw.create_task(tid, project, description, baseline)
         click.echo(f"  state={rec['state']} baseline={baseline or 'none'}")
 
-        # 2. RESEARCH
-        click.echo("\n[2/8] RESEARCHING...")
-        rec = gw.advance_task(tid, "RESEARCHING")
-        if dry_run:
-            click.echo("  (dry-run) research skipped")
-        else:
-            click.echo("  (research via CAO researcher agent — run 'supervisor-cao chat' for interactive)")
-        (run_dir / "research.json").write_text('{"status": "dry_run" if dry_run else "interactive_required"}')
+        # 2. drive stages until terminal
+        terminal = {TaskState.READY_FOR_HUMAN_REVIEW.value, TaskState.FAILED.value,
+                    TaskState.NEEDS_HUMAN.value}
+        for i in range(1, max_stages + 1):
+            rec = gw.get_task(tid)
+            if rec["state"] in terminal:
+                break
+            click.echo(f"\n[stage {i}] {rec['state']} -> run_next_stage ...")
+            rec = gw.run_next_stage(tid)
+            click.echo(f"  state={rec['state']} cand={rec.get('candidate_sha') or '-'}"
+                       f" tested={rec.get('tested_sha') or '-'}"
+                       f" reviewed={rec.get('reviewed_sha') or '-'}"
+                       f" err={rec.get('error') or '-'}")
+            if rec["state"] in terminal:
+                break
 
-        # 3. PLAN (Codex planner, 1/4 budget)
-        click.echo("\n[3/8] PLANNING (Codex Planner, 1/4 budget)...")
-        rec = gw.advance_task(tid, "PLANNING")
-        budget_info = gw.call_planner(tid, input_artifact=str(run_dir / "research.json"))
-        click.echo(f"  planner call {budget_info['call_index']}, remaining budget={budget_info['remaining']}")
-        if dry_run:
-            (run_dir / "plan.json").write_text('{"status": "dry_run"}')
-        rec = gw.advance_task(tid, "PLAN_READY")
-        click.echo(f"  state={rec['state']}")
-
-        # 4. IMPLEMENT (GLM Executor)
-        click.echo("\n[4/8] IMPLEMENTING (GLM Executor)...")
-        rec = gw.advance_task(tid, "IMPLEMENTING")
-        if dry_run:
-            click.echo("  (dry-run) executor skipped")
-        else:
-            wt_info = gw.start_executor(tid, project)
-            click.echo(f"  worktree={wt_info['executor_worktree']} branch={wt_info['task_branch']}")
-        rec = gw.advance_task(tid, "IMPLEMENTED",
-                              new_candidate_sha=baseline or "dry-run-sha")
-        click.echo(f"  candidate_sha={rec['candidate_sha']}")
-
-        # 5. VERIFY (Qwen Verifier — local + remote)
-        click.echo("\n[5/8] LOCAL_VERIFYING (Qwen Verifier)...")
-        rec = gw.advance_task(tid, "LOCAL_VERIFYING")
-        verify = gw.run_verification(tid, project, rec["candidate_sha"], local=True)
-        click.echo(f"  tested_sha={verify['tested_sha']} state={verify['state']}")
-        # remote verification states (skipped in dry-run, but state transitions required)
-        click.echo("  REMOTE_QUEUED -> REMOTE_VERIFYING -> REMOTE_VERIFIED...")
-        if dry_run:
-            click.echo("  (dry-run) remote verification skipped")
-        rec = gw.advance_task(tid, "REMOTE_QUEUED")
-        rec = gw.advance_task(tid, "REMOTE_VERIFYING")
-        rec = gw.advance_task(tid, "REMOTE_VERIFIED")
-
-        # 6. REVIEW (Codex Reviewer, 2/4 budget)
-        click.echo("\n[6/8] REVIEWING (Codex Reviewer, 2/4 budget)...")
-        rec = gw.advance_task(tid, "REVIEWING", reviewed_sha=rec["candidate_sha"])
-        review_info = gw.call_reviewer(tid, str(run_dir / "verification.json"),
-                                       rec["candidate_sha"], "full_review")
-        click.echo(f"  review call {review_info['call_index']}, remaining={review_info['remaining']}")
-        rec = gw.advance_task(tid, "APPROVED")
-        click.echo(f"  state={rec['state']}")
-
-        # 7. DRAFT PR
-        click.echo("\n[7/8] DRAFT_PR_CREATED...")
-        rec = gw.advance_task(tid, "DRAFT_PR_CREATED")
-        click.echo(f"  state={rec['state']}")
-
-        # 8. WINDOWS SYNC + READY
-        click.echo("\n[8/8] WINDOWS_SYNC -> READY_FOR_HUMAN_REVIEW...")
-        if dry_run:
-            click.echo("  (dry-run) windows sync skipped")
-            rec = gw.advance_task(tid, "WINDOWS_SYNCED")
-        else:
-            try:
-                sync = gw.sync_windows(tid, project)
-                click.echo(f"  windows_head={sync.get('windows_head', 'n/a')}")
-            except PolicyError as e:
-                click.echo(f"  {e} (continuing to READY_FOR_HUMAN_REVIEW)")
-        rec = gw.advance_task(tid, "READY_FOR_HUMAN_REVIEW")
         click.echo(f"\n=== DONE: state={rec['state']} ===")
         click.echo(f"Codex budget used: {gw.budget_summary(tid)['total_used']}/4")
         click.echo(f"Artifacts: {run_dir}")
-        click.echo("Task is READY_FOR_HUMAN_REVIEW. No auto-merge performed.")
+        if rec["state"] == TaskState.READY_FOR_HUMAN_REVIEW.value:
+            click.echo("Task is READY_FOR_HUMAN_REVIEW. No auto-merge performed.")
+        else:
+            click.echo(f"Task stopped at {rec['state']}. Inspect artifacts in {run_dir}.")
+            sys.exit(2)
 
     except PolicyError as e:
         click.echo(f"\nPOLICY ERROR: {e}", err=True)
         sys.exit(2)
-    except (IllegalTransition, ShaMismatch) as e:
-        click.echo(f"\nSTATE ERROR: {e}", err=True)
-        sys.exit(3)
 
 
 @cli.command()
