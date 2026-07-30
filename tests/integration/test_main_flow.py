@@ -411,20 +411,28 @@ class TestModelConfigProfileRender:
         assert content.index("model:") > content.index("provider:")
 
     def test_detect_models_role_keys_match_resolver(self):
-        """The role keys detect-models uses MUST match model_resolver's
-        PROFILE_TO_ROLE values, so a generated config resolves everywhere."""
-        # load detect-models' ROLE_LABELS without importing the script as a module
+        """detect-models checks OpenCode roles only; those role keys MUST be a
+        superset of the OpenCode roles in model_resolver.PROFILE_TO_ROLE.
+        Codex roles (planner/reviewer/judge) use a Codex CLI health check, not
+        OpenCode model mappings."""
         import re
         script = Path(__file__).resolve().parents[2] / "scripts" / "detect-models"
         text = script.read_text()
-        # extract ROLE_LABELS keys
-        m = re.search(r"ROLE_LABELS\s*=\s*\{(.*?)\}", text, re.DOTALL)
+        # extract OPENCODE_ROLE_LABELS keys
+        m = re.search(r"OPENCODE_ROLE_LABELS\s*=\s*\{(.*?)\}", text, re.DOTALL)
         assert m
         keys = re.findall(r'"([^"]+)"\s*:', m.group(1))
-        resolver_roles = set(model_resolver.PROFILE_TO_ROLE.values())
+        # OpenCode profiles in model_resolver (not codex)
+        opencode_profiles = {"researcher", "glm-executor", "qwen-verifier", "supervisor"}
+        resolver_opencode_roles = {model_resolver.PROFILE_TO_ROLE[p]
+                                   for p in opencode_profiles}
         detect_roles = set(keys)
-        # every resolver role that maps to an opencode profile must be present
-        # in detect-models (codex roles planner/reviewer/judge are also covered)
-        assert detect_roles.issuperset(resolver_roles), (
-            f"detect-models roles {detect_roles} missing resolver roles "
-            f"{resolver_roles - detect_roles}")
+        assert detect_roles.issuperset(resolver_opencode_roles), (
+            f"detect-models OpenCode roles {detect_roles} missing "
+            f"{resolver_opencode_roles - detect_roles}")
+        # Codex roles must NOT be in OPENCODE_ROLE_LABELS (they use CLI check)
+        assert "planner" not in detect_roles
+        assert "reviewer" not in detect_roles
+        assert "judge" not in detect_roles
+        # CODEX_ROLES must be present in the script
+        assert "CODEX_ROLES" in text

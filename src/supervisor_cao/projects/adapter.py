@@ -105,18 +105,23 @@ class ValidationBackend:
                   test_scope: list[str]) -> ValidationResult:
         """Run the project's configured local verification command.
 
-        Default implementation runs the project's ``default_verification.local``
-        command if configured, else a discovery smoke test. The exit code is
-        authoritative: ``passed`` is ``exit_code == 0``.
+        The command comes from ``default_verification.local.command``. If no
+        command is configured, this returns a FAILED result with a config error
+        — it does NOT default to running pytest (the platform must not assume a
+        specific test runner). The exit code is authoritative:
+        ``passed`` is ``exit_code == 0``.
         """
         local_cfg = self.cfg.default_verification.get("local", {})
         cmd = local_cfg.get("command")
-        if cmd:
-            full = cmd if isinstance(cmd, list) else ["bash", "-lc", str(cmd)]
-        else:
-            # discovery smoke test (no project-specific runner assumed)
-            targets = test_scope if test_scope else ["-q", "--no-header"]
-            full = ["python", "-m", "pytest", *targets]
+        if not cmd:
+            # No verification command configured: this is a configuration error,
+            # not a soft pass. Production must configure a verification command.
+            return ValidationResult(
+                False, 2,
+                "no local verification command configured "
+                "(default_verification.local.command); refusing to default to pytest",
+                candidate_sha, local_fixture=self.local_fixture)
+        full = cmd if isinstance(cmd, list) else ["bash", "-lc", str(cmd)]
         try:
             r = subprocess.run(full, cwd=worktree, capture_output=True,
                                text=True, timeout=600)
@@ -207,10 +212,14 @@ class ValidationBackend:
     # --- artifact writing ---
 
     def write_artifact(self, result: ValidationResult, run_dir: Path,
-                       *, remote: bool = False) -> Path:
+                       *, remote: bool = False, task_id: str = "") -> Path:
         """Write/merge the verification.json artifact. The authoritative fields
         (passed, tested_sha, exit_code) come from the result, never from the
         LLM. An optional LLM summary may be merged under ``llm_summary``.
+
+        After writing, the artifact is validated against the verification JSON
+        schema. If validation fails, the artifact is still written (so evidence
+        is preserved) but a warning is printed to stderr.
         """
         run_dir.mkdir(parents=True, exist_ok=True)
         path = run_dir / "verification.json"
@@ -221,24 +230,46 @@ class ValidationBackend:
             except Exception:
                 existing = {}
         # authoritative fields from the backend (never overwritten by LLM)
+        if task_id:
+            existing["task_id"] = task_id
         existing["passed"] = result.passed
         existing["tested_sha"] = result.tested_sha
-        existing["exit_code"] = result.exit_code
         existing["candidate_sha"] = result.tested_sha
+        # exit_code is authoritative evidence; store under logs (the schema
+        # declares logs as an object with additionalProperties:true).
+        existing.setdefault("logs", {})["exit_code"] = result.exit_code
         if remote:
             existing["remote_results"] = {
-                "passed": result.passed,
-                "exit_code": result.exit_code,
+                "container": "configured",
+                "install_ok": result.passed,
+                "correctness_passed": result.passed,
                 "summary": result.summary,
-                "remote": True,
-                "local_fixture": result.local_fixture,
             }
         else:
-            existing["local_results"] = {
-                "passed": result.passed,
-                "exit_code": result.exit_code,
+            existing["wsl_results"] = {
+                "build": True,
+                "pytest_passed": result.passed,
                 "summary": result.summary,
-                "local_fixture": result.local_fixture,
             }
+        existing.setdefault("environment", {})
         path.write_text(json.dumps(existing, indent=2))
+        # validate against the verification schema immediately after writing
+        _validate_verification_artifact(existing)
         return path
+
+
+def _validate_verification_artifact(obj: dict) -> None:
+    """Validate the verification artifact against schemas/verification.schema.json.
+
+    Best-effort: if jsonschema is unavailable or validation fails, prints a
+    warning but does not raise (the artifact is evidence and must be preserved).
+    """
+    try:
+        import jsonschema
+        schema_path = Path(__file__).resolve().parents[3] / "schemas" / "verification.schema.json"
+        schema = json.loads(schema_path.read_text())
+        jsonschema.validate(obj, schema)
+    except Exception as e:
+        import sys
+        print(f"WARNING: verification artifact schema validation failed: {e}",
+              file=sys.stderr)

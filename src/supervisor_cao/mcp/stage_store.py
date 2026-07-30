@@ -65,6 +65,8 @@ class StageRun:
     codex_call_id: str | None
     started: float
     finished: float | None
+    attempt: int = 0
+    input_sha: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -74,6 +76,7 @@ class StageRun:
             "artifact_path": self.artifact_path, "candidate_sha": self.candidate_sha,
             "codex_call_id": self.codex_call_id,
             "started": self.started, "finished": self.finished,
+            "attempt": self.attempt, "input_sha": self.input_sha,
         }
 
 
@@ -114,26 +117,37 @@ class StageStore:
                     codex_call_id TEXT,
                     started REAL NOT NULL,
                     finished REAL,
+                    attempt INTEGER NOT NULL DEFAULT 0,
+                    input_sha TEXT,
                     PRIMARY KEY (task_id, stage)
                 )
                 """
             )
+            # migration: add attempt/input_sha columns if upgrading an old DB
+            cols = {row[1] for row in c.execute("PRAGMA table_info(stage_runs)")}
+            if "attempt" not in cols:
+                c.execute("ALTER TABLE stage_runs ADD COLUMN attempt INTEGER NOT NULL DEFAULT 0")
+            if "input_sha" not in cols:
+                c.execute("ALTER TABLE stage_runs ADD COLUMN input_sha TEXT")
             c.commit()
 
     def begin_stage(self, task_id: str, stage: str,
                     worker_profile: str | None = None,
-                    candidate_sha: str | None = None) -> tuple[StageRun, bool]:
+                    candidate_sha: str | None = None,
+                    input_sha: str | None = None) -> tuple[StageRun, bool]:
         """Begin a stage. Returns (stage_run, already_completed).
 
         - If a COMPLETED record exists with the SAME candidate_sha: returns it
           with already_completed=True. The caller MUST NOT re-run the Worker or
           re-spend budget. (Idempotent resume.)
         - If a COMPLETED record exists with a DIFFERENT candidate_sha (a fix
-          produced a new SHA): the old result is stale. Reclaim the record and
-          re-run. This enforces "after a fix, re-verification and incremental
-          review are mandatory" (spec §9).
+          produced a new SHA): the old result is stale. Reclaim the record,
+          increment the attempt counter, and re-run. This enforces "after a fix,
+          re-verification and incremental review are mandatory" (spec §9) and
+          supports multiple CHANGES_REQUESTED rounds.
         - If a RUNNING record exists and is not stale: returns it with
-          already_completed=False (caller reuses its terminal_id).
+          already_completed=False (caller reuses its terminal_id and the already-
+          spent Codex budget — no duplicate call/commit/PR).
         - If a RUNNING record is stale: reclaim it (mark FAILED, begin new).
         - Otherwise: insert a new PENDING record and return it.
         """
@@ -150,7 +164,7 @@ class StageStore:
                     if candidate_sha is None or rec.candidate_sha == candidate_sha:
                         return rec, True
                     # stale: a new candidate invalidates this COMPLETED record.
-                    # Fall through to reclaim.
+                    # Fall through to reclaim (attempt++).
                 if rec.status == RUNNING:
                     if now - rec.started < STALE_RUNNING_SECS:
                         return rec, False
@@ -159,29 +173,33 @@ class StageStore:
                         "UPDATE stage_runs SET status=?, finished=? WHERE task_id=? AND stage=?",
                         (FAILED, now, task_id, stage),
                     )
-                # FAILED, PENDING, or stale-COMPLETED: reclaim by updating in place
+                # FAILED, PENDING, or stale-COMPLETED: reclaim by updating in place.
+                # Increment attempt so each re-run (e.g. each CHANGES_REQUESTED round)
+                # is recorded distinctly.
                 run_id = str(uuid.uuid4())
+                next_attempt = (rec.attempt or 0) + 1 if rec.status != PENDING else (rec.attempt or 0)
                 c.execute(
                     "UPDATE stage_runs SET stage_run_id=?, status=?, terminal_id=?, "
                     "worker_profile=?, artifact_path=?, candidate_sha=?, codex_call_id=?, "
-                    "started=?, finished=NULL WHERE task_id=? AND stage=?",
+                    "started=?, finished=NULL, attempt=?, input_sha=? WHERE task_id=? AND stage=?",
                     (run_id, PENDING, None, worker_profile, None, None, None, now,
-                     task_id, stage),
+                     next_attempt, input_sha, task_id, stage),
                 )
                 c.commit()
                 return StageRun(task_id, stage, run_id, PENDING, None, worker_profile,
-                                None, None, None, now, None), False
+                                None, None, None, now, None, next_attempt, input_sha), False
             # no prior record: insert new
             run_id = str(uuid.uuid4())
             c.execute(
                 "INSERT INTO stage_runs (task_id, stage, stage_run_id, status, terminal_id, "
-                "worker_profile, artifact_path, candidate_sha, codex_call_id, started, finished) "
-                "VALUES (?,?,?,?,NULL,?,NULL,NULL,NULL,?,NULL)",
-                (task_id, stage, run_id, PENDING, worker_profile, now),
+                "worker_profile, artifact_path, candidate_sha, codex_call_id, started, finished, "
+                "attempt, input_sha) "
+                "VALUES (?,?,?,?,NULL,?,NULL,NULL,NULL,?,NULL,0,?)",
+                (task_id, stage, run_id, PENDING, worker_profile, now, input_sha),
             )
             c.commit()
             return StageRun(task_id, stage, run_id, PENDING, None, worker_profile,
-                            None, None, None, now, None), False
+                            None, None, None, now, None, 0, input_sha), False
 
     def mark_running(self, task_id: str, stage: str, terminal_id: str | None = None,
                      candidate_sha: str | None = None) -> None:
@@ -246,4 +264,6 @@ class StageStore:
             artifact_path=row["artifact_path"], candidate_sha=row["candidate_sha"],
             codex_call_id=row["codex_call_id"], started=row["started"],
             finished=row["finished"],
+            attempt=row["attempt"] if "attempt" in row.keys() else 0,
+            input_sha=row["input_sha"] if "input_sha" in row.keys() else None,
         )

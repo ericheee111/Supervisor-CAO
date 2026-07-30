@@ -305,5 +305,42 @@ def upgrade():
     click.echo("After upgrade, re-pin the new SHA in config/cao_pinned.sha")
 
 
+@cli.group()
+def acceptance():
+    """Isolated acceptance scenarios (independent state/budget/runs/worktrees)."""
+
+
+@acceptance.command("prepare")
+@click.option("--repo-path", default=None, help="local path to the test repo")
+@click.option("--repo-url", default=None, help="git URL of the test repo (clone/update only; never creates/deletes remote)")
+def acceptance_prepare(repo_path, repo_url):
+    """Prepare the isolated acceptance environment."""
+    from supervisor_cao.cli.acceptance import prepare
+    sys.exit(prepare(repo_path=repo_path, repo_url=repo_url))
+
+
+@acceptance.command("run")
+@click.option("--scenario", required=True,
+              type=click.Choice(["direct", "review-fix", "resume"]))
+def acceptance_run(scenario):
+    """Run one acceptance scenario."""
+    from supervisor_cao.cli.acceptance import run_scenario
+    sys.exit(run_scenario(scenario))
+
+
+@acceptance.command("status")
+def acceptance_status():
+    """Report acceptance scenario results."""
+    from supervisor_cao.cli.acceptance import status
+    sys.exit(status())
+
+
+@acceptance.command("cleanup")
+def acceptance_cleanup():
+    """Remove the isolated acceptance environment."""
+    from supervisor_cao.cli.acceptance import cleanup
+    sys.exit(cleanup())
+
+
 if __name__ == "__main__":
     cli()

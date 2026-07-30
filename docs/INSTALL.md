@@ -10,14 +10,40 @@ Supervisor-CAO runs on **WSL2 Ubuntu-24.04** and orchestrates OpenCode
 | Tool | Min version | Install |
 |------|-------------|---------|
 | WSL2 distro | Ubuntu-24.04 | `wsl --install -d Ubuntu-24.04` |
-| Python | 3.10+ (3.12 tested) | `sudo apt install python3 python3-pip` |
+| Python | 3.10+ (3.12 tested) | `sudo apt install python3` (system Python is PEP 668-managed — never `pip install` against it) |
 | tmux | 3.3+ (3.4 tested) | `sudo apt install tmux` |
 | git / gh | recent | `sudo apt install git gh`; `gh auth login` |
 | uv | 0.8.x (0.8.6 tested) | `curl -LsSf https://astral.sh/uv/install.sh \| sh` |
 
 Verify: `python3 --version; tmux -V; uv --version; git --version; gh --version`.
 
-## 1. Install CAO (cli-agent-orchestrator)
+> Ubuntu's system Python is PEP 668-managed. Never run bare `pip install`
+> against it and never use `--break-system-packages` — install the workspace
+> into an isolated `.venv` (step 1) and the upstream CAO tool via `uv tool`
+> (step 2).
+
+## 1. Install Supervisor-CAO into an isolated venv
+
+From the workspace root (where `pyproject.toml` lives), create an isolated
+virtualenv and install the workspace **editable with the `dev` extra**. This
+provides the `supervisor-cao` and `supervisor-cao-policy-mcp` entry points
+from this checkout — not a stale global install.
+
+```bash
+uv venv .venv                                    # or: python3 -m venv .venv
+uv pip install -e ".[dev]"                       # or: .venv/bin/pip install -e ".[dev]"
+source .venv/bin/activate                        # activate before running any supervisor-cao command
+```
+
+Activate the venv in every shell that will run `supervisor-cao`. Confirm both
+binaries resolve to this workspace's `.venv`, not a global install:
+
+```bash
+which supervisor-cao              # must print .../Supervisor-CAO/.venv/bin/supervisor-cao
+which supervisor-cao-policy-mcp   # must print .../Supervisor-CAO/.venv/bin/supervisor-cao-policy-mcp
+```
+
+## 2. Install CAO (cli-agent-orchestrator)
 
 CAO is pinned to a tested commit in `config/cao_pinned.sha`:
 `4cc40b182d259f8a370ec3f70fb00a0d67b7844d` (awslabs/cli-agent-orchestrator@main, v2.3.0).
@@ -33,7 +59,7 @@ uv tool install --force --reinstall \
 `supervisor-cao doctor` reports the pinned SHA. Upgrades are explicit
 (`supervisor-cao upgrade`, runs a regression suite first).
 
-## 2. Install OpenCode CLI
+## 3. Install OpenCode CLI
 
 OpenCode 1.18.x is the GLM/Qwen provider. Install per upstream, authenticate
 GLM/Qwen; auth lives in `~/.local/share/opencode/auth.json` (or
@@ -45,7 +71,7 @@ opencode --version     # >= 1.18
 opencode models        # lists provider/model IDs (never prints API keys)
 ```
 
-## 3. Install Codex CLI + ChatGPT auth
+## 4. Install Codex CLI + ChatGPT auth
 
 Codex CLI 0.146.x is the high-value provider (Plan/Review/Judge). Install per
 upstream and complete ChatGPT (Pro) auth.
@@ -57,7 +83,7 @@ codex --version        # >= 0.146
 If `codex` is not on the WSL PATH, set `CODEX_BIN` to an absolute path
 (WSL-side or `/mnt/c/...`). `doctor` honors `CODEX_BIN`.
 
-## 4. Detect models
+## 5. Detect models
 
 Generate a desensitized model map (provider/model IDs only, never API keys):
 
@@ -69,7 +95,7 @@ python3 scripts/detect-models            # writes ~/.config/supervisor-cao/model
 `models.local.yaml` maps roles (`supervisor_primary`, `glm_executor`,
 `qwen_verifier`, `researcher`, `codex`) to detected models. Git-ignored.
 
-## 5. Create project local config
+## 6. Create project local config
 
 `config/examples/demo-project.example.yaml` is a fully fictional, public
 template — real hosts, container names, usernames, and paths never go in it.
@@ -82,7 +108,7 @@ cp config/examples/demo-project.example.yaml \
 # (ssh_host, containers, user, repo_path, env). Never commit this file.
 ```
 
-## 6. Initialize CAO and verify
+## 7. Initialize CAO and verify
 
 ```bash
 cao init                              # one-time CAO workspace init
@@ -151,14 +177,38 @@ Supervisor-CAO 运行在 **WSL2 Ubuntu-24.04** 之上，通过本地 `cao-server
 | 工具 | 最低版本 | 安装方式 |
 |------|----------|----------|
 | WSL2 发行版 | Ubuntu-24.04 | `wsl --install -d Ubuntu-24.04` |
-| Python | 3.10+（已测试 3.12） | `sudo apt install python3 python3-pip` |
+| Python | 3.10+（已测试 3.12） | `sudo apt install python3`（系统 Python 受 PEP 668 管理 —— 绝不对它执行 `pip install`） |
 | tmux | 3.3+（已测试 3.4） | `sudo apt install tmux` |
 | git / gh | 较新版本 | `sudo apt install git gh`; `gh auth login` |
 | uv | 0.8.x（已测试 0.8.6） | `curl -LsSf https://astral.sh/uv/install.sh \| sh` |
 
 验证：`python3 --version; tmux -V; uv --version; git --version; gh --version`。
 
-## 1. 安装 CAO (cli-agent-orchestrator)
+> Ubuntu 的系统 Python 受 PEP 668 管理。绝不对它执行裸 `pip install`，
+> 也绝不使用 `--break-system-packages` —— 工作区安装进隔离的 `.venv`
+> （第 1 步），上游 CAO 工具通过 `uv tool` 安装（第 2 步）。
+
+## 1. 将 Supervisor-CAO 安装到隔离 venv
+
+在工作区根目录（`pyproject.toml` 所在处）创建隔离虚拟环境，并以**带 `dev`
+extra 的可编辑模式**安装工作区。这样 `supervisor-cao` 与
+`supervisor-cao-policy-mcp` 入口点来自本次 checkout —— 而非过期的全局安装。
+
+```bash
+uv venv .venv                                    # 或：python3 -m venv .venv
+uv pip install -e ".[dev]"                       # 或：.venv/bin/pip install -e ".[dev]"
+source .venv/bin/activate                        # 运行任何 supervisor-cao 命令前先激活
+```
+
+在每个要运行 `supervisor-cao` 的 shell 中激活该 venv。确认两个二进制都解析
+到本工作区的 `.venv`，而非全局安装：
+
+```bash
+which supervisor-cao              # 必须输出 .../Supervisor-CAO/.venv/bin/supervisor-cao
+which supervisor-cao-policy-mcp   # 必须输出 .../Supervisor-CAO/.venv/bin/supervisor-cao-policy-mcp
+```
+
+## 2. 安装 CAO (cli-agent-orchestrator)
 
 CAO 在 `config/cao_pinned.sha` 中固定到一个已测试的 commit：
 `4cc40b182d259f8a370ec3f70fb00a0d67b7844d`（awslabs/cli-agent-orchestrator@main，
@@ -175,7 +225,7 @@ uv tool install --force --reinstall \
 `supervisor-cao doctor` 会报告固定的 SHA。升级是显式的
 （`supervisor-cao upgrade`，会先运行回归测试套件）。
 
-## 2. 安装 OpenCode CLI
+## 3. 安装 OpenCode CLI
 
 OpenCode 1.18.x 是 GLM/Qwen 提供方。按上游说明安装，并完成
 GLM/Qwen 认证；认证信息存放在 `~/.local/share/opencode/auth.json`
@@ -187,7 +237,7 @@ opencode --version     # >= 1.18
 opencode models        # 列出 provider/model ID（绝不打印 API key）
 ```
 
-## 3. 安装 Codex CLI + ChatGPT 认证
+## 4. 安装 Codex CLI + ChatGPT 认证
 
 Codex CLI 0.146.x 是高价值提供方（Plan/Review/Judge）。按上游说明安装
 并完成 ChatGPT (Pro) 认证。
@@ -199,7 +249,7 @@ codex --version        # >= 0.146
 如果 `codex` 不在 WSL PATH 上，请将 `CODEX_BIN` 设置为绝对路径
 （WSL 侧或 `/mnt/c/...`）。`doctor` 会遵循 `CODEX_BIN`。
 
-## 4. 检测模型
+## 5. 检测模型
 
 生成一个脱敏的模型映射（仅 provider/model ID，绝不包含 API key）：
 
@@ -211,7 +261,7 @@ python3 scripts/detect-models            # 写入 ~/.config/supervisor-cao/model
 `models.local.yaml` 将角色（`supervisor_primary`、`glm_executor`、
 `qwen_verifier`、`researcher`、`codex`）映射到检测到的模型。已 git-ignore。
 
-## 5. 创建项目本地配置
+## 6. 创建项目本地配置
 
 `config/examples/demo-project.example.yaml` 是一个完全虚构的、公开的模板
 — 真实的主机名、容器名、用户名和路径绝不放入其中。
@@ -224,7 +274,7 @@ cp config/examples/demo-project.example.yaml \
 #（ssh_host、containers、user、repo_path、env）。切勿提交此文件。
 ```
 
-## 6. 初始化 CAO 并验证
+## 7. 初始化 CAO 并验证
 
 ```bash
 cao init                              # 一次性 CAO 工作区初始化

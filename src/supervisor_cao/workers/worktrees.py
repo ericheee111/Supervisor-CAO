@@ -60,11 +60,13 @@ def fetch_main(main_repo: str, base_branch: str = "main") -> str:
     return r.stdout.strip()
 
 
-def create_task_branch(main_repo: str, task_id: str, base_branch: str = "main") -> str:
-    """Create agent/<task-id> from latest origin/<base> in the main clone (no checkout).
+def create_task_branch(main_repo: str, task_id: str, base_branch: str = "main",
+                       branch_prefix: str = "agent/") -> str:
+    """Create <prefix><task-id> from latest origin/<base> in the main clone (no checkout).
     Returns the new branch HEAD SHA. Idempotent: if branch exists, returns its SHA.
+    The branch prefix comes from the project config (default ``agent/``).
     """
-    branch = f"agent/{task_id}"
+    branch = f"{branch_prefix}{task_id}"
     # ensure branch doesn't already diverge
     r = _run(["git", "-C", main_repo, "rev-parse", "--verify", branch], check=False)
     if r.returncode == 0:
@@ -74,8 +76,10 @@ def create_task_branch(main_repo: str, task_id: str, base_branch: str = "main") 
     return base_sha
 
 
-def add_executor_worktree(main_repo: str, project: str, task_id: str) -> Path:
-    """Create the writable executor worktree on agent/<task-id>. Idempotent."""
+def add_executor_worktree(main_repo: str, project: str, task_id: str,
+                          branch_prefix: str = "agent/") -> Path:
+    """Create the writable executor worktree on <prefix><task-id>. Idempotent.
+    The branch prefix comes from the project config (default ``agent/``)."""
     p = paths_for(project, task_id)
     if p.executor.exists() and (p.executor / ".git").exists():
         # validate the worktree is still functional (not a stale reference)
@@ -85,7 +89,7 @@ def add_executor_worktree(main_repo: str, project: str, task_id: str) -> Path:
         # stale: prune and recreate
         _run(["git", "-C", main_repo, "worktree", "prune"], check=False)
     p.executor.mkdir(parents=True, exist_ok=True)
-    branch = f"agent/{task_id}"
+    branch = f"{branch_prefix}{task_id}"
     _run(["git", "-C", main_repo, "worktree", "add", str(p.executor), branch], check=False)
     # if worktree add failed because branch not local, create tracking
     if not (p.executor / ".git").exists():
@@ -97,9 +101,11 @@ def add_executor_worktree(main_repo: str, project: str, task_id: str) -> Path:
 
 
 def add_readonly_worktree(main_repo: str, project: str, task_id: str, role: str,
-                          sha: str | None = None) -> Path:
+                          sha: str | None = None,
+                          branch_prefix: str = "agent/") -> Path:
     """Create a read-only worktree (verifier/reviewer) at an optional detached SHA.
     Read-only-ness is enforced by the policy layer (permissions), not git itself.
+    The branch prefix comes from the project config (default ``agent/``).
     """
     if role not in ("verifier", "reviewer"):
         raise WorktreeError(f"unknown read-only role {role}")
@@ -108,11 +114,11 @@ def add_readonly_worktree(main_repo: str, project: str, task_id: str, role: str,
     if target.exists() and (target / ".git").exists():
         return target
     target.mkdir(parents=True, exist_ok=True)
-    branch = f"agent/{task_id}-{role}"
+    branch = f"{branch_prefix}{task_id}-{role}"
     if sha:
         _run(["git", "-C", main_repo, "worktree", "add", "--detach", str(target), sha], check=False)
     else:
-        _run(["git", "-C", main_repo, "worktree", "add", "-B", branch, str(target), f"agent/{task_id}"],
+        _run(["git", "-C", main_repo, "worktree", "add", "-B", branch, str(target), f"{branch_prefix}{task_id}"],
              check=False)
     if not (target / ".git").exists():
         raise WorktreeError(f"failed to create {role} worktree at {target}")

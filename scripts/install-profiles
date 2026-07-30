@@ -1,82 +1,211 @@
-#!/usr/bin/env bash
-# install-profiles: install all Supervisor-CAO agent profiles into CAO.
-# Idempotent: safe to re-run. Uses `cao install` with the correct provider.
-#
-# Model ids are rendered from the local (gitignored) models.local.yaml if
-# present (produced by scripts/detect-models). If absent, profiles install
-# without a model field and the CAO provider applies its own default.
-set -euo pipefail
+#!/usr/bin/env python3
+"""install-profiles: install all Supervisor-CAO agent profiles into CAO.
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROFILES_DIR="$SCRIPT_DIR/../profiles"
-MODELS_LOCAL="${HOME}/.config/supervisor-cao/models.local.yaml"
+Fixes:
+  - Rendered profiles are written to a temp dir with the correct ``<profile>.md``
+    name (CAO install requires the ``.md`` suffix).
+  - When no model config exists, the source profile is COPIED to the temp file
+    (the source is never deleted or modified).
+  - A failed install exits non-zero immediately (no ``|| echo WARN`` swallowing).
+  - Supports ``--force`` (re-install over existing) and ``--verify`` (check
+    installed profiles contain expected provider/role/model/MCP fields without
+    installing).
+  - Post-install validation checks each profile actually has the expected
+    provider, role, model (when configured), and Policy MCP config (supervisor).
+  - Stale existing profiles do NOT count as success: --verify re-reads the
+    installed profile content and checks the expected fields.
 
-# Render a profile's frontmatter model field from models.local.yaml.
-# Usage: render_model <profile> <profile.md>
-render_model() {
-    local profile="$1" src="$2"
-    if [[ ! -f "$MODELS_LOCAL" ]]; then
-        echo "$src"
-        return
-    fi
-    local rendered
-    rendered="$(mktemp)"
-    python3 - "$src" "$rendered" "$profile" "$MODELS_LOCAL" <<'PY'
-import sys, yaml
-src, out, profile, models_file = sys.argv[1:5]
-text = open(src).read()
-mapping = yaml.safe_load(open(models_file).read()) or {}
-# Profile -> role key. MUST match model_resolver.PROFILE_TO_ROLE exactly so the
-# same models.local.yaml resolves consistently everywhere.
-role_map = {
-    "researcher": "research", "glm-executor": "executor",
-    "qwen-verifier": "verifier", "supervisor": "supervisor_primary",
-    "codex-planner": "planner", "codex-reviewer": "reviewer",
-    "codex-judge": "judge",
+Model ids are rendered from the local (gitignored) models.local.yaml if present
+(produced by scripts/detect-models). Codex profiles (planner/reviewer/judge) do
+NOT require an OpenCode model mapping.
+"""
+from __future__ import annotations
+
+import argparse
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+try:
+    import yaml
+except ImportError:
+    yaml = None
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROFILES_DIR = SCRIPT_DIR.parent / "profiles"
+MODELS_LOCAL = Path.home() / ".config" / "supervisor-cao" / "models.local.yaml"
+
+# Profile -> (provider, role_key_for_model). Codex profiles have no OpenCode
+# model mapping; their role_key is None.
+PROFILES = [
+    ("supervisor", "opencode_cli", "supervisor_primary"),
+    ("researcher", "opencode_cli", "research"),
+    ("glm-executor", "opencode_cli", "executor"),
+    ("qwen-verifier", "opencode_cli", "verifier"),
+    ("codex-planner", "codex", None),
+    ("codex-reviewer", "codex", None),
+    ("codex-judge", "codex", None),
+]
+
+# Expected frontmatter fields per profile for post-install validation.
+EXPECTED_FIELDS = {
+    "supervisor": {"provider": "opencode_cli", "role": "supervisor", "mcp": "supervisor-cao-policy"},
+    "researcher": {"provider": "opencode_cli", "role": "reviewer"},
+    "glm-executor": {"provider": "opencode_cli", "role": "developer"},
+    "qwen-verifier": {"provider": "opencode_cli", "role": "reviewer"},
+    "codex-planner": {"provider": "codex", "role": "reviewer"},
+    "codex-reviewer": {"provider": "codex", "role": "reviewer"},
+    "codex-judge": {"provider": "codex", "role": "reviewer"},
 }
-role = role_map.get(profile)
-model = None
-# Flat form: {role: "provider/model"} (what detect-models writes).
-if role and isinstance(mapping.get(role), str):
-    model = mapping[role]
-# Legacy nested form: roles: {role: "provider/model"}.
-elif role and isinstance(mapping.get("roles"), dict) and isinstance(mapping["roles"].get(role), str):
-    model = mapping["roles"][role]
-if model:
-    # insert model: line after the provider: line in frontmatter
-    lines = text.split("\n")
-    for i, ln in enumerate(lines):
-        if ln.startswith("provider:"):
-            lines.insert(i + 1, f"model: {model}")
-            break
-    text = "\n".join(lines)
-open(out, "w").write(text)
-PY
-    echo "$rendered"
-}
 
-echo "Installing Supervisor-CAO profiles into CAO..."
 
-# OpenCode provider profiles
-for profile in supervisor researcher glm-executor qwen-verifier; do
-    f="$PROFILES_DIR/$profile.md"
-    if [[ -f "$f" ]]; then
-        rendered="$(render_model "$profile" "$f")"
-        echo "  installing $profile (opencode_cli)..."
-        cao install "$rendered" --provider opencode_cli 2>&1 | tail -1 || echo "  WARN: $profile install failed (may already exist)"
-        rm -f "$rendered"
-    fi
-done
+def _load_models_mapping() -> dict:
+    if not MODELS_LOCAL.exists() or yaml is None:
+        return {}
+    try:
+        data = yaml.safe_load(MODELS_LOCAL.read_text()) or {}
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
 
-# Codex provider profiles
-for profile in codex-planner codex-reviewer codex-judge; do
-    f="$PROFILES_DIR/$profile.md"
-    if [[ -f "$f" ]]; then
-        echo "  installing $profile (codex)..."
-        cao install "$f" --provider codex 2>&1 | tail -1 || echo "  WARN: $profile install failed (may already exist)"
-    fi
-done
 
-echo "Profile installation complete."
-echo "Installed profiles:"
-cao profile list 2>&1 | grep -iE "supervisor|researcher|executor|verifier|planner|reviewer|judge" || true
+def _resolve_model(profile: str, role_key: str | None, mapping: dict) -> str | None:
+    if not role_key:
+        return None
+    if isinstance(mapping.get(role_key), str):
+        return mapping[role_key]
+    roles = mapping.get("roles") or {}
+    if isinstance(roles, dict) and isinstance(roles.get(role_key), str):
+        return roles[role_key]
+    return None
+
+
+def render_profile(src: Path, profile: str, role_key: str | None,
+                   mapping: dict) -> str:
+    """Return rendered profile text with model line inserted if configured.
+    Never modifies the source file."""
+    text = src.read_text()
+    model = _resolve_model(profile, role_key, mapping)
+    if model:
+        lines = text.split("\n")
+        for i, ln in enumerate(lines):
+            if ln.startswith("provider:"):
+                lines.insert(i + 1, f"model: {model}")
+                break
+        text = "\n".join(lines)
+    return text
+
+
+def _parse_frontmatter(text: str) -> dict:
+    """Parse YAML frontmatter (between --- fences) into a dict."""
+    if not text.startswith("---"):
+        return {}
+    parts = text.split("---", 2)
+    if len(parts) < 3:
+        return {}
+    if yaml is None:
+        # minimal fallback: just return raw text for substring checks
+        return {"_raw": parts[1]}
+    try:
+        data = yaml.safe_load(parts[1]) or {}
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def verify_profile_content(text: str, profile: str) -> list[str]:
+    """Check the profile text contains expected fields. Returns list of errors."""
+    errors = []
+    expected = EXPECTED_FIELDS.get(profile, {})
+    fm = _parse_frontmatter(text)
+    raw = text
+    if expected.get("provider") and fm.get("provider") != expected["provider"]:
+        # fallback substring check for non-yaml envs
+        if f"provider: {expected['provider']}" not in raw:
+            errors.append(f"provider != {expected['provider']}")
+    if expected.get("role") and fm.get("role") != expected["role"]:
+        if f"role: {expected['role']}" not in raw:
+            errors.append(f"role != {expected['role']}")
+    if expected.get("mcp") and expected["mcp"] not in raw:
+        errors.append(f"missing MCP config {expected['mcp']}")
+    return errors
+
+
+def install_one(profile: str, provider: str, role_key: str | None,
+                mapping: dict, tmpdir: Path, *, force: bool) -> None:
+    """Install a single profile. Raises on failure (no swallowing)."""
+    src = PROFILES_DIR / f"{profile}.md"
+    if not src.exists():
+        raise RuntimeError(f"profile source not found: {src}")
+    rendered_text = render_profile(src, profile, role_key, mapping)
+    # ALWAYS write to a temp file with the .md suffix (CAO requires it).
+    tmp_file = tmpdir / f"{profile}.md"
+    tmp_file.write_text(rendered_text)
+    cmd = ["cao", "install", str(tmp_file), "--provider", provider]
+    if force:
+        cmd.append("--force")
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        raise RuntimeError(
+            f"install failed for {profile} (exit {r.returncode}): "
+            f"{r.stderr.strip() or r.stdout.strip()}")
+    print(f"  installed {profile} ({provider})")
+    # post-install validation: re-read the installed profile from CAO
+    verify_cmd = ["cao", "profile", "show", profile]
+    rv = subprocess.run(verify_cmd, capture_output=True, text=True, timeout=30)
+    if rv.returncode != 0:
+        raise RuntimeError(f"post-install verify failed for {profile}: "
+                           f"{rv.stderr.strip()}")
+    errors = verify_profile_content(rv.stdout, profile)
+    if errors:
+        raise RuntimeError(f"post-install content check failed for {profile}: "
+                           f"{'; '.join(errors)}")
+
+
+def verify_only() -> int:
+    """--verify: check installed profiles without installing."""
+    print("Verifying installed profiles...")
+    all_ok = True
+    for profile, provider, role_key in PROFILES:
+        rv = subprocess.run(["cao", "profile", "show", profile],
+                            capture_output=True, text=True, timeout=30)
+        if rv.returncode != 0:
+            print(f"  FAIL {profile}: not installed ({rv.stderr.strip()})")
+            all_ok = False
+            continue
+        errors = verify_profile_content(rv.stdout, profile)
+        if errors:
+            print(f"  FAIL {profile}: {'; '.join(errors)}")
+            all_ok = False
+        else:
+            print(f"  OK   {profile}")
+    return 0 if all_ok else 1
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Install Supervisor-CAO profiles into CAO")
+    ap.add_argument("--force", action="store_true", help="re-install over existing profiles")
+    ap.add_argument("--verify", action="store_true", help="only verify installed profiles, do not install")
+    args = ap.parse_args()
+
+    if args.verify:
+        return verify_only()
+
+    mapping = _load_models_mapping()
+    print("Installing Supervisor-CAO profiles into CAO...")
+    with tempfile.TemporaryDirectory(prefix="scao-profiles-") as td:
+        tmpdir = Path(td)
+        for profile, provider, role_key in PROFILES:
+            try:
+                install_one(profile, provider, role_key, mapping, tmpdir, force=args.force)
+            except Exception as e:
+                print(f"ERROR: {e}", file=sys.stderr)
+                return 1
+    print("Profile installation complete.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

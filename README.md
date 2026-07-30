@@ -84,7 +84,8 @@ Research → Codex Plan → GLM Implement → WSL2 quick verify
 ```bash
 git clone https://github.com/ericheee111/Supervisor-CAO.git
 cd Supervisor-CAO
-pip install -e .              # installs the supervisor-cao CLI
+uv venv .venv                         # create an isolated venv (PEP 668)
+uv pip install -e ".[dev]"            # install the supervisor-cao CLI into .venv
 ```
 
 ### Configure
@@ -320,7 +321,8 @@ Apache-2.0
 ```bash
 git clone https://github.com/ericheee111/Supervisor-CAO.git
 cd Supervisor-CAO
-pip install -e .              # 安装 supervisor-cao CLI
+uv venv .venv                         # 创建隔离 venv（PEP 668）
+uv pip install -e ".[dev]"            # 将 supervisor-cao CLI 安装到 .venv
 ```
 
 ### 配置

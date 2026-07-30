@@ -4,33 +4,36 @@
 
 Run from the repo root on WSL2 Ubuntu-24.04: `python -m pytest tests/ -q`.
 
-## Current status: READY
+## Current status: READY_WITH_KNOWN_LIMITATIONS
 
-Main-flow integration is complete and verified. All main-flow tests pass and
-GitHub Actions CI is green (run 30526826061):
-https://github.com/ericheee111/Supervisor-CAO/actions/runs/30526826061
+Production hardening is implemented and all unit/integration tests pass, with
+green GitHub Actions CI. The known limitation: the three real acceptance
+scenarios (direct, review-fix, resume) require a running cao-server with real
+Workers and have not yet been executed end-to-end; the acceptance CLI is in
+place but the real-Worker runs are pending. Per the active goal, the platform
+stays `READY_WITH_KNOWN_LIMITATIONS` (not `READY`) until all three real
+acceptance scenarios pass.
 
-This round fixed the real main-flow integration:
-- `PolicyGateway` now runs worktree creation, local verification, and remote
-  verification through `ProjectAdapter` and `ValidationBackend` (no simulated
-  remote result in the production path).
-- The deterministic exit code is authoritative; the LLM verifier only writes a
-  summary and cannot change `passed`, `tested_sha`, selectors, or thresholds.
-- The `CHANGES_REQUESTED` flow no longer performs the illegal
-  `FIXING -> IMPLEMENTED` transition. A fix goes `FIXING -> LOCAL_VERIFYING`
-  (new candidate) -> re-verify -> `REMOTE_VERIFIED` -> incremental review.
-- `detect-models`, `model_resolver`, and `install-profiles` share unified role
-  keys and a flat YAML structure; a generated `models.local.yaml` resolves
-  consistently and renders into profiles.
-- The remote backend passes the task id, configurable setup/verify commands,
-  environment variables, and container selection, and reads the real
-  `verification.json`.
-
-New integration tests (`tests/integration/test_main_flow.py`) verify: the
-adapter is called by the main flow; remote unconfigured blocks
-`REMOTE_VERIFIED`; a failed test is not flipped to pass; the full
-`CHANGES_REQUESTED -> fix -> re-verify -> incremental review` flow completes;
-and a profile renders its model from the generated config.
+This round added production hardening:
+- `install-profiles` rewritten in Python: rendered profiles use `<profile>.md`
+  temp files (CAO requires the suffix); no source deletion; fail-fast (no
+  `|| echo WARN` swallowing); `--force`/`--verify`; post-install validation of
+  provider/role/model/MCP fields; stale profiles do not count as success.
+- `detect-models` checks OpenCode roles only (supervisor_primary,
+  supervisor_backup, executor, verifier, research); Planner/Reviewer/Judge use
+  a Codex CLI health check, not OpenCode model mappings.
+- Install flow uses isolated `.venv`/`uv` (no system pip / no
+  `--break-system-packages`).
+- Removed all hardcoded `agent/` branch prefix; branch prefix and worktree root
+  come from project config throughout.
+- `ValidationBackend` no longer defaults to pytest; returns a config error when
+  no verification command is configured. `verification.json` is schema-validated
+  on write.
+- `StageStore` records attempt and input_sha; a RUNNING stage is reused on
+  resume (no duplicate Worker/Codex budget/commit/PR); supports multiple
+  consecutive `CHANGES_REQUESTED` rounds.
+- Acceptance CLI: `supervisor-cao acceptance prepare/run/status/cleanup` with
+  isolated state/budget/runs/worktree directories.
 
 ## Test suite
 
@@ -143,8 +146,10 @@ detection (2h). Restore failure keeps lock + marks UNHEALTHY. Never
   non-critical limitation remains.
 - `BLOCKED` — a mandatory capability cannot be completed.
 
-Current overall: **READY** — main-flow integration is complete, all main-flow
-tests pass, and GitHub Actions CI is green (run 30526826061).
+Current overall: **READY_WITH_KNOWN_LIMITATIONS** — production hardening is
+complete and all unit/integration tests pass with green CI, but the three real
+acceptance scenarios (direct/review-fix/resume) require a running cao-server
+and are pending. Not `READY` until all three pass.
 
 ## See also
 
@@ -156,27 +161,27 @@ tests pass, and GitHub Actions CI is green (run 30526826061).
 
 在 WSL2 Ubuntu-24.04 上从仓库根目录运行：`python -m pytest tests/ -q`。
 
-## 当前状态：READY
+## 当前状态：READY_WITH_KNOWN_LIMITATIONS
 
-主流程集成已完成并验证。所有主流程测试通过，GitHub Actions CI 已变绿（run 30526826061）：
-https://github.com/ericheee111/Supervisor-CAO/actions/runs/30526826061
+生产硬化已实现，所有单元/集成测试通过，GitHub Actions CI 已变绿。已知限制：三条真实
+验收场景（direct、review-fix、resume）需要运行中的 cao-server 和真实 Worker，尚未端到端
+执行；验收 CLI 已就位，但真实 Worker 运行待完成。按当前目标，平台保持
+`READY_WITH_KNOWN_LIMITATIONS`（不是 `READY`），直到三条真实验收场景全部通过。
 
-本轮修复了真实的主流程集成：
-- `PolicyGateway` 现在通过 `ProjectAdapter` 和 `ValidationBackend` 执行 worktree 创建、
-  本地验证和远程验证（生产路径中无模拟远程结果）。
-- 确定性退出码是权威结果；LLM verifier 只写摘要，不能修改 `passed`、`tested_sha`、
-  selector 或阈值。
-- `CHANGES_REQUESTED` 流程不再执行非法的 `FIXING -> IMPLEMENTED` 转换。修复路径为
-  `FIXING -> LOCAL_VERIFYING`（新 candidate）-> 重新验证 -> `REMOTE_VERIFIED` -> 增量 Review。
-- `detect-models`、`model_resolver` 和 `install-profiles` 共享统一的 role key 和扁平 YAML
-  结构；生成的 `models.local.yaml` 一致解析并能渲染进 profile。
-- 远程 backend 传递 task id、配置化的 setup/verify 命令、环境变量和容器选择，并读取真实
-  的 `verification.json`。
-
-新增集成测试（`tests/integration/test_main_flow.py`）验证：adapter 被主流程调用；remote
-未配置时阻止 `REMOTE_VERIFIED`；测试失败不能被 LLM 改成通过；完整的
-`CHANGES_REQUESTED -> fix -> 重新验证 -> 增量 review` 流程通过；profile 能从生成的配置
-渲染模型。
+本轮新增生产硬化：
+- `install-profiles` 用 Python 重写：渲染的 profile 使用 `<profile>.md` 临时文件（CAO 要求
+  后缀）；不删除源文件；失败立即非零退出（不吞错）；支持 `--force`/`--verify`；安装后校验
+  provider/role/model/MCP 字段；旧 profile 不算成功。
+- `detect-models` 只检查 OpenCode 角色（supervisor_primary、supervisor_backup、executor、
+  verifier、research）；Planner/Reviewer/Judge 用 Codex CLI 健康检查，不要求 OpenCode 模型映射。
+- 安装流程使用隔离的 `.venv`/`uv`（不用系统 pip / 不用 `--break-system-packages`）。
+- 删除所有硬编码的 `agent/` 分支前缀；branch prefix 和 worktree root 全程来自项目配置。
+- `ValidationBackend` 不再默认运行 pytest；未配置验证命令时返回配置错误。`verification.json`
+  写入后立即按 schema 校验。
+- `StageStore` 记录 attempt 和 input_sha；RUNNING 阶段恢复时复用（不重复 Worker/Codex 预算/
+  commit/PR）；支持连续多轮 `CHANGES_REQUESTED`。
+- 验收 CLI：`supervisor-cao acceptance prepare/run/status/cleanup`，使用独立的
+  state/budget/runs/worktree 目录。
 
 ## 测试套件
 
@@ -259,8 +264,9 @@ SHA 保真、门禁感知）。Provider/model ID 来自 `~/.config/supervisor-ca
 - `READY_WITH_KNOWN_LIMITATIONS` — 核心工作流可用；存在已记录的非关键性局限。
 - `BLOCKED` — 某项强制能力无法完成。
 
-当前总体：**READY** — 主流程集成已完成，所有主流程测试通过，GitHub Actions CI 已变绿
-（run 30526826061）。
+当前总体：**READY_WITH_KNOWN_LIMITATIONS** — 生产硬化已完成，所有单元/集成测试通过且 CI
+变绿，但三条真实验收场景（direct/review-fix/resume）需要运行中的 cao-server，尚未执行。
+三条全部通过前不标记 `READY`。
 
 ## 另请参阅
 

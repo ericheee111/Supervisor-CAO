@@ -31,44 +31,58 @@ WIN_AUTH = Path(os.environ.get("OPENCODE_AUTH_PATH", "")) if os.environ.get("OPE
 # If absent, detection lists available models without preferring any.
 CANDIDATES_FILE = Path.home() / ".config" / "supervisor-cao" / "model-candidates.yaml"
 
-# Canonical role keys — MUST match model_resolver.PROFILE_TO_ROLE values and
-# the keys install-profiles reads. These are role slots, NOT profile names and
-# NOT model ids. Keeping them unified across all three files is required so a
-# generated models.local.yaml resolves correctly everywhere.
-ROLE_LABELS = {
+# OpenCode roles only. Planner/Reviewer/Judge use Codex CLI (separate health
+# check), NOT OpenCode model mappings. These role keys match
+# model_resolver.PROFILE_TO_ROLE values for the OpenCode profiles.
+OPENCODE_ROLE_LABELS = {
     "supervisor_primary": "primary supervisor model",
     "supervisor_backup": "backup supervisor model",
     "executor": "executor model",
     "verifier": "verifier model",
     "research": "researcher model",
-    "planner": "planner model",
-    "reviewer": "reviewer model",
-    "judge": "judge model",
 }
+
+# Codex roles are checked via the Codex CLI health check, not OpenCode models.
+CODEX_ROLES = ["planner", "reviewer", "judge"]
 
 
 def _load_role_specs() -> dict:
     """Load role -> candidate model list from the local candidates file.
 
-    Returns {} if the file is absent (no preferences; all detected models
-    listed without selection). Never hard-codes model ids in source.
+    Only OpenCode roles are loaded (supervisor_primary, supervisor_backup,
+    executor, verifier, research). Codex roles (planner/reviewer/judge) are
+    NOT loaded here — they use a Codex CLI health check instead.
     """
     if not CANDIDATES_FILE.exists():
         return {role: {"candidates": [], "label": lbl}
-                for role, lbl in ROLE_LABELS.items()}
+                for role, lbl in OPENCODE_ROLE_LABELS.items()}
     try:
         import yaml
         data = yaml.safe_load(CANDIDATES_FILE.read_text()) or {}
     except Exception:
         return {role: {"candidates": [], "label": lbl}
-                for role, lbl in ROLE_LABELS.items()}
+                for role, lbl in OPENCODE_ROLE_LABELS.items()}
     specs = {}
-    for role, lbl in ROLE_LABELS.items():
+    for role, lbl in OPENCODE_ROLE_LABELS.items():
         cands = data.get(role, [])
         if isinstance(cands, str):
             cands = [cands]
         specs[role] = {"candidates": list(cands or []), "label": lbl}
     return specs
+
+
+def codex_cli_healthy() -> bool:
+    """Check the Codex CLI is installed and authenticated.
+
+    Planner/Reviewer/Judge use Codex CLI (ChatGPT auth), NOT OpenCode model
+    mappings. This returns True if `codex --version` succeeds.
+    """
+    try:
+        r = subprocess.run(["codex", "--version"], capture_output=True,
+                           text=True, timeout=15)
+        return r.returncode == 0
+    except Exception:
+        return False
 
 
 def find_auth_json(opencode_config: str | None) -> Path | None:
@@ -133,9 +147,9 @@ def pick_model(available: list[str], candidates: list[str]) -> str | None:
 def build_mapping(providers: list[str], models: list[str]) -> dict:
     specs = _load_role_specs()
     mapping = {"providers": providers, "models_available_count": len(models)}
-    # Flat role -> model-id mapping. The value is a STRING ("provider/model")
-    # or None, so model_resolver.resolve_model and install-profiles can read it
-    # directly via isinstance(..., str). Role keys match PROFILE_TO_ROLE values.
+    # Flat role -> model-id mapping for OpenCode roles only. The value is a
+    # STRING ("provider/model") or None, so model_resolver.resolve_model and
+    # install-profiles can read it directly via isinstance(..., str).
     roles = {}
     roles_meta = {}
     for role, spec in specs.items():
@@ -144,8 +158,11 @@ def build_mapping(providers: list[str], models: list[str]) -> dict:
         roles_meta[role] = {"label": spec["label"], "configured": chosen is not None}
     mapping["roles"] = roles
     mapping["roles_meta"] = roles_meta
-    # codex is separate (Codex CLI, ChatGPT auth) - not an OpenCode provider
-    mapping["codex"] = {"platform": "codex-cli", "auth": "chatgpt", "configured": True}
+    # Codex roles (planner/reviewer/judge) use the Codex CLI, NOT OpenCode
+    # models. Health is checked via `codex --version`; no model mapping needed.
+    codex_ok = codex_cli_healthy()
+    mapping["codex"] = {"platform": "codex-cli", "healthy": codex_ok,
+                        "roles": CODEX_ROLES}
     return mapping
 
 
@@ -176,8 +193,10 @@ def to_yaml(data: dict) -> str:
         lines.append(f"    configured: {str(info.get('configured', False)).lower()}")
     lines.append("")
     lines.append("codex:")
-    for k, v in data.get("codex", {}).items():
-        lines.append(f"  {k}: {v}")
+    codex = data.get("codex", {})
+    lines.append(f"  platform: {codex.get('platform', 'codex-cli')}")
+    lines.append(f"  healthy: {str(codex.get('healthy', False)).lower()}")
+    lines.append(f"  roles: {codex.get('roles', [])}")
     return "\n".join(lines) + "\n"
 
 
@@ -201,10 +220,15 @@ def main() -> int:
 
     if args.check:
         print(yaml_text)
-        # exit non-zero if any role unconfigured (value is None)
+        # exit non-zero if any OpenCode role unconfigured (model is None) or
+        # the Codex CLI is not healthy (planner/reviewer/judge need it).
         unconf = [r for r, model in mapping["roles"].items() if not model]
         if unconf:
-            print(f"ERROR: unconfigured roles: {unconf}", file=sys.stderr)
+            print(f"ERROR: unconfigured OpenCode roles: {unconf}", file=sys.stderr)
+            return 2
+        if not mapping.get("codex", {}).get("healthy"):
+            print("ERROR: Codex CLI not healthy (planner/reviewer/judge need it)",
+                  file=sys.stderr)
             return 2
         return 0
 
@@ -213,7 +237,9 @@ def main() -> int:
     out.write_text(yaml_text)
     print(f"wrote {out}", file=sys.stderr)
     unconf = [r for r, model in mapping["roles"].items() if not model]
-    return 2 if unconf else 0
+    if unconf or not mapping.get("codex", {}).get("healthy"):
+        return 2
+    return 0
 
 
 if __name__ == "__main__":

@@ -164,9 +164,11 @@ class PolicyGateway:
         # require main clone clean (read-only check)
         if not git_porcelain_clean(main_repo):
             raise PolicyError(f"LOCAL_WORKTREE_DIRTY: main clone {main_repo} is dirty")
-        sha = create_task_branch(main_repo, task_id, cfg.base_branch)
-        wt = add_executor_worktree(main_repo, project, task_id)
-        return {"task_branch": f"agent/{task_id}", "base_sha": sha,
+        sha = create_task_branch(main_repo, task_id, cfg.base_branch,
+                                 branch_prefix=cfg.task_branch_prefix)
+        wt = add_executor_worktree(main_repo, project, task_id,
+                                   branch_prefix=cfg.task_branch_prefix)
+        return {"task_branch": cfg.task_branch_for(task_id), "base_sha": sha,
                 "executor_worktree": str(wt)}
 
     def executor_commit(self, task_id: str, project: str, message: str) -> dict:
@@ -182,7 +184,7 @@ class PolicyGateway:
             # dirty is OK for commit (we're staging changes); but we require it
             # to become clean after commit
             pass
-        branch = f"agent/{task_id}"
+        branch = cfg.task_branch_for(task_id)
         try:
             new_sha = commit_and_push(str(p.executor), branch, message)
         except Exception as e:
@@ -254,7 +256,7 @@ class PolicyGateway:
         win_repo = cfg.windows_repo
         if not win_repo:
             raise PolicyError("WINDOWS_SYNC_BLOCKED: no windows_repo configured")
-        task_branch = f"agent/{task_id}"
+        task_branch = cfg.task_branch_for(task_id)
         try:
             final_sha = win_sync(win_repo, task_branch, rec.candidate_sha,
                                  rec.tested_sha, rec.reviewed_sha,
@@ -418,8 +420,10 @@ class PolicyGateway:
         if Path(main_repo).exists() and (Path(main_repo) / ".git").exists():
             if not git_porcelain_clean(main_repo):
                 raise PolicyError(f"LOCAL_WORKTREE_DIRTY: main clone {main_repo} is dirty")
-            create_task_branch(main_repo, task_id, adapter.base_branch)
-            wt = add_executor_worktree(main_repo, adapter.name, task_id)
+            create_task_branch(main_repo, task_id, adapter.base_branch,
+                               branch_prefix=adapter.task_branch_prefix)
+            wt = add_executor_worktree(main_repo, adapter.name, task_id,
+                                       branch_prefix=adapter.task_branch_prefix)
             executor_wt = str(wt)
         else:
             executor_wt = main_repo  # temp-repo fallback
@@ -450,7 +454,7 @@ class PolicyGateway:
         backend = self._backend_factory(cfg, local_fixture=self._local_fixture)
         result = backend.run_local(executor_wt, rec.candidate_sha,
                                    plan.get("test_matrix", []))
-        backend.write_artifact(result, run_dir, remote=False)
+        backend.write_artifact(result, run_dir, remote=False, task_id=task_id)
         if not result.passed:
             self.stages.fail_stage(task_id, stage)
             self.store.transition(task_id, TaskState.FAILED,
@@ -490,7 +494,7 @@ class PolicyGateway:
             self.store.transition(task_id, TaskState.REMOTE_VERIFYING)
         backend = self._backend_factory(cfg, local_fixture=self._local_fixture)
         result = backend.run_remote(task_id, rec.candidate_sha, run_dir)
-        backend.write_artifact(result, run_dir, remote=True)
+        backend.write_artifact(result, run_dir, remote=True, task_id=task_id)
         if not result.passed:
             self.stages.fail_stage(task_id, stage)
             self.store.transition(task_id, TaskState.FAILED,
@@ -615,7 +619,7 @@ class PolicyGateway:
         self.stages.mark_running(task_id, stage, candidate_sha=rec.candidate_sha)
         # delegate to create-draft-pr script (validates all 5 artifacts exist)
         script = Path(__file__).resolve().parents[3] / "scripts" / "create-draft-pr"
-        task_branch = f"agent/{task_id}"
+        task_branch = cfg.task_branch_for(task_id)
         cmd = ["python", str(script), "--repo", cfg.wsl_repo or str(run_dir),
                "--task-id", task_id, "--task-branch", task_branch,
                "--base-branch", cfg.base_branch, "--run-dir", str(run_dir)]
@@ -641,7 +645,7 @@ class PolicyGateway:
             self.store.transition(task_id, TaskState.WINDOWS_SYNCED)
             return
         self.stages.mark_running(task_id, stage, candidate_sha=rec.candidate_sha)
-        task_branch = f"agent/{task_id}"
+        task_branch = cfg.task_branch_for(task_id)
         try:
             final_sha = win_sync(win_repo, task_branch, rec.candidate_sha,
                                  rec.tested_sha, rec.reviewed_sha,

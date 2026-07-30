@@ -102,6 +102,10 @@
         "remote_log": {
           "type": "string",
           "description": "Path to the remote container run log file."
+        },
+        "exit_code": {
+          "type": "integer",
+          "description": "Authoritative exit code from the deterministic verification runner. The LLM cannot change this."
         }
       }
     },
