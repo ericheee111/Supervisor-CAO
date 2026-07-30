@@ -4,16 +4,27 @@
 
 Run from the repo root on WSL2 Ubuntu-24.04: `python -m pytest tests/ -q`.
 
-## Test suite (all passing)
+## Current status: BLOCKED
+
+The policy MCP architecture, state machine, budget, schema validation, idempotent
+resume, remote pipefail fix, and draft-PR artifact gate are all implemented and
+unit-tested (97 tests pass). The live CAO E2E is blocked by a Codex CLI
+cold-start timeout (CAO's `provider_init_timeout` of 60s is too short; even raised
+to 180s, Codex's ChatGPT Pro session initialization exceeds it on a cold start).
+The 920B smoke proved SSH/containers/lock/fetch/checkout/install all work, but
+the full pandas pytest suite did not complete within the test timeout.
+
+## Test suite
 
 | Level | Count | Scope |
 |-------|-------|-------|
-| Unit | 69 | state machine, budget (BEGIN IMMEDIATE), schema, SHA, locks, windows-dirty, ff, PR body, secret scan, config, config-safety (task override filtering), permissions |
+| Unit | 97 | state machine, budget, schema, SHA, locks, windows-dirty, ff, PR body, secret scan, config, config-safety, permissions, **worker runner (strict JSON extraction)**, **stage resume (idempotency)**, **policy MCP protocol**, **remote pipefail** |
 | Integration | 10 | planner, executor-fix, verifier-fail, stale, budget, pool, windows-blocked, happy-path |
 | Simulated E2E | 13/13 | temp-repo full flow with mocked workers |
 | Stability | 10/10 | 10 consecutive simulated E2E runs |
-| Real CAO E2E | 9/9 | real GLM (opencode run) + Codex (codex exec) through policy gateway |
-| Fresh clone | ✓ | state machine tracked, 69 tests pass, doctor green |
+| Live CAO E2E | partial | researcher (opencode run --format json) ✅; Codex planner (run-step) blocked by cold-start timeout |
+| 920B smoke | partial | SSH ✅, containers ✅, lock ✅, fetch/checkout ✅, editable install ✅; pytest timed out (full suite too slow) |
+| Fresh clone | ✓ | state machine tracked, 97 tests pass, doctor green |
 | CI | ✓ | GitHub Actions: install + unit + integration + E2E + secret scan |
 
 ## Unit tests (69)
