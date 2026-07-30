@@ -558,6 +558,11 @@ class WorkerRunner:
             "functions, bug fixes, and refactors with passing tests should be "
             "APPROVED. Only request CHANGES if there is an actual correctness "
             "bug, safety issue, or missing tests.\n"
+            "SAFETY CHECK: If the code handles file paths, check for path "
+            "traversal vulnerabilities (e.g. os.path.join without validating "
+            "'..' components). A function named 'safe_join' that does NOT "
+            "reject path traversal is a P0 safety issue — you MUST output "
+            "CHANGES_REQUESTED with a finding about path traversal.\n"
             "If CHANGES_REQUESTED, list findings with id, severity (P0-P3), "
             "category, file, claim, evidence, recommended_direction.\n\n"
             + _schema_hint("review")
