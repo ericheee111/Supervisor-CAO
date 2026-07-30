@@ -392,7 +392,11 @@ def _run_review_fix(dirs: dict[str, Path], meta: dict) -> tuple[bool, dict]:
         wt = str(p.executor)
         unsafe_code = (
             "def safe_join(base, *parts):\n"
+            "    \"\"\"Join base with parts. No path traversal protection.\"\"\"\n"
             "    import os\n"
+            "    # NOTE: This does NOT check for '..' in parts, allowing\n"
+            "    # path traversal: safe_join('/base', '../etc/passwd')\n"
+            "    # would return '/etc/passwd', escaping the base directory.\n"
             "    return os.path.join(base, *parts)\n"
         )
         (Path(wt) / "src" / "scao_live" / "paths.py").write_text(unsafe_code)
@@ -402,12 +406,14 @@ def _run_review_fix(dirs: dict[str, Path], meta: dict) -> tuple[bool, dict]:
                        capture_output=True, timeout=30)
         new_sha = subprocess.run(["git", "-C", wt, "rev-parse", "HEAD"],
                                 capture_output=True, text=True, timeout=15).stdout.strip()
-        # Directly update the candidate_sha in the DB (no state transition needed;
-        # we're already at REMOTE_VERIFIED, just changing which SHA is the candidate)
+        # Directly update the candidate_sha in the DB and clear tested/reviewed
+        # SHAs (the new unsafe candidate has not been tested or reviewed yet).
+        # Roll back to LOCAL_VERIFYING so the flow re-verifies and re-reviews.
         import sqlite3
         with sqlite3.connect(str(dirs["state"] / "tasks.db")) as conn:
-            conn.execute("UPDATE tasks SET candidate_sha=? WHERE task_id=?",
-                         (new_sha, task_id))
+            conn.execute(
+                "UPDATE tasks SET candidate_sha=?, tested_sha=NULL, reviewed_sha=NULL, state=? WHERE task_id=?",
+                (new_sha, TaskState.LOCAL_VERIFYING.value, task_id))
             conn.commit()
         print(f"  injected unsafe candidate: {new_sha[:12]}")
     # Now drive the rest (review should catch the issue -> CHANGES_REQUESTED -> fix -> ...)
