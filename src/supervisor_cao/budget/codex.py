@@ -121,43 +121,56 @@ class CodexBudget:
               output_artifact: str | None = None, candidate_sha: str | None = None) -> CodexCall:
         """Record a Codex call. Raises BudgetExhausted if not allowed.
 
-        Atomic: checks remaining under the lock before inserting.
+        Atomic across processes: uses BEGIN IMMEDIATE for cross-process safety
+        (threading.Lock only protects in-process concurrency). The BEGIN
+        IMMEDIATE acquires a database write lock before any reads, preventing
+        two processes from reading the same count and both inserting.
         """
         if role not in VALID_ROLES:
             raise ValueError(f"invalid role {role}; expected one of {VALID_ROLES}")
-        with self._lock, self._conn() as c:
-            # re-check under lock
-            role_used = c.execute(
-                "SELECT COUNT(*) AS n FROM codex_calls WHERE task_id=? AND role=?",
-                (task_id, role),
-            ).fetchone()["n"]
-            total = c.execute(
-                "SELECT COUNT(*) AS n FROM codex_calls WHERE task_id=?", (task_id,)
-            ).fetchone()["n"]
-            if role_used >= self._budget[role]:
-                c.commit()
-                raise BudgetExhausted(
-                    f"CODEX_BUDGET_EXHAUSTED: role {role} used {role_used}/{self._budget[role]} for task {task_id}"
+        with self._lock:
+            c = self._conn()
+            try:
+                # BEGIN IMMEDIATE: acquire write lock before reading counts.
+                # This blocks other writers until we commit, ensuring the
+                # check-then-insert is atomic across processes.
+                c.execute("BEGIN IMMEDIATE")
+                role_used = c.execute(
+                    "SELECT COUNT(*) AS n FROM codex_calls WHERE task_id=? AND role=?",
+                    (task_id, role),
+                ).fetchone()["n"]
+                total = c.execute(
+                    "SELECT COUNT(*) AS n FROM codex_calls WHERE task_id=?", (task_id,)
+                ).fetchone()["n"]
+                if role_used >= self._budget[role]:
+                    c.commit()
+                    raise BudgetExhausted(
+                        f"CODEX_BUDGET_EXHAUSTED: role {role} used {role_used}/{self._budget[role]} for task {task_id}"
+                    )
+                if total >= self._budget["max_calls_per_task"]:
+                    c.commit()
+                    raise BudgetExhausted(
+                        f"CODEX_BUDGET_EXHAUSTED: total {total}/{self._budget['max_calls_per_task']} for task {task_id}"
+                    )
+                call_index = role_used + 1
+                remaining = self._budget["max_calls_per_task"] - (total + 1)
+                ts = time.time()
+                c.execute(
+                    "INSERT INTO codex_calls (task_id, role, call_index, input_artifact, output_artifact, remaining_budget, candidate_sha, ts) "
+                    "VALUES (?,?,?,?,?,?,?,?)",
+                    (task_id, role, call_index, input_artifact, output_artifact, remaining, candidate_sha, ts),
                 )
-            if total >= self._budget["max_calls_per_task"]:
                 c.commit()
-                raise BudgetExhausted(
-                    f"CODEX_BUDGET_EXHAUSTED: total {total}/{self._budget['max_calls_per_task']} for task {task_id}"
+                return CodexCall(
+                    task_id=task_id, role=role, call_index=call_index,
+                    input_artifact=input_artifact, output_artifact=output_artifact,
+                    remaining_budget=remaining, candidate_sha=candidate_sha, ts=ts,
                 )
-            call_index = role_used + 1
-            remaining = self._budget["max_calls_per_task"] - (total + 1)
-            ts = time.time()
-            c.execute(
-                "INSERT INTO codex_calls (task_id, role, call_index, input_artifact, output_artifact, remaining_budget, candidate_sha, ts) "
-                "VALUES (?,?,?,?,?,?,?,?)",
-                (task_id, role, call_index, input_artifact, output_artifact, remaining, candidate_sha, ts),
-            )
-            c.commit()
-            return CodexCall(
-                task_id=task_id, role=role, call_index=call_index,
-                input_artifact=input_artifact, output_artifact=output_artifact,
-                remaining_budget=remaining, candidate_sha=candidate_sha, ts=ts,
-            )
+            except Exception:
+                c.rollback()
+                raise
+            finally:
+                c.close()
 
     def history(self, task_id: str) -> list[dict]:
         with self._lock, self._conn() as c:

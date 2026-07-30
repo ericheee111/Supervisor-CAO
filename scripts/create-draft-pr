@@ -99,16 +99,29 @@ def create_or_update_draft(repo: str, task_branch: str, base_branch: str, title:
 
 
 def _repo_full(repo: str) -> str:
-    """Extract owner/repo from a git remote URL or path."""
+    """Extract owner/repo from a git remote URL. Raises if cannot resolve GitHub remote."""
     r = _run(["git", "-C", repo, "remote", "get-url", "origin"], check=False)
     url = r.stdout.strip()
+    if not url:
+        raise RuntimeError(f"PR_CREATION_FAILED: no origin remote for {repo}")
     if "github.com" in url:
-        # https://github.com/owner/repo.git  or  git@github.com:owner/repo.git
         if url.startswith("https"):
             return url.split("github.com/")[1].replace(".git", "")
         if url.startswith("git@"):
             return url.split(":")[1].replace(".git", "")
-    return "ericheee111/pandas"  # fallback
+    raise RuntimeError(f"PR_CREATION_FAILED: origin is not a GitHub remote: {url}")
+
+
+def _load_json(path: Path) -> dict:
+    """Load JSON artifact. Returns empty dict if missing (warned)."""
+    if not path.exists():
+        print(f"WARN: artifact not found: {path}", file=sys.stderr)
+        return {}
+    try:
+        return json.loads(path.read_text())
+    except Exception as e:
+        print(f"WARN: could not parse {path}: {e}", file=sys.stderr)
+        return {}
 
 
 def main() -> int:
@@ -121,20 +134,51 @@ def main() -> int:
     args = ap.parse_args()
 
     run_dir = Path(args.run_dir)
-    # load artifacts
-    plan = (run_dir / "plan.json")
-    plan_summary = "see plan.json"
-    candidate_sha = ""
-    changed_files: list[str] = []
-    wsl_tests = remote_tests = codex_review = {}
-    codex_call_count = 0
-    artifacts = []
-    for name, loader in [("plan.json", "json"), ("implementation.json", "json"),
-                         ("verification.json", "json"), ("review.json", "json"),
-                         ("codex-budget-summary.json", "json")]:
-        f = run_dir / name
-        if f.exists():
-            artifacts.append(str(f))
+
+    # Load and validate all artifacts
+    plan = _load_json(run_dir / "plan.json")
+    impl = _load_json(run_dir / "implementation.json")
+    verification = _load_json(run_dir / "verification.json")
+    review = _load_json(run_dir / "review.json")
+    budget_summary = _load_json(run_dir / "codex-budget-summary.json")
+
+    # Extract real data from artifacts
+    candidate_sha = impl.get("candidate_sha", "")
+    if not candidate_sha:
+        # try verification.json
+        candidate_sha = verification.get("candidate_sha", "")
+    if not candidate_sha:
+        print("ERROR: cannot determine candidate_sha from artifacts", file=sys.stderr)
+        return 1
+
+    changed_files = impl.get("changed_files", [])
+    wsl_tests = verification.get("wsl_results", {})
+    remote_tests = verification.get("remote_results", {})
+    codex_review = review
+    codex_call_count = budget_summary.get("total_used", 0)
+    plan_summary = plan.get("steps", plan.get("description", "see plan.json"))
+    if isinstance(plan_summary, list):
+        plan_summary = "; ".join(str(s.get("description", s)) if isinstance(s, dict) else str(s) for s in plan_summary[:5])
+
+    # Validate SHA consistency
+    tested_sha = verification.get("tested_sha", "")
+    reviewed_sha = review.get("reviewed_sha", "")
+    if tested_sha and tested_sha != candidate_sha:
+        print(f"ERROR: SHA mismatch: tested_sha={tested_sha} != candidate_sha={candidate_sha}", file=sys.stderr)
+        return 1
+    if reviewed_sha and reviewed_sha != candidate_sha:
+        print(f"ERROR: SHA mismatch: reviewed_sha={reviewed_sha} != candidate_sha={candidate_sha}", file=sys.stderr)
+        return 1
+
+    # Validate review decision
+    if review.get("decision") and review["decision"] != "APPROVED":
+        print(f"ERROR: review not APPROVED: {review.get('decision')}", file=sys.stderr)
+        return 1
+
+    artifacts = [str(run_dir / n) for n in ["plan.json", "implementation.json",
+                 "verification.json", "review.json", "codex-budget-summary.json"]
+                 if (run_dir / n).exists()]
+
     title = f"[Draft] {args.task_id}"
     body = build_pr_body(args.task_id, plan_summary, "", candidate_sha, changed_files,
                          wsl_tests, remote_tests, codex_review, codex_call_count, artifacts, [])
