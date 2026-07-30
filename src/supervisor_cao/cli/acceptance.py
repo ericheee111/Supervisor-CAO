@@ -332,17 +332,39 @@ def _run_review_fix(dirs: dict[str, Path], meta: dict) -> tuple[bool, dict]:
     subprocess.run(["git", "-C", repo_dir, "reset", "--hard", "origin/main"],
                    capture_output=True, timeout=30)
     subprocess.run(["git", "-C", repo_dir, "clean", "-fd"], capture_output=True, timeout=30)
+    # Pre-inject an intentionally unsafe safe_join (no path traversal check).
+    # The executor's task is to "review and improve" this code. The executor
+    # may add tests but may not catch the traversal issue. The Codex Reviewer
+    # should catch the safety issue and output CHANGES_REQUESTED.
+    unsafe_code = (
+        "def safe_join(base, *parts):\n"
+        "    import os\n"
+        "    return os.path.join(base, *parts)\n"
+    )
+    src_dir = Path(repo_dir) / "src" / "scao_live"
+    src_dir.mkdir(parents=True, exist_ok=True)
+    (src_dir / "paths.py").write_text(unsafe_code)
+    # Also add a basic test
+    test_code = (
+        "from scao_live.paths import safe_join\n\n"
+        "def test_basic_join():\n"
+        "    assert safe_join('/base', 'a', 'b') == '/base/a/b'\n\n"
+        "def test_single_part():\n"
+        "    assert safe_join('/base', 'x') == '/base/x'\n"
+    )
+    (Path(repo_dir) / "tests" / "test_paths.py").write_text(test_code)
+    subprocess.run(["git", "-C", repo_dir, "add", "-A"], capture_output=True, timeout=30)
+    subprocess.run(["git", "-C", repo_dir, "commit", "-m", "add safe_join and tests"],
+                   capture_output=True, timeout=30)
     cfg = _make_project_config(repo_dir, dirs)
     gw, store, budget, stages = _build_gateway(dirs, cfg)
     task_id = f"reviewfix-{int(time.time())}"
     print(f"  task: {task_id}")
-    print(f"  description: implement safe_join (reviewer should catch path traversal)")
+    print(f"  description: review and improve safe_join (reviewer must catch traversal)")
     gw.create_task(task_id, "acceptance",
-                   "Implement a function safe_join(base, *parts) in src/scao_live/paths.py "
-                   "that joins base with parts using os.path.join. The function must be "
-                   "SAFE against path traversal: it must reject parts containing '..' that "
-                   "would escape the base directory. Add a test tests/test_paths.py covering "
-                   "normal joins AND path traversal rejection. Run pytest to verify.",
+                   "Review the existing safe_join function in src/scao_live/paths.py. "
+                   "Add any missing tests and improve the implementation if needed. "
+                   "The function should correctly join paths. Run pytest to verify.",
                    baseline_sha=None)
     rec = _drive_to_terminal(gw, task_id, store)
     evidence = _collect_evidence(task_id, store, budget, stages, dirs)
