@@ -637,7 +637,7 @@ class PolicyGateway:
         # delegate to create-draft-pr script (validates all 5 artifacts exist)
         script = Path(__file__).resolve().parents[3] / "scripts" / "create-draft-pr"
         task_branch = cfg.task_branch_for(task_id)
-        cmd = ["python", str(script), "--repo", cfg.wsl_repo or str(run_dir),
+        cmd = [sys.executable, str(script), "--repo", cfg.wsl_repo or str(run_dir),
                "--task-id", task_id, "--task-branch", task_branch,
                "--base-branch", cfg.base_branch, "--run-dir", str(run_dir)]
         if self.test_mode:
