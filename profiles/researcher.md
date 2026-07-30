@@ -1,19 +1,9 @@
 ---
 name: researcher
 description: Cheap GLM/Qwen read-only researcher producing structured reference reports.
-model: researcher-model
-allowedTools:
-  - read
-  - glob
-  - grep
-  - bash
-permission:
-  read: allow
-  glob: allow
-  grep: allow
-  bash: allow
-  edit: deny
-  write: deny
+role: reviewer
+provider: opencode_cli
+model: zhipuai/glm-5.2
 ---
 
 # Researcher

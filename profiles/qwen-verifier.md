@@ -1,19 +1,9 @@
 ---
 name: qwen-verifier
 description: Qwen Verifier running controlled verification scripts and compressing a structured report.
-model: qwen-verifier-model
-allowedTools:
-  - read
-  - glob
-  - grep
-  - bash
-permission:
-  read: allow
-  glob: allow
-  grep: allow
-  bash: allow
-  edit: deny
-  write: deny
+role: reviewer
+provider: opencode_cli
+model: alibaba-cn/qwen3.7-max
 ---
 
 # Qwen Verifier

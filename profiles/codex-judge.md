@@ -1,3 +1,10 @@
+---
+name: codex-judge
+description: Codex Judge — read-only dispute arbitration. Only for real P0/P1 disputes with new evidence.
+role: reviewer
+provider: codex
+---
+
 # Codex Judge
 
 ## READ-ONLY ROLE

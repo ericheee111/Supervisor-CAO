@@ -1,21 +1,9 @@
 ---
 name: glm-executor
 description: GLM Executor editing only its assigned worktree; build, focused test, commit, push task branch.
-model: glm-executor-model
-allowedTools:
-  - read
-  - edit
-  - write
-  - glob
-  - grep
-  - bash
-permission:
-  read: allow
-  glob: allow
-  grep: allow
-  edit: allow
-  write: allow
-  bash: allow
+role: developer
+provider: opencode_cli
+model: zhipuai/glm-5.2
 ---
 
 # GLM Executor

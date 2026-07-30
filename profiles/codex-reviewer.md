@@ -1,3 +1,10 @@
+---
+name: codex-reviewer
+description: Codex Reviewer — read-only code review. Checks candidate SHA, correctness, safety, performance.
+role: reviewer
+provider: codex
+---
+
 # Codex Reviewer
 
 ## READ-ONLY ROLE
