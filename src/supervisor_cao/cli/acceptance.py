@@ -86,10 +86,29 @@ def prepare(repo_path: str | None = None, repo_url: str | None = None) -> int:
     if repo_url:
         if repo_dir.exists() and (repo_dir / ".git").exists():
             print(f"Updating existing acceptance repo at {repo_dir}...")
+            # Remove all stale worktrees from previous runs (their .git files
+            # may have Windows paths that WSL git cannot manage).
+            subprocess.run(["git", "-C", str(repo_dir), "worktree", "prune"],
+                           capture_output=True, timeout=30)
+            # Force-remove any remaining worktree registrations
+            wt_dir = repo_dir / ".git" / "worktrees"
+            if wt_dir.exists():
+                import shutil as _sh
+                for d in wt_dir.iterdir():
+                    if d.is_dir():
+                        _sh.rmtree(d, ignore_errors=True)
+            # Also remove old worktree directories
+            old_wt_root = repo_dir.parent / "scao-acceptance-worktrees"
+            if old_wt_root.exists():
+                import shutil as _sh
+                _sh.rmtree(old_wt_root, ignore_errors=True)
             subprocess.run(["git", "-C", str(repo_dir), "fetch", "origin"],
                            capture_output=True, timeout=60)
             subprocess.run(["git", "-C", str(repo_dir), "reset", "--hard",
                             "origin/HEAD"], capture_output=True, timeout=30)
+            # Clean untracked files
+            subprocess.run(["git", "-C", str(repo_dir), "clean", "-fd"],
+                           capture_output=True, timeout=30)
         else:
             print(f"Cloning {repo_url} into {repo_dir}...")
             r = subprocess.run(["git", "clone", repo_url, str(repo_dir)],
