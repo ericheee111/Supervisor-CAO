@@ -4,20 +4,33 @@
 
 Run from the repo root on WSL2 Ubuntu-24.04: `python -m pytest tests/ -q`.
 
-## Current status: READY
+## Current status: BLOCKED
 
-The platform is fully decoupled from any specific project: no tracked file
-references any real project name, remote host, container, username, or private
-path. The generic, project-agnostic state is implemented and verified end-to-end.
-GitHub Actions CI is green (run 30522553455):
-https://github.com/ericheee111/Supervisor-CAO/actions/runs/30522553455
+Main-flow integration is implemented and all main-flow tests pass locally, but
+status stays BLOCKED until the latest GitHub Actions CI run is confirmed green
+(the main-flow changes must pass on the remote, not only locally).
 
-The policy MCP architecture, state machine, budget, schema validation,
-idempotent resume, remote pipefail fix, and draft-PR artifact gate are all in
-place and unit-tested. The generic temp-repository E2E
-(`tests/e2e/test_temp_repo_e2e.py`) drives the full deterministic policy flow on
-a throwaway git repo with mocked workers and passes. Unit and integration tests
-pass. The secret scanner is clean and contains no hardcoded private identifiers.
+This round fixed the real main-flow integration:
+- `PolicyGateway` now runs worktree creation, local verification, and remote
+  verification through `ProjectAdapter` and `ValidationBackend` (no simulated
+  remote result in the production path).
+- The deterministic exit code is authoritative; the LLM verifier only writes a
+  summary and cannot change `passed`, `tested_sha`, selectors, or thresholds.
+- The `CHANGES_REQUESTED` flow no longer performs the illegal
+  `FIXING -> IMPLEMENTED` transition. A fix goes `FIXING -> LOCAL_VERIFYING`
+  (new candidate) -> re-verify -> `REMOTE_VERIFIED` -> incremental review.
+- `detect-models`, `model_resolver`, and `install-profiles` share unified role
+  keys and a flat YAML structure; a generated `models.local.yaml` resolves
+  consistently and renders into profiles.
+- The remote backend passes the task id, configurable setup/verify commands,
+  environment variables, and container selection, and reads the real
+  `verification.json`.
+
+New integration tests (`tests/integration/test_main_flow.py`) verify: the
+adapter is called by the main flow; remote unconfigured blocks
+`REMOTE_VERIFIED`; a failed test is not flipped to pass; the full
+`CHANGES_REQUESTED -> fix -> re-verify -> incremental review` flow completes;
+and a profile renders its model from the generated config.
 
 ## Test suite
 
@@ -130,9 +143,9 @@ detection (2h). Restore failure keeps lock + marks UNHEALTHY. Never
   non-critical limitation remains.
 - `BLOCKED` — a mandatory capability cannot be completed.
 
-Current overall: **READY** — generalization is complete, all local checks
-(unit, integration, temp-repo E2E, secret scan) pass, and GitHub Actions CI
-is green end-to-end (run 30522553455).
+Current overall: **BLOCKED** — main-flow integration is implemented and all
+main-flow tests pass locally, but the latest CI run must confirm green before
+moving to READY.
 
 ## See also
 
@@ -144,17 +157,27 @@ is green end-to-end (run 30522553455).
 
 在 WSL2 Ubuntu-24.04 上从仓库根目录运行：`python -m pytest tests/ -q`。
 
-## 当前状态：READY
+## 当前状态：BLOCKED
 
-平台已完全与任何特定项目解耦：tracked files 中不含任何真实项目名、远程主机、容器、
-用户名或私有路径的引用。通用、与项目无关的状态已实现并端到端验证。GitHub Actions CI
-已变绿（run 30522553455）：
-https://github.com/ericheee111/Supervisor-CAO/actions/runs/30522553455
+主流程集成已实现，所有主流程测试在本地通过，但在最新 GitHub Actions CI 运行确认变绿
+之前，状态保持 BLOCKED（主流程变更必须在远端通过，不仅是本地）。
 
-policy MCP 架构、状态机、预算、schema 校验、幂等恢复、远程 pipefail 修复以及 draft-PR
-产物门禁均已就绪并通过单元测试。通用的临时仓库 E2E（`tests/e2e/test_temp_repo_e2e.py`）
-在一个一次性 git 仓库上以 mocked worker 驱动完整的确定性策略流程并通过。单元与集成测试
-通过。secret scanner 干净，不含硬编码的私有标识符。
+本轮修复了真实的主流程集成：
+- `PolicyGateway` 现在通过 `ProjectAdapter` 和 `ValidationBackend` 执行 worktree 创建、
+  本地验证和远程验证（生产路径中无模拟远程结果）。
+- 确定性退出码是权威结果；LLM verifier 只写摘要，不能修改 `passed`、`tested_sha`、
+  selector 或阈值。
+- `CHANGES_REQUESTED` 流程不再执行非法的 `FIXING -> IMPLEMENTED` 转换。修复路径为
+  `FIXING -> LOCAL_VERIFYING`（新 candidate）-> 重新验证 -> `REMOTE_VERIFIED` -> 增量 Review。
+- `detect-models`、`model_resolver` 和 `install-profiles` 共享统一的 role key 和扁平 YAML
+  结构；生成的 `models.local.yaml` 一致解析并能渲染进 profile。
+- 远程 backend 传递 task id、配置化的 setup/verify 命令、环境变量和容器选择，并读取真实
+  的 `verification.json`。
+
+新增集成测试（`tests/integration/test_main_flow.py`）验证：adapter 被主流程调用；remote
+未配置时阻止 `REMOTE_VERIFIED`；测试失败不能被 LLM 改成通过；完整的
+`CHANGES_REQUESTED -> fix -> 重新验证 -> 增量 review` 流程通过；profile 能从生成的配置
+渲染模型。
 
 ## 测试套件
 
@@ -237,8 +260,8 @@ SHA 保真、门禁感知）。Provider/model ID 来自 `~/.config/supervisor-ca
 - `READY_WITH_KNOWN_LIMITATIONS` — 核心工作流可用；存在已记录的非关键性局限。
 - `BLOCKED` — 某项强制能力无法完成。
 
-当前总体：**READY** — 通用化已完成，所有本地检查（单元、集成、临时仓库 E2E、
-密钥扫描）通过，且 GitHub Actions CI 已端到端变绿（run 30522553455）。
+当前总体：**BLOCKED** — 主流程集成已实现且所有主流程测试在本地通过，但最新 CI 运行
+确认变绿后才能转为 READY。
 
 ## 另请参阅
 

@@ -26,16 +26,22 @@ import sys, yaml
 src, out, profile, models_file = sys.argv[1:5]
 text = open(src).read()
 mapping = yaml.safe_load(open(models_file).read()) or {}
+# Profile -> role key. MUST match model_resolver.PROFILE_TO_ROLE exactly so the
+# same models.local.yaml resolves consistently everywhere.
 role_map = {
     "researcher": "research", "glm-executor": "executor",
     "qwen-verifier": "verifier", "supervisor": "supervisor_primary",
+    "codex-planner": "planner", "codex-reviewer": "reviewer",
+    "codex-judge": "judge",
 }
 role = role_map.get(profile)
 model = None
+# Flat form: {role: "provider/model"} (what detect-models writes).
 if role and isinstance(mapping.get(role), str):
     model = mapping[role]
-elif isinstance(mapping.get("roles"), dict):
-    model = mapping["roles"].get(role)
+# Legacy nested form: roles: {role: "provider/model"}.
+elif role and isinstance(mapping.get("roles"), dict) and isinstance(mapping["roles"].get(role), str):
+    model = mapping["roles"][role]
 if model:
     # insert model: line after the provider: line in frontmatter
     lines = text.split("\n")

@@ -233,20 +233,28 @@ def validate_and_stamp(stage: str, obj: dict, task_id: str,
     """Validate `obj` against the stage schema and stamp cross-artifact fields.
 
     Requirement 4: every artifact gets task_id, stage, candidate_sha, schema_version.
-    These are extra properties; the schemas use additionalProperties:false, so we
-    validate a COPY without the stamps (the stamps are platform metadata, not
-    part of the stage schema), then add them to the returned artifact.
+    The schemas use additionalProperties:false. Platform-stamped fields
+    (task_id, candidate_sha, base_sha) that the schema does NOT declare are
+    stripped from the validation copy; fields the schema DOES declare (e.g.
+    implementation.candidate_sha, verification.tested_sha) are validated as the
+    worker emitted them. After validation, platform metadata is stamped on.
     """
     schema_file = STAGE_SCHEMA.get(stage)
     if not schema_file:
         raise WorkerError(f"unknown stage: {stage}")
     schema = _load_schema(schema_file)
-    # validate the worker's own fields (without platform stamps)
-    validation_obj = {k: v for k, v in obj.items()
-                      if k not in {"stage", "schema_version"}}
-    jsonschema.validate(validation_obj, schema)
-    # stamp platform metadata
+    declared_props = set(schema.get("properties", {}).keys())
+    # task_id is a platform stamp that schemas declare as required; stamp it
+    # before validation so the required-field check passes.
     obj["task_id"] = task_id
+    # strip platform chrome (stage/schema_version never in schemas) and any
+    # platform-stamped field the schema does not declare.
+    strip = {"stage", "schema_version"}
+    if candidate_sha is not None and "candidate_sha" not in declared_props:
+        strip.add("candidate_sha")
+    validation_obj = {k: v for k, v in obj.items() if k not in strip}
+    jsonschema.validate(validation_obj, schema)
+    # stamp remaining platform metadata after validation
     obj["stage"] = stage
     obj["schema_version"] = SCHEMA_VERSION
     if candidate_sha is not None:
@@ -390,13 +398,43 @@ class WorkerRunner:
         # Requirement: verify the commit was pushed to the remote.
         if expected_branch and not _branch_pushed(executor_worktree, expected_branch):
             raise WorkerError(f"executor: branch {expected_branch} not pushed to remote")
-        obj = validate_and_stamp("implementation", obj, task_id, real_sha)
+        # set base_sha before validation (implementation schema requires it)
         obj["candidate_sha"] = real_sha
         obj["base_sha"] = base_sha
+        obj = validate_and_stamp("implementation", obj, task_id, real_sha)
         _save_artifact(task_id, "implementation", obj)
         return obj, real_sha
 
     # --- verification (Qwen Verifier reads exit codes, does NOT build commands) ---
+
+    def run_verifier_summary(self, task_id: str, candidate_sha: str,
+                             runner_summary: str, session_name: str | None) -> str:
+        """Run the Qwen Verifier to produce a HUMAN-READABLE SUMMARY only.
+
+        The deterministic runner has already executed the tests and decided
+        pass/fail via the exit code. The LLM here only summarizes the logs for
+        the report; it CANNOT change ``passed``, ``tested_sha``, selectors, or
+        thresholds. Returns the summary string (best-effort; never authoritative).
+        """
+        prompt = (
+            f"You are the Qwen Verifier. The deterministic runner has already "
+            f"executed the tests and the exit code decided pass/fail. Your ONLY "
+            f"job is to write a concise human-readable summary of the result. "
+            f"Do NOT run tests. Do NOT change pass/fail, the tested SHA, test "
+            f"selectors, or thresholds.\n\n"
+            f"Candidate SHA: {candidate_sha}\n"
+            f"Runner summary:\n{runner_summary}\n\n"
+            "Output ONLY a short summary paragraph (no JSON, no pass/fail claim)."
+        )
+        try:
+            result = self.client.launch_worker(
+                "qwen-verifier", prompt, ".", session_name,
+                task_id=task_id, stage="verification_summary", timeout=120)
+            if result.success and result.last_message:
+                return result.last_message[:1000]
+        except Exception:
+            pass
+        return runner_summary[:1000]
 
     def run_verifier(self, task_id: str, candidate_sha: str, plan: dict,
                      executor_worktree: str, session_name: str | None,

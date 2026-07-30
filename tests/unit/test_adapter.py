@@ -54,7 +54,7 @@ def test_validation_backend_run_remote_production_cannot_fake(tmp_path):
     """Production backend with no remote pool configured MUST NOT fake REMOTE_VERIFIED."""
     cfg = _cfg()  # no remote_validation configured
     b = ValidationBackend(cfg, local_fixture=False)
-    r = b.run_remote("c1", tmp_path)
+    r = b.run_remote("T1", "c1", tmp_path)
     assert r.passed is False
     assert r.remote is True
     assert r.local_fixture is False
@@ -64,7 +64,7 @@ def test_validation_backend_run_remote_local_fixture_simulates(tmp_path):
     """A local-fixture (test) backend may simulate remote verification."""
     cfg = _cfg()
     b = ValidationBackend(cfg, local_fixture=True)
-    r = b.run_remote("c1", tmp_path)
+    r = b.run_remote("T1", "c1", tmp_path)
     assert r.passed is True
     assert r.local_fixture is True
 

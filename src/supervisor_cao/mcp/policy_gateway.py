@@ -25,6 +25,7 @@ if str(_SRC) not in sys.path:
 from supervisor_cao.state.machine import StateStore, TaskState, IllegalTransition, ShaMismatch
 from supervisor_cao.budget.codex import CodexBudget, BudgetExhausted
 from supervisor_cao.projects.config import load_project
+from supervisor_cao.projects.adapter import ProjectAdapter, ValidationBackend
 from supervisor_cao.workers.worktrees import (
     create_task_branch, add_executor_worktree, commit_and_push,
     current_sha, git_porcelain_clean,
@@ -41,6 +42,12 @@ class PolicyError(Exception):
     """Raised when a policy gate fails. Contains the error-state name."""
 
 
+def _default_backend_factory(cfg, *, local_fixture: bool = False) -> ValidationBackend:
+    """Default validation-backend factory. Production builds a real backend;
+    tests inject a local-fixture backend via the PolicyGateway constructor."""
+    return ValidationBackend(cfg, local_fixture=local_fixture)
+
+
 class PolicyGateway:
     """The deterministic policy layer. All Supervisor operations go through here."""
 
@@ -48,7 +55,9 @@ class PolicyGateway:
                  budget: CodexBudget | None = None,
                  cao_client: CaoClient | None = None,
                  stage_store: StageStore | None = None,
-                 test_mode: bool = False):
+                 test_mode: bool = False,
+                 backend_factory=None,
+                 local_fixture: bool = False):
         self.store = state_store or StateStore()
         self.budget = budget or CodexBudget()
         self.cao = cao_client or CaoClient()
@@ -57,6 +66,12 @@ class PolicyGateway:
         # Test mode is enabled via dependency injection (NOT a .test-mode file).
         # When True, the draft-PR step writes a test URL instead of calling gh.
         self.test_mode = test_mode
+        # Validation backend factory: builds a ValidationBackend from a
+        # ProjectConfig. local_fixture is a test-only flag; production never
+        # sets it. The main flow calls this so verification goes through the
+        # generic adapter/backend, not ad-hoc subprocess calls.
+        self._backend_factory = backend_factory or _default_backend_factory
+        self._local_fixture = local_fixture
 
     # --- task lifecycle ---
 
@@ -397,13 +412,14 @@ class PolicyGateway:
             self.store.transition(task_id, TaskState.IMPLEMENTED, new_candidate_sha=cand)
             return
         plan = self.get_artifact(task_id, "plan") or {}
-        # create the executor worktree (idempotent)
-        main_repo = cfg.wsl_repo or str(run_dir)
+        # create the executor worktree via the ProjectAdapter (generic)
+        adapter = ProjectAdapter(cfg)
+        main_repo = adapter.main_repo or str(run_dir)
         if Path(main_repo).exists() and (Path(main_repo) / ".git").exists():
             if not git_porcelain_clean(main_repo):
                 raise PolicyError(f"LOCAL_WORKTREE_DIRTY: main clone {main_repo} is dirty")
-            create_task_branch(main_repo, task_id, cfg.base_branch)
-            wt = add_executor_worktree(main_repo, rec.project, task_id)
+            create_task_branch(main_repo, task_id, adapter.base_branch)
+            wt = add_executor_worktree(main_repo, adapter.name, task_id)
             executor_wt = str(wt)
         else:
             executor_wt = main_repo  # temp-repo fallback
@@ -411,7 +427,7 @@ class PolicyGateway:
         self.stages.mark_running(task_id, stage, candidate_sha=base_sha)
         impl, real_sha = self.runner.run_executor(
             task_id, plan, base_sha, executor_wt, session_name,
-            expected_branch=f"agent/{task_id}")
+            expected_branch=adapter.task_branch_for(task_id))
         self.stages.complete_stage(task_id, stage, artifact_path=str(run_dir / "implementation.json"),
                                    candidate_sha=real_sha)
         self.store.transition(task_id, TaskState.IMPLEMENTED, new_candidate_sha=real_sha)
@@ -424,27 +440,43 @@ class PolicyGateway:
             self.store.transition(task_id, TaskState.LOCAL_VERIFIED, tested_sha=rec.candidate_sha)
             return
         plan = self.get_artifact(task_id, "plan") or {}
-        impl = self.get_artifact(task_id, "implementation") or {}
         from supervisor_cao.workers.worktrees import paths_for
         p = paths_for(rec.project, task_id)
         executor_wt = str(p.executor) if (p.executor / ".git").exists() else (cfg.wsl_repo or str(run_dir))
         self.stages.mark_running(task_id, stage, candidate_sha=rec.candidate_sha)
-        self.store.transition(task_id, TaskState.LOCAL_VERIFYING)
-        verify = self.runner.run_verifier(
-            task_id, rec.candidate_sha, plan, executor_wt, session_name, local=True)
-        # the verifier's passed field comes from the real pytest exit code
-        if not verify.get("passed", False):
+        if rec.state != TaskState.LOCAL_VERIFYING.value:
+            self.store.transition(task_id, TaskState.LOCAL_VERIFYING)
+        # 1. Deterministic runner via ValidationBackend: exit code is authoritative.
+        backend = self._backend_factory(cfg, local_fixture=self._local_fixture)
+        result = backend.run_local(executor_wt, rec.candidate_sha,
+                                   plan.get("test_matrix", []))
+        backend.write_artifact(result, run_dir, remote=False)
+        if not result.passed:
             self.stages.fail_stage(task_id, stage)
-            self.store.transition(task_id, TaskState.FAILED, error="local verification failed")
+            self.store.transition(task_id, TaskState.FAILED,
+                                  error="local verification failed (exit code non-zero)")
             raise PolicyError("LOCAL_VERIFYING: tests failed (real exit code non-zero)")
+        # 2. Optional LLM summary only. The LLM CANNOT change passed/tested_sha.
+        try:
+            summary = self.runner.run_verifier_summary(
+                task_id, rec.candidate_sha, result.summary, session_name)
+            verify = self.get_artifact(task_id, "verification") or {}
+            verify["llm_summary"] = summary
+            verify["passed"] = result.passed  # authoritative, re-stamped
+            verify["tested_sha"] = rec.candidate_sha  # authoritative, re-stamped
+            (run_dir / "verification.json").write_text(json.dumps(verify, indent=2))
+        except Exception:
+            pass  # LLM summary is best-effort; the exit code already decided
         self.stages.complete_stage(task_id, stage, artifact_path=str(run_dir / "verification.json"),
                                    candidate_sha=rec.candidate_sha)
         self.store.transition(task_id, TaskState.LOCAL_VERIFIED, tested_sha=rec.candidate_sha)
 
     def _stage_remote_verify(self, task_id, rec, cfg, session_name, run_dir):
-        # For temp-repo E2E (no real remote pool), remote verification is simulated
-        # by treating the local verification as the remote result. The real remote
-        # path delegates to scripts/run-verification (Stage 5 fixes the pipefail bug).
+        # Remote verification goes through the ValidationBackend. Production
+        # delegates to scripts/run-verification (real exit code). A local-fixture
+        # backend (tests) may simulate. If no remote pool is configured and this
+        # is NOT a local fixture, the backend returns FAILED and the state
+        # machine does NOT advance to REMOTE_VERIFIED (production cannot fake it).
         stage = "remote_verification"
         run, done = self.stages.begin_stage(task_id, stage, "qwen-verifier",
                                             candidate_sha=rec.candidate_sha)
@@ -454,16 +486,16 @@ class PolicyGateway:
         self.stages.mark_running(task_id, stage, candidate_sha=rec.candidate_sha)
         if rec.state == TaskState.LOCAL_VERIFIED.value:
             self.store.transition(task_id, TaskState.REMOTE_QUEUED)
-        self.store.transition(task_id, TaskState.REMOTE_VERIFYING)
-        # real remote: would call scripts/run-verification here. For temp repos,
-        # the local verification already tested the candidate; mark remote done.
-        verify = self.get_artifact(task_id, "verification") or {}
-        verify["remote_results"] = {
-            "container": "temp-repo-local", "install_ok": True,
-            "correctness_passed": verify.get("passed", True),
-            "summary": "remote verification simulated on temp repo (no remote pool)",
-        }
-        (run_dir / "verification.json").write_text(json.dumps(verify, indent=2))
+        if rec.state != TaskState.REMOTE_VERIFYING.value:
+            self.store.transition(task_id, TaskState.REMOTE_VERIFYING)
+        backend = self._backend_factory(cfg, local_fixture=self._local_fixture)
+        result = backend.run_remote(task_id, rec.candidate_sha, run_dir)
+        backend.write_artifact(result, run_dir, remote=True)
+        if not result.passed:
+            self.stages.fail_stage(task_id, stage)
+            self.store.transition(task_id, TaskState.FAILED,
+                                  error=result.summary or "remote verification failed")
+            raise PolicyError(f"REMOTE_VERIFYING: {result.summary}")
         self.stages.complete_stage(task_id, stage, candidate_sha=rec.candidate_sha)
         self.store.transition(task_id, TaskState.REMOTE_VERIFIED)
 
@@ -474,6 +506,23 @@ class PolicyGateway:
         if done:
             review = self.get_artifact(task_id, "review") or {}
             self._apply_review_decision(task_id, rec, review)
+            return
+        # If a prior full review exists for a DIFFERENT candidate (i.e. this is
+        # a re-review after a fix), route to incremental review instead of
+        # spending another full_review budget. The state machine allows
+        # REMOTE_VERIFIED -> INCREMENTAL_REVIEWING for exactly this case.
+        prior_review = self.get_artifact(task_id, "review") or {}
+        prior_stage = self.stages.get(task_id, "review")
+        prior_sha = (prior_stage.candidate_sha if prior_stage else None) \
+            or prior_review.get("candidate_sha")
+        had_prior_review = bool(prior_sha) or any(
+            e.get("to_state") == TaskState.CHANGES_REQUESTED.value
+            for e in self.store.events(task_id)
+        )
+        if had_prior_review and (not prior_sha or prior_sha != rec.candidate_sha):
+            self.store.transition(task_id, TaskState.INCREMENTAL_REVIEWING,
+                                  reviewed_sha=rec.tested_sha)
+            self._stage_incremental_review(task_id, rec, cfg, session_name, run_dir)
             return
         impl = self.get_artifact(task_id, "implementation") or {}
         verify = self.get_artifact(task_id, "verification") or {}
@@ -492,32 +541,44 @@ class PolicyGateway:
         self._apply_review_decision(task_id, rec, review)
 
     def _stage_fix(self, task_id, rec, cfg, session_name, run_dir):
-        # CHANGES_REQUESTED -> FIXING -> re-implement -> re-verify -> incremental review
+        # CHANGES_REQUESTED -> FIXING -> (new SHA) -> LOCAL_VERIFYING -> ...
+        # -> REMOTE_VERIFIED -> INCREMENTAL_REVIEWING. FIXING -> IMPLEMENTED is
+        # ILLEGAL (state machine §9); the fix goes straight to re-verification.
         stage = "fix"
         run, done = self.stages.begin_stage(task_id, stage, "glm-executor",
                                             candidate_sha=rec.candidate_sha)
         if done:
+            # fix already produced a new SHA; re-verify it. The new candidate
+            # was recorded in complete_stage; advance to re-verification.
+            cand = run.candidate_sha or rec.candidate_sha
+            if rec.state == TaskState.CHANGES_REQUESTED.value:
+                self.store.transition(task_id, TaskState.FIXING, new_candidate_sha=cand)
             self.store.transition(task_id, TaskState.LOCAL_VERIFYING)
             return
         prior_review = self.get_artifact(task_id, "review") or {}
         plan = self.get_artifact(task_id, "plan") or {}
-        from supervisor_cao.workers.worktrees import paths_for
-        p = paths_for(rec.project, task_id)
-        executor_wt = str(p.executor) if (p.executor / ".git").exists() else (cfg.wsl_repo or str(run_dir))
+        adapter = ProjectAdapter(cfg)
+        executor_wt = str(adapter.executor_worktree(task_id)) \
+            if (adapter.executor_worktree(task_id) / ".git").exists() \
+            else (adapter.main_repo or str(run_dir))
         self.stages.mark_running(task_id, stage, candidate_sha=rec.candidate_sha)
         self.store.transition(task_id, TaskState.FIXING)
-        # re-run executor with the prior review findings as guidance
+        # re-run executor with the prior review findings as guidance. The base
+        # for the diff check is the OLD candidate (the fix must change it).
         fix_plan = dict(plan)
         fix_plan["_prior_review_findings"] = prior_review.get("findings", [])
+        fix_base = rec.candidate_sha or rec.baseline_sha or _safe_head(executor_wt)
         impl, real_sha = self.runner.run_executor(
-            task_id, fix_plan, rec.baseline_sha or _safe_head(executor_wt),
+            task_id, fix_plan, fix_base,
             executor_wt, session_name,
-            expected_branch=f"agent/{task_id}")
+            expected_branch=adapter.task_branch_for(task_id))
         self.stages.complete_stage(task_id, stage, artifact_path=str(run_dir / "implementation.json"),
                                    candidate_sha=real_sha)
-        # new SHA invalidates old verification/review — re-verify then incremental review
-        self.store.transition(task_id, TaskState.IMPLEMENTED, new_candidate_sha=real_sha)
-        self.store.transition(task_id, TaskState.LOCAL_VERIFYING)
+        # new SHA invalidates old verification/review — re-verify then incremental
+        # review. FIXING -> IMPLEMENTED is ILLEGAL (state machine §9); the fix
+        # goes directly to LOCAL_VERIFYING with the new candidate_sha, which
+        # invalidates the old tested/reviewed SHAs.
+        self.store.transition(task_id, TaskState.LOCAL_VERIFYING, new_candidate_sha=real_sha)
 
     def _stage_incremental_review(self, task_id, rec, cfg, session_name, run_dir):
         stage = "incremental_review"
@@ -534,7 +595,9 @@ class PolicyGateway:
                                  input_artifact=str(run_dir / "verification.json"),
                                  candidate_sha=rec.candidate_sha)
         self.stages.mark_running(task_id, stage, candidate_sha=rec.candidate_sha)
-        self.store.transition(task_id, TaskState.INCREMENTAL_REVIEWING, reviewed_sha=rec.tested_sha)
+        cur = self.store.get(task_id)
+        if not cur or cur.state != TaskState.INCREMENTAL_REVIEWING.value:
+            self.store.transition(task_id, TaskState.INCREMENTAL_REVIEWING, reviewed_sha=rec.tested_sha)
         review = self.runner.run_incremental_reviewer(
             task_id, rec.candidate_sha, rec.tested_sha, prior_review, impl, verify,
             cfg.wsl_repo or str(run_dir), session_name)

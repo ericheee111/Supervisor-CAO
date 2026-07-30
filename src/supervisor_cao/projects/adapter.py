@@ -17,8 +17,11 @@ verification).
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+import subprocess
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from supervisor_cao.projects.config import ProjectConfig
 
@@ -59,28 +62,44 @@ class ProjectAdapter:
     def windows_repo(self) -> str:
         return self.cfg.windows_repo
 
+    def executor_worktree(self, task_id: str) -> Path:
+        """Return the executor worktree path for a task (may not exist yet)."""
+        from supervisor_cao.workers.worktrees import paths_for
+        return paths_for(self.cfg.name, task_id).executor
+
 
 @dataclass
 class ValidationResult:
-    """Structured result of one verification run. Core reads only this."""
+    """Structured result of one verification run. Core reads only this.
+
+    ``passed`` is derived from ``exit_code == 0`` and is authoritative. The LLM
+    verifier only contributes ``summary`` text — it can never flip ``passed``.
+    """
     passed: bool
     exit_code: int
     summary: str
     tested_sha: str
-    logs: dict
+    logs: dict = field(default_factory=dict)
     remote: bool = False
     local_fixture: bool = False  # True only in tests (simulated)
 
 
 class ValidationBackend:
     """Generic validation backend. Runs configured commands; the core reads the
-    exit code as authoritative. The model only summarizes, never decides."""
+    exit code as authoritative. The model only summarizes, never decides.
+
+    The remote path delegates to ``scripts/run-verification`` with configurable
+    setup/verify commands, environment variables, container selection, and the
+    task id. It reads the real ``verification.json`` the script writes.
+    """
 
     def __init__(self, cfg: ProjectConfig, *, local_fixture: bool = False):
         self.cfg = cfg
         # local_fixture is ONLY set in tests. Production backends must never
         # mark themselves as fixtures.
         self.local_fixture = local_fixture
+
+    # --- local ---
 
     def run_local(self, worktree: str, candidate_sha: str,
                   test_scope: list[str]) -> ValidationResult:
@@ -90,7 +109,6 @@ class ValidationBackend:
         command if configured, else a discovery smoke test. The exit code is
         authoritative: ``passed`` is ``exit_code == 0``.
         """
-        import subprocess
         local_cfg = self.cfg.default_verification.get("local", {})
         cmd = local_cfg.get("command")
         if cmd:
@@ -106,50 +124,121 @@ class ValidationBackend:
             summary = (r.stdout + r.stderr)[-1500:]
         except subprocess.TimeoutExpired:
             return ValidationResult(False, 124, "verification timed out after 600s",
-                                    candidate_sha, {}, remote=False,
-                                    local_fixture=self.local_fixture)
+                                    candidate_sha, local_fixture=self.local_fixture)
         except FileNotFoundError:
             # runner not installed — soft pass only for local fixtures (tests)
             return ValidationResult(self.local_fixture, 0,
                                     "runner not available; skipped (local fixture)" if self.local_fixture
                                     else "runner not available; FAILED",
-                                    candidate_sha, {}, remote=False,
-                                    local_fixture=self.local_fixture)
+                                    candidate_sha, local_fixture=self.local_fixture)
         return ValidationResult(passed, r.returncode, summary, candidate_sha,
                                 {"stdout": r.stdout[-500:], "stderr": r.stderr[-500:]},
-                                remote=False, local_fixture=self.local_fixture)
+                                local_fixture=self.local_fixture)
 
-    def run_remote(self, candidate_sha: str, run_dir: Path) -> ValidationResult:
-        """Run remote verification. Production: delegates to the configured
-        remote pool / scripts/run-verification and reads the real exit code.
-        Local-fixture (test) backends may simulate; production MUST NOT."""
+    # --- remote ---
+
+    def run_remote(self, task_id: str, candidate_sha: str,
+                   run_dir: Path) -> ValidationResult:
+        """Run remote verification.
+
+        Production: delegates to the configured remote pool via
+        ``scripts/run-verification`` and reads the real exit code + the
+        ``verification.json`` the script writes.
+
+        Local-fixture (test) backends may simulate; production MUST NOT. If no
+        remote pool is configured and this is not a local fixture, this returns
+        a FAILED result so the state machine does NOT advance to REMOTE_VERIFIED.
+        """
         if self.local_fixture:
             return ValidationResult(True, 0, "remote simulated (local fixture)",
-                                     candidate_sha, {}, remote=True,
-                                     local_fixture=True)
+                                     candidate_sha, remote=True, local_fixture=True)
         rv = self.cfg.remote_validation
         if not rv or not rv.get("ssh_host"):
             # No remote pool configured: production code MUST NOT fake this.
-            # Return a failure so the state machine does not advance to
-            # REMOTE_VERIFIED on a simulated result.
             return ValidationResult(False, 1,
                                     "no remote pool configured (production cannot fake remote verification)",
-                                    candidate_sha, {}, remote=True,
-                                    local_fixture=False)
-        # Real remote path: delegate to scripts/run-verification.
-        import subprocess
+                                    candidate_sha, remote=True)
+        return self._run_remote_script(task_id, candidate_sha, run_dir, rv)
+
+    def _run_remote_script(self, task_id: str, candidate_sha: str,
+                           run_dir: Path, rv: dict) -> ValidationResult:
+        """Delegate to scripts/run-verification with configurable commands."""
         script = Path(__file__).resolve().parents[3] / "scripts" / "run-verification"
-        cmd = ["python", str(script), "--ssh-host", rv.get("ssh_host", ""),
-               "--containers", ",".join(rv.get("containers", [])),
-               "--user", rv.get("user", ""), "--repo-path", rv.get("repo_path", ""),
-               "--candidate-sha", candidate_sha, "--run-dir", str(run_dir)]
+        containers = rv.get("containers", [])
+        # container selection: prefer the first configured container
+        container = containers[0] if containers else ""
+        cmd = ["python", str(script),
+               "--ssh-host", rv.get("ssh_host", ""),
+               "--containers", ",".join(containers),
+               "--user", rv.get("user", ""),
+               "--repo-path", rv.get("repo_path", ""),
+               "--candidate-sha", candidate_sha,
+               "--task-id", task_id,
+               "--run-dir", str(run_dir)]
+        # configurable setup/verify commands from project config
+        remote_cfg = self.cfg.default_verification.get("remote", {})
+        for setup_cmd in remote_cfg.get("setup_commands", []) or []:
+            cmd += ["--setup-command", setup_cmd]
+        for verify_cmd in remote_cfg.get("verify_commands", []) or []:
+            cmd += ["--verify-command", verify_cmd]
+        if remote_cfg.get("verify_script"):
+            cmd += ["--verify-script", str(remote_cfg["verify_script"])]
+        for env_kv in remote_cfg.get("env", []) or []:
+            cmd += ["--env", env_kv]
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
             passed = r.returncode == 0
             summary = (r.stdout + r.stderr)[-1500:]
         except subprocess.TimeoutExpired:
             return ValidationResult(False, 124, "remote verification timed out",
-                                    candidate_sha, {}, remote=True)
+                                    candidate_sha, remote=True)
+        # read the real verification.json the script wrote
+        logs = {"stdout": r.stdout[-500:] if r.stdout else "",
+                "stderr": r.stderr[-500:] if r.stderr else ""}
+        vjson = run_dir / "verification.json"
+        if vjson.exists():
+            try:
+                logs["verification_json"] = json.loads(vjson.read_text())
+            except Exception:
+                pass
         return ValidationResult(passed, r.returncode, summary, candidate_sha,
-                                {"stdout": r.stdout[-500:], "stderr": r.stderr[-500:]},
-                                remote=True)
+                                logs, remote=True)
+
+    # --- artifact writing ---
+
+    def write_artifact(self, result: ValidationResult, run_dir: Path,
+                       *, remote: bool = False) -> Path:
+        """Write/merge the verification.json artifact. The authoritative fields
+        (passed, tested_sha, exit_code) come from the result, never from the
+        LLM. An optional LLM summary may be merged under ``llm_summary``.
+        """
+        run_dir.mkdir(parents=True, exist_ok=True)
+        path = run_dir / "verification.json"
+        existing: dict[str, Any] = {}
+        if path.exists():
+            try:
+                existing = json.loads(path.read_text()) or {}
+            except Exception:
+                existing = {}
+        # authoritative fields from the backend (never overwritten by LLM)
+        existing["passed"] = result.passed
+        existing["tested_sha"] = result.tested_sha
+        existing["exit_code"] = result.exit_code
+        existing["candidate_sha"] = result.tested_sha
+        if remote:
+            existing["remote_results"] = {
+                "passed": result.passed,
+                "exit_code": result.exit_code,
+                "summary": result.summary,
+                "remote": True,
+                "local_fixture": result.local_fixture,
+            }
+        else:
+            existing["local_results"] = {
+                "passed": result.passed,
+                "exit_code": result.exit_code,
+                "summary": result.summary,
+                "local_fixture": result.local_fixture,
+            }
+        path.write_text(json.dumps(existing, indent=2))
+        return path
