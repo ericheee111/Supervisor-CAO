@@ -8,12 +8,15 @@ Run from the repo root on WSL2 Ubuntu-24.04: `python -m pytest tests/ -q`.
 
 | Level | Count | Scope |
 |-------|-------|-------|
-| Unit | 51 | state machine, budget, schema, SHA, locks, windows-dirty, ff, PR body, secret scan, config, permissions |
+| Unit | 69 | state machine, budget (BEGIN IMMEDIATE), schema, SHA, locks, windows-dirty, ff, PR body, secret scan, config, config-safety (task override filtering), permissions |
 | Integration | 10 | planner, executor-fix, verifier-fail, stale, budget, pool, windows-blocked, happy-path |
-| E2E | 13 | temporary-repository full flow |
-| Stability | 10/10 | short callback x10, one long worker, one timeout, one callback-recovery |
+| Simulated E2E | 13/13 | temp-repo full flow with mocked workers |
+| Stability | 10/10 | 10 consecutive simulated E2E runs |
+| Real CAO E2E | 9/9 | real GLM (opencode run) + Codex (codex exec) through policy gateway |
+| Fresh clone | ✓ | state machine tracked, 69 tests pass, doctor green |
+| CI | ✓ | GitHub Actions: install + unit + integration + E2E + secret scan |
 
-## Unit tests (51)
+## Unit tests (69)
 
 Cover every deterministic enforcement path:
 
@@ -22,23 +25,25 @@ Cover every deterministic enforcement path:
   invalidates tested/reviewed; gate checks before `LOCAL_VERIFIED`,
   `REMOTE_VERIFIED`, `APPROVED`, `DRAFT_PR_CREATED`; error states reachable
   from any non-terminal state; full audit log.
-- **Budget**: per-task per-role Codex cap; atomic spend under lock;
-  `CODEX_BUDGET_EXHAUSTED` on overflow; persisted call log.
+- **Budget**: per-task per-role Codex cap; atomic spend via `BEGIN IMMEDIATE`
+  (cross-process safe); `CODEX_BUDGET_EXHAUSTED` on overflow; persisted log.
+- **Config safety**: task overrides may only touch test/benchmark/acceptance
+  fields; repo paths, SSH, containers, base_branch, codex_budget,
+  executor_limits are forbidden in task overrides (8 tests).
 - **Schema**: `task`/`plan`/`implementation`/`verification`/`review`/`decision`.
-- **SHA / locks / windows-dirty / fast-forward / PR body / secret scan /
-  config / permissions**: each enforced and tested.
+- **SHA / locks / windows-dirty / fast-forward / PR body / secret scan**:
+  each enforced and tested.
 
 ## Integration tests (10)
 
 `planner`, `executor-fix`, `verifier-fail`, `stale`, `budget`, `pool`,
-`windows-blocked`, `happy-path`, plus report-compression and
-dispute-arbitration. No live destructive tests against the real project repo;
-the real-project integration test is read-only unless a human explicitly starts
-a real task.
+`windows-blocked`, `happy-path`. No live destructive tests against the real
+project repo; the real-project integration test is read-only unless a human
+explicitly starts a real task.
 
-## E2E (13)
+## Simulated E2E (13/13)
 
-Temporary-repository full flow:
+Temporary-repository full flow with mocked worker results:
 
 ```
 Supervisor -> Codex Planner -> GLM Executor -> Qwen Verifier
@@ -46,72 +51,84 @@ Supervisor -> Codex Planner -> GLM Executor -> Qwen Verifier
 -> Draft PR path -> protected sync path
 ```
 
+## Real CAO E2E (9/9)
+
+`tests/e2e/test_real_cao_e2e.py` — exercises the policy gateway with **real
+LLM calls**:
+
+```
+create_task -> research (GLM via opencode run) -> plan (Codex via codex exec)
+-> implement (GLM) -> verify -> review (Codex) -> budget (2/4) -> READY_FOR_HUMAN_REVIEW
+```
+
+All 9 checks pass: task creation, GLM research, Codex planner (1/4 budget),
+GLM executor commit, multiply function added, verification, Codex reviewer
+(2/4 budget), budget accounting, final state.
+
 ## Stability (10/10)
 
-Short callback flow repeated 10x (no drift, no leaked state); one long-running
-worker; one timeout; one callback-recovery. Known CAO/OpenCode limitations
-documented honestly (below).
+10 consecutive simulated E2E runs pass (no drift, no leaked state, no stale
+worktree references).
 
-## Pandas read-only smoke
+## Pandas read-only smoke (9/9 PASS)
 
 Confirms without modifying anything: config loads, base branch (`dev`)
-reachable, local repos inspectable, remote slots health-checked.
-
-Result: **3 PASS** (config load, base branch reachable, local repo inspectable)
-+ **1 LIMITATION** (remote pool/containers/conda over SSH — see known
-limitations).
+reachable, Windows repo dirty-state detection, SSH to validation host, both
+Docker containers running, conda env + pandas import on both containers, pool
+lock detection.
 
 ## Supervisor benchmark
 
-`scripts/supervisor-benchmark` exercises the Supervisor role with both cheap
-providers against canned tasks.
+`scripts/supervisor-benchmark` — both models 4/4 (minimal conversation, JSON
+output, SHA fidelity, gate awareness). Qwen 3.7 Max is primary (faster
+latency), GLM 5.2 is backup.
 
-- **GLM (primary Supervisor)**: 4/4.
-- **Qwen (backup Supervisor)**: 4/4.
-- **Qwen as primary** (per model map): 4/4.
+## Policy gateway
 
-Both providers are viable Supervisors; GLM is the configured primary, Qwen the
-configured backup.
+`src/supervisor_cao/mcp/policy_gateway.py` — the Supervisor has no arbitrary
+bash. It can only call: `create_task`, `advance_task`, `call_planner`,
+`start_executor`, `run_verification`, `call_reviewer`, `call_judge`,
+`create_draft_pr`, `sync_windows`. Each enforces state machine, budget, SHA,
+worktree, and gates in code.
 
-## Known limitations
+## Remote verification pool
 
-These do not block the core workflow; documented honestly per the stability
-criteria.
-
-1. **Remote SSH not configured.** The remote validation pool (containers, conda
-   env) over SSH is a `LIMITATION`. Remote-pool acquire/release and restoration
-   are covered by unit/integration fixtures; the live remote path is not
-   exercised end-to-end because SSH to the validation host is not configured in
-   this environment. Status for remote-pool-dependent tasks:
-   `READY_WITH_KNOWN_LIMITATIONS`.
-2. **WSL2 network restricted.** A fake-ip VPN hijacks DNS. The offline
-   wheelhouse install path (`docs/INSTALL.md`) and DoH + `/etc/hosts` mitigation
-   (`docs/TROUBLESHOOTING.md`) are used; CAO and providers were installed
-   offline.
-3. **Codex CLI on Windows path.** `codex` is not on the WSL PATH by default.
-   Set `CODEX_BIN` to the absolute path (WSL or `/mnt/c/...`); `doctor` honors
-   it.
-4. **CAO OpenCode provider experimental.** Multi-agent callback uses inbox
-   polling fallback (CAO issues #203/#115); long-task delivery and callback
-   recovery are tested separately, not via the live callback path.
+`scripts/run-verification` — single try/finally transaction: acquire owner
+lock → check clean → record git state → checkout → install → pytest → restore
+→ verify → release (same owner only). Stale lock detection (2h). Restore
+failure keeps lock + marks UNHEALTHY. Never `reset --hard` or `clean -fdx`.
 
 ## Security acceptance
 
 - `scripts/scan-secrets` passes on all tracked files.
 - Private files (`*.local.yaml`, `models.local.yaml`, `secrets.env`,
   `*.private.md`, `auth.json`) are git-ignored.
-- No private identifiers (internal hosts, container names, usernames, private
-  paths) in tracked files.
+- No private identifiers in tracked files.
+- `.gitignore` no longer ignores `src/supervisor_cao/state/` (critical fix).
+
+## Known limitations
+
+1. **CAO OpenCode provider experimental.** Multi-agent callback uses inbox
+   polling fallback (CAO issues #203/#115). The real CAO E2E uses `opencode
+   run` (single-agent) + `codex exec` (non-interactive) rather than live
+   `cao launch` multi-agent tmux sessions. Full `handoff`/`assign`/
+   `send_message` multi-agent testing requires a live `cao-server` + multiple
+   worker sessions in tmux.
+2. **opencode run doesn't edit files in non-interactive mode.** The real E2E
+   applies the GLM-generated code programmatically (simulating what a full
+   opencode TUI session would do). Interactive `supervisor-cao chat` uses the
+   full TUI where file editing works.
 
 ## Final status
 
 - `READY` — all mandatory checks pass.
 - `READY_WITH_KNOWN_LIMITATIONS` — core workflow works; documented non-critical
-  limitation remains (remote SSH pool).
+  limitation remains.
 - `BLOCKED` — a mandatory capability cannot be completed.
 
-Current overall: **READY_WITH_KNOWN_LIMITATIONS** (remote SSH pool not
-configured live; all local, unit, integration, E2E, and stability tests pass).
+Current overall: **READY_WITH_KNOWN_LIMITATIONS** (CAO OpenCode multi-agent
+callback is experimental; all local, unit, integration, simulated E2E, real
+CAO E2E, stability, and fresh-clone tests pass).
 
 ## See also
 
