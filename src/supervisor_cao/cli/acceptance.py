@@ -332,28 +332,15 @@ def _run_review_fix(dirs: dict[str, Path], meta: dict) -> tuple[bool, dict]:
     subprocess.run(["git", "-C", repo_dir, "reset", "--hard", "origin/main"],
                    capture_output=True, timeout=30)
     subprocess.run(["git", "-C", repo_dir, "clean", "-fd"], capture_output=True, timeout=30)
-    # inject an intentionally unsafe safe_join implementation as the starting point
-    unsafe_code = (
-        "def safe_join(base, *parts):\n"
-        "    # unsafe: joins without checking for path traversal\n"
-        "    import os\n"
-        "    return os.path.join(base, *parts)\n"
-    )
-    src_dir = Path(repo_dir) / "src" / "scao_live"
-    src_dir.mkdir(parents=True, exist_ok=True)
-    (src_dir / "paths.py").write_text(unsafe_code)
-    subprocess.run(["git", "-C", repo_dir, "add", "-A"], capture_output=True, timeout=30)
-    subprocess.run(["git", "-C", repo_dir, "commit", "-m", "add unsafe safe_join"],
-                   capture_output=True, timeout=30)
     cfg = _make_project_config(repo_dir, dirs)
     gw, store, budget, stages = _build_gateway(dirs, cfg)
     task_id = f"reviewfix-{int(time.time())}"
     print(f"  task: {task_id}")
-    print(f"  description: review safe_join for path traversal safety")
+    print(f"  description: implement safe_join (reviewer should catch path traversal)")
     gw.create_task(task_id, "acceptance",
-                   "Review src/scao_live/paths.py safe_join for path traversal safety. "
-                   "If unsafe, fix it to reject '..' traversal and add a test. "
-                   "The function must prevent escaping the base directory.",
+                   "Implement a function safe_join(base, *parts) in src/scao_live/paths.py "
+                   "that joins base with parts using os.path.join. Add a test tests/test_paths.py. "
+                   "Run pytest to verify. This is a simple path-joining utility.",
                    baseline_sha=None)
     rec = _drive_to_terminal(gw, task_id, store)
     evidence = _collect_evidence(task_id, store, budget, stages, dirs)
