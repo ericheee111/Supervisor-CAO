@@ -201,8 +201,12 @@ def extract_strict_json(text: str) -> dict:
     if not objects:
         raise WorkerError(f"no JSON object found in Worker output (len={len(text)})")
     if len(objects) > 1:
-        raise WorkerError(f"multiple JSON objects found ({len(objects)}); expected exactly one")
-    s, e, obj = objects[0]
+        # Terminal-pane fallback output may contain JSON from prior worker turns
+        # (e.g. the researcher's output is still in the tmux pane). The LAST
+        # object is the current worker's response. Use it rather than failing.
+        s, e, obj = objects[-1]
+    else:
+        s, e, obj = objects[0]
     # Check trailing non-whitespace content after the single object (within the
     # candidate text that produced it).
     cand = candidates[0]
@@ -262,8 +266,10 @@ def validate_and_stamp(stage: str, obj: dict, task_id: str,
     return obj
 
 
-def _save_artifact(task_id: str, stage: str, obj: dict) -> Path:
-    run_dir = RUN_ROOT / task_id
+def _save_artifact(task_id: str, stage: str, obj: dict,
+                   run_root: Path | None = None) -> Path:
+    root = run_root or RUN_ROOT
+    run_dir = root / task_id
     run_dir.mkdir(parents=True, exist_ok=True)
     path = run_dir / f"{stage}.json"
     path.write_text(json.dumps(obj, indent=2))
@@ -313,7 +319,7 @@ class WorkerRunner:
             raise WorkerError(f"{stage} worker failed: {result.error or 'no output'}")
         obj = extract_strict_json(result.last_message)
         obj = validate_and_stamp(stage, obj, task_id, candidate_sha)
-        _save_artifact(task_id, stage, obj)
+        _save_artifact(task_id, stage, obj, run_root=self._run_root)
         return obj
 
     # --- research ---
@@ -402,7 +408,7 @@ class WorkerRunner:
         obj["candidate_sha"] = real_sha
         obj["base_sha"] = base_sha
         obj = validate_and_stamp("implementation", obj, task_id, real_sha)
-        _save_artifact(task_id, "implementation", obj)
+        _save_artifact(task_id, "implementation", obj, run_root=self._run_root)
         return obj, real_sha
 
     # --- verification (Qwen Verifier reads exit codes, does NOT build commands) ---

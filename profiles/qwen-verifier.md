@@ -52,31 +52,45 @@ read-only with respect to source code.
 
 ## Output format
 
+Output ONLY a single JSON object (no markdown, no prose before or after, no code fences). The JSON must have exactly these fields:
+
+```json
+{
+  "task_id": "<task id being verified>",
+  "candidate_sha": "<candidate commit SHA submitted for verification>",
+  "tested_sha": "<SHA actually built and tested>",
+  "passed": true,
+  "wsl_results": {
+    "build": true,
+    "pytest_passed": true,
+    "summary": "<short human-readable summary of the local WSL run>"
+  },
+  "remote_results": {
+    "container": "<container image identifier used for the remote run>",
+    "install_ok": true,
+    "correctness_passed": true,
+    "summary": "<short human-readable summary of the remote run>"
+  },
+  "environment": { "toolchain": "<detail>", "os": "<detail>", "arch": "<detail>" },
+  "logs": {
+    "build_log": "<path to build log>",
+    "pytest_log": "<path to pytest log>",
+    "asv_log": "<path to ASV benchmark log>",
+    "remote_log": "<path to remote container run log>",
+    "exit_code": 0
+  }
+}
 ```
-## Verification report
 
-### Candidate
-- branch: <name>
-- commit: <SHA>
-- files changed: <list>
+Notes on the fields:
 
-### Correctness
-- <test id>: PASS / FAIL — <detail>
-- overall: PASS / FAIL
+- `task_id` — the identifier of the task being verified.
+- `candidate_sha` — the Git SHA of the candidate commit submitted for verification.
+- `tested_sha` — the Git SHA actually built and tested (may differ from `candidate_sha` if you rebased or amended).
+- `passed` — overall pass/fail boolean verdict for the verification.
+- `wsl_results` — local WSL build and pytest run. `build` = whether the local build succeeded; `pytest_passed` = whether the local pytest run passed; `summary` = short human-readable summary.
+- `remote_results` — remote containerized verification run. `container` = identifier of the container image used; `install_ok` = whether the package installed successfully; `correctness_passed` = whether the correctness test suite passed; `summary` = short human-readable summary.
+- `environment` — free-form object describing the verification environment (toolchain, OS, arch, dependency versions).
+- `logs` — paths to evidence log files. `exit_code` is the authoritative exit code from the deterministic verification runner; you cannot change it.
 
-### Performance
-- <benchmark id> on <arch>: <value> (baseline <value>, delta <+/-><pct>)
-- regression threshold: <pct> -> PASS / FAIL
-
-### Safety checks
-- dtype/NA/empty: PASS / FAIL — <detail>
-- overflow: PASS / FAIL — <detail>
-- thread/GIL: PASS / FAIL — <detail>
-- Cython memory: PASS / FAIL — <detail>
-
-### Remote results
-- <source>: <summary>
-
-### Verdict
-<VERIFIED / REJECTED> — <one-line reason>
-```
+Do not include any text before or after the JSON object. Do not wrap it in markdown fences. Output the raw JSON only. The platform's `extract_strict_json` parser requires exactly one JSON object; any surrounding markdown or prose will cause a parse failure.

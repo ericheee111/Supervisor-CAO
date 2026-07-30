@@ -116,26 +116,40 @@ def _parse_frontmatter(text: str) -> dict:
 
 
 def verify_profile_content(text: str, profile: str) -> list[str]:
-    """Check the profile text contains expected fields. Returns list of errors."""
+    """Check the profile text contains expected fields. Returns list of errors.
+
+    Handles both raw frontmatter (``provider: opencode_cli``) and the formatted
+    output of ``cao profile show`` (``provider:     opencode_cli`` with padding).
+    """
+    import re
     errors = []
     expected = EXPECTED_FIELDS.get(profile, {})
     fm = _parse_frontmatter(text)
-    raw = text
-    if expected.get("provider") and fm.get("provider") != expected["provider"]:
-        # fallback substring check for non-yaml envs
-        if f"provider: {expected['provider']}" not in raw:
-            errors.append(f"provider != {expected['provider']}")
-    if expected.get("role") and fm.get("role") != expected["role"]:
-        if f"role: {expected['role']}" not in raw:
-            errors.append(f"role != {expected['role']}")
-    if expected.get("mcp") and expected["mcp"] not in raw:
-        errors.append(f"missing MCP config {expected['mcp']}")
+    # try frontmatter first; fall back to tolerant line matching
+    for field, want in expected.items():
+        if field == "mcp":
+            if want not in text:
+                errors.append(f"missing MCP config {want}")
+            continue
+        fm_val = fm.get(field)
+        if fm_val == want:
+            continue
+        # tolerant: match "field: <whitespace> value" anywhere in text
+        pat = re.compile(rf"^{re.escape(field)}:\s*{re.escape(str(want))}\s*$",
+                         re.MULTILINE)
+        if not pat.search(text):
+            errors.append(f"{field} != {want}")
     return errors
 
 
 def install_one(profile: str, provider: str, role_key: str | None,
-                mapping: dict, tmpdir: Path, *, force: bool) -> None:
-    """Install a single profile. Raises on failure (no swallowing)."""
+                mapping: dict, tmpdir: Path, *, force: bool = False) -> None:
+    """Install a single profile. Raises on failure (no swallowing).
+
+    ``cao install`` does not have a --force flag; re-installing overwrites the
+    existing profile. The ``force`` arg is kept for API symmetry but does not
+    pass a flag to cao (it always overwrites).
+    """
     src = PROFILES_DIR / f"{profile}.md"
     if not src.exists():
         raise RuntimeError(f"profile source not found: {src}")
@@ -144,8 +158,6 @@ def install_one(profile: str, provider: str, role_key: str | None,
     tmp_file = tmpdir / f"{profile}.md"
     tmp_file.write_text(rendered_text)
     cmd = ["cao", "install", str(tmp_file), "--provider", provider]
-    if force:
-        cmd.append("--force")
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
     if r.returncode != 0:
         raise RuntimeError(

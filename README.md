@@ -81,11 +81,19 @@ Research → Codex Plan → GLM Implement → WSL2 quick verify
 
 ### Install Supervisor-CAO
 
+Ubuntu's system Python is PEP 668-managed — never run bare `pip install`
+against it (and never `--break-system-packages`). Install the workspace into
+an isolated `.venv` so the `supervisor-cao` and `supervisor-cao-policy-mcp`
+entry points come from this checkout, not a stale global install:
+
 ```bash
 git clone https://github.com/ericheee111/Supervisor-CAO.git
 cd Supervisor-CAO
-uv venv .venv                         # create an isolated venv (PEP 668)
-uv pip install -e ".[dev]"            # install the supervisor-cao CLI into .venv
+uv venv .venv                         # or: python3 -m venv .venv
+uv pip install -e ".[dev]"            # or: .venv/bin/pip install -e ".[dev]"
+source .venv/bin/activate             # activate before running supervisor-cao
+which supervisor-cao                  # must print .../Supervisor-CAO/.venv/bin/supervisor-cao
+which supervisor-cao-policy-mcp       # must print .../Supervisor-CAO/.venv/bin/supervisor-cao-policy-mcp
 ```
 
 ### Configure
@@ -318,11 +326,19 @@ Apache-2.0
 
 ### 安装 Supervisor-CAO
 
+Ubuntu 的系统 Python 受 PEP 668 管理 —— 绝不对它执行裸 `pip install`
+（也不要用 `--break-system-packages`）。将工作区安装到隔离的 `.venv`，
+这样 `supervisor-cao` 与 `supervisor-cao-policy-mcp` 入口点来自本次
+checkout，而非过期的全局安装：
+
 ```bash
 git clone https://github.com/ericheee111/Supervisor-CAO.git
 cd Supervisor-CAO
-uv venv .venv                         # 创建隔离 venv（PEP 668）
-uv pip install -e ".[dev]"            # 将 supervisor-cao CLI 安装到 .venv
+uv venv .venv                         # 或：python3 -m venv .venv
+uv pip install -e ".[dev]"            # 或：.venv/bin/pip install -e ".[dev]"
+source .venv/bin/activate             # 运行 supervisor-cao 前先激活
+which supervisor-cao                  # 必须输出 .../Supervisor-CAO/.venv/bin/supervisor-cao
+which supervisor-cao-policy-mcp       # 必须输出 .../Supervisor-CAO/.venv/bin/supervisor-cao-policy-mcp
 ```
 
 ### 配置

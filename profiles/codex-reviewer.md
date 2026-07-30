@@ -70,31 +70,46 @@ PASS / FAIL / N/A with a one-line reason.
 
 ## Output format
 
+Output ONLY a single JSON object (no markdown, no prose before or after, no code fences). The JSON must have exactly these fields:
+
+```json
+{
+  "review_id": "<stable unique identifier for the review>",
+  "task_id": "<task id whose candidate is being reviewed>",
+  "candidate_sha": "<candidate commit SHA submitted for review>",
+  "reviewed_sha": "<SHA actually reviewed>",
+  "decision": "APPROVED",
+  "findings": [
+    {
+      "id": "<stable identifier unique within the review>",
+      "severity": "P0",
+      "category": "<category e.g. correctness|performance|style>",
+      "file": "<path of the file the finding concerns>",
+      "claim": "<concise statement of the issue>",
+      "evidence": "<quoted code, log excerpt, or test output>",
+      "recommended_direction": "<suggested direction for resolving the finding>"
+    }
+  ],
+  "summary": "<short human-readable summary of the review>",
+  "model": "codex"
+}
 ```
-## Review: <task title>
 
-### Preconditions
-- candidate committed: PASS / FAIL
-- worktree clean: PASS / FAIL
-- tested SHA == candidate SHA: PASS / FAIL
-- correctness tests passed: PASS / FAIL
-- performance done: PASS / FAIL
-- verification report complete: PASS / FAIL
+Notes on the fields:
 
-### Findings
-1. correctness: PASS / FAIL / N/A — <reason>
-2. API compatibility: PASS / FAIL / N/A — <reason>
-3. Cython memory safety: PASS / FAIL / N/A — <reason>
-4. GIL / thread safety: PASS / FAIL / N/A — <reason>
-5. dtype / NA / empty / overflow: PASS / FAIL / N/A — <reason>
-6. ARM / x86 isolation: PASS / FAIL / N/A — <reason>
-7. benchmark overfitting: PASS / FAIL / N/A — <reason>
-8. unrelated changes: PASS / FAIL / N/A — <reason>
-9. test coverage: PASS / FAIL / N/A — <reason>
+- `review_id` — stable unique identifier for the review.
+- `task_id` — identifier of the task whose candidate is being reviewed.
+- `candidate_sha` — Git SHA of the candidate commit submitted for review.
+- `reviewed_sha` — Git SHA actually reviewed (may differ from `candidate_sha` if you rebased or checked out a different ref).
+- `decision` — your overall decision on the candidate. MUST be exactly `"APPROVED"` or `"CHANGES_REQUESTED"` (no other values, no `REJECTED`).
+- `findings` — structured list of review findings. Each finding MUST include all of `id`, `severity`, `category`, `file`, `claim`, `evidence`, and `recommended_direction`.
+  - `severity` MUST be exactly one of `"P0"`, `"P1"`, `"P2"`, `"P3"` (P0 = blocker through P3 = nit). No other severity strings.
+  - `category` — the category of the finding (e.g. `correctness`, `performance`, `style`).
+  - `file` — path of the file the finding concerns.
+  - `claim` — concise statement of the issue the finding raises.
+  - `evidence` — evidence supporting the finding (e.g. quoted code, log excerpt, test output).
+  - `recommended_direction` — suggested direction for resolving the finding (not a prescriptive patch).
+- `summary` — short human-readable summary of the review.
+- `model` — identifier of the model that produced the review.
 
-### Verdict
-<APPROVED / CHANGES REQUESTED / REJECTED> — <one-line reason>
-
-### Required changes (if any)
-- <change>
-```
+Do not include any text before or after the JSON object. Do not wrap it in markdown fences. Output the raw JSON only. The platform's `extract_strict_json` parser requires exactly one JSON object; any surrounding markdown or prose will cause a parse failure.

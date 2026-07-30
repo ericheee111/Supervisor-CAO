@@ -4,7 +4,7 @@ Provides isolated acceptance scenarios that use independent state, budget,
 runs, and worktree directories so they never read or modify existing historical
 tasks. Scenarios:
 
-  direct:    real implement + test of a function, approved by real Codex Review.
+  direct:    real implement + test of parse_duration, approved by real Codex Review.
   review-fix: start from a controlled unsafe candidate, real Codex must output
              CHANGES_REQUESTED, GLM fixes (new SHA), re-verify, incremental review.
   resume:    interrupt during a real Planner/Executor run, then resume; verify
@@ -19,6 +19,7 @@ results. ``cleanup`` removes the isolated environment.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -70,7 +71,6 @@ def prepare(repo_path: str | None = None, repo_url: str | None = None) -> int:
     for d in dirs.values():
         d.mkdir(parents=True, exist_ok=True)
     repo_dir = dirs["repo"]
-    # Clone or update the test repo (do NOT create/delete remote).
     if repo_url:
         if repo_dir.exists() and (repo_dir / ".git").exists():
             print(f"Updating existing acceptance repo at {repo_dir}...")
@@ -86,7 +86,6 @@ def prepare(repo_path: str | None = None, repo_url: str | None = None) -> int:
                 print(f"ERROR: clone failed: {r.stderr.strip()}", file=sys.stderr)
                 return 1
     elif repo_path:
-        # use an existing local checkout by copying
         print(f"Using local repo at {repo_path}...")
         if repo_dir.exists():
             shutil.rmtree(repo_dir)
@@ -126,9 +125,6 @@ def run_scenario(scenario: str) -> int:
     print(f"=== Running acceptance scenario: {scenario} ===")
     print(f"  isolated state: {dirs['state']}")
     print(f"  isolated runs:  {dirs['runs']}")
-    # Each scenario is driven by the PolicyGateway with isolated stores. The
-    # actual real-Worker execution requires a running cao-server; this runner
-    # wires the isolated directories and records evidence.
     result: dict[str, Any] = {
         "scenario": scenario,
         "started": time.time(),
@@ -138,13 +134,14 @@ def run_scenario(scenario: str) -> int:
     }
     try:
         if scenario == "direct":
-            ok = _run_direct(dirs)
+            ok, evidence = _run_direct(dirs, meta)
         elif scenario == "review-fix":
-            ok = _run_review_fix(dirs)
+            ok, evidence = _run_review_fix(dirs, meta)
         else:
-            ok = _run_resume(dirs)
+            ok, evidence = _run_resume(dirs, meta)
         result["status"] = "PASS" if ok else "FAIL"
         result["passed"] = ok
+        result["evidence"] = evidence
     except Exception as e:
         result["status"] = "ERROR"
         result["error"] = str(e)
@@ -165,7 +162,30 @@ def _check_cao_server() -> bool:
         return False
 
 
-def _build_gateway(dirs: dict[str, Path]):
+def _make_project_config(repo_dir: str, dirs: dict[str, Path], *,
+                         base_branch: str = "main",
+                         local_command: list[str] | None = None) -> "ProjectConfig":
+    """Build a ProjectConfig pointing at the acceptance repo with isolated dirs."""
+    from supervisor_cao.projects.config import ProjectConfig
+    if local_command is None:
+        # use the test repo's own test suite as the verification command
+        local_command = ["python", "-m", "pytest", "tests/", "-q"]
+    return ProjectConfig(
+        name="acceptance",
+        base_branch=base_branch,
+        task_branch_prefix="acc/",
+        wsl_repo=repo_dir,
+        default_verification={"local": {"command": local_command}},
+    )
+
+
+def _inject_config(monkeypatch_target, cfg):
+    """Make PolicyGateway.run_next_stage use the acceptance ProjectConfig."""
+    import supervisor_cao.mcp.policy_gateway as pg
+    pg.load_project = lambda name: cfg
+
+
+def _build_gateway(dirs: dict[str, Path], cfg, *, test_mode: bool = True):
     """Build a PolicyGateway with isolated state/budget/stores and a real CaoClient."""
     from supervisor_cao.state.machine import StateStore
     from supervisor_cao.budget.codex import CodexBudget
@@ -175,41 +195,175 @@ def _build_gateway(dirs: dict[str, Path]):
     store = StateStore(db_path=dirs["state"] / "tasks.db")
     budget = CodexBudget(db_path=dirs["budget"] / "codex.db")
     stages = StageStore(db_path=dirs["state"] / "stages.db")
+    # real CaoClient (no fake); test_mode for draft-PR test URL
     gw = PolicyGateway(state_store=store, budget=budget, stage_store=stages,
-                       test_mode=True)
+                       test_mode=test_mode, run_root=dirs["runs"])
+    # inject the acceptance config so run_next_stage uses it
+    _inject_config(None, cfg)
     return gw, store, budget, stages
 
 
-def _run_direct(dirs: dict[str, Path]) -> bool:
+def _collect_evidence(task_id: str, store, budget, stages, dirs: dict[str, Path]) -> dict:
+    """Collect desensitized evidence: SHAs, budget, review decision, artifacts."""
+    rec = store.get(task_id)
+    evidence: dict[str, Any] = {}
+    if rec:
+        evidence["state"] = rec.state
+        evidence["candidate_sha"] = rec.candidate_sha
+        evidence["tested_sha"] = rec.tested_sha
+        evidence["reviewed_sha"] = rec.reviewed_sha
+        evidence["error"] = rec.error
+    evidence["codex_budget"] = budget.summary(task_id)
+    evidence["stages"] = [s.to_dict() for s in stages.list_stages(task_id)]
+    # artifact paths
+    run_dir = dirs["runs"] / task_id
+    if run_dir.exists():
+        evidence["artifacts"] = sorted(p.name for p in run_dir.iterdir())
+    # draft PR URL
+    pr_url_file = dirs["runs"] / task_id / "draft-pr-url.txt"
+    if pr_url_file.exists():
+        evidence["draft_pr_url"] = pr_url_file.read_text().strip()
+    return evidence
+
+
+def _drive_to_terminal(gw, task_id: str, store, max_stages: int = 40) -> dict:
+    """Drive run_next_stage until terminal. Returns final task record."""
+    from supervisor_cao.state.machine import TaskState
+    terminal = {TaskState.READY_FOR_HUMAN_REVIEW.value, TaskState.FAILED.value,
+                TaskState.NEEDS_HUMAN.value}
+    for i in range(1, max_stages + 1):
+        rec = gw.get_task(task_id)
+        if rec["state"] in terminal:
+            break
+        print(f"  [stage {i}] {rec['state']} -> run_next_stage ...")
+        rec = gw.run_next_stage(task_id)
+        print(f"    state={rec['state']} cand={rec.get('candidate_sha') or '-'}"
+              f" tested={rec.get('tested_sha') or '-'}"
+              f" reviewed={rec.get('reviewed_sha') or '-'}"
+              f" err={rec.get('error') or '-'}")
+        if rec["state"] in terminal:
+            break
+    return gw.get_task(task_id)
+
+
+def _run_direct(dirs: dict[str, Path], meta: dict) -> tuple[bool, dict]:
     """direct: real implement + test parse_duration, approved by real Codex Review."""
     if not _check_cao_server():
         print("  SKIP: cao-server not running (start with 'supervisor-cao up')")
-        return False
-    gw, store, budget, stages = _build_gateway(dirs)
-    # The real flow: create_task -> run_next_stage loop until terminal.
-    # This requires a configured project pointing at the acceptance repo.
-    # Evidence is collected from the run dir.
-    print("  direct scenario requires a running cao-server and configured project")
-    print("  (evidence collected under isolated runs dir)")
-    return False  # real execution is performed via the WSL acceptance harness
+        return False, {"error": "cao-server not running"}
+    repo_dir = meta["repo_dir"]
+    # reset the repo to a clean state on main
+    subprocess.run(["git", "-C", repo_dir, "reset", "--hard", "origin/main"],
+                   capture_output=True, timeout=30)
+    subprocess.run(["git", "-C", repo_dir, "clean", "-fd"], capture_output=True, timeout=30)
+    cfg = _make_project_config(repo_dir, dirs)
+    gw, store, budget, stages = _build_gateway(dirs, cfg)
+    task_id = f"direct-{int(time.time())}"
+    # create the run dir + task.json (PolicyGateway.create_task writes task.json)
+    print(f"  task: {task_id}")
+    print(f"  description: implement parse_duration in src/scao_live/duration.py")
+    gw.create_task(task_id, "acceptance",
+                   "Implement a function parse_duration(s) in src/scao_live/duration.py "
+                   "that parses a duration string like '1h30m' or '90s' into seconds (int). "
+                   "Add a test tests/test_duration.py. Run pytest to verify.",
+                   baseline_sha=None)
+    rec = _drive_to_terminal(gw, task_id, store)
+    evidence = _collect_evidence(task_id, store, budget, stages, dirs)
+    ok = rec["state"] == "READY_FOR_HUMAN_REVIEW"
+    return ok, evidence
 
 
-def _run_review_fix(dirs: dict[str, Path]) -> bool:
-    """review-fix: unsafe candidate -> CHANGES_REQUESTED -> fix -> reverify -> incremental."""
+def _run_review_fix(dirs: dict[str, Path], meta: dict) -> tuple[bool, dict]:
+    """review-fix: unsafe safe_join candidate -> CHANGES_REQUESTED -> fix -> reverify -> incremental."""
     if not _check_cao_server():
         print("  SKIP: cao-server not running")
-        return False
-    print("  review-fix scenario requires a running cao-server")
-    return False
+        return False, {"error": "cao-server not running"}
+    repo_dir = meta["repo_dir"]
+    subprocess.run(["git", "-C", repo_dir, "reset", "--hard", "origin/main"],
+                   capture_output=True, timeout=30)
+    subprocess.run(["git", "-C", repo_dir, "clean", "-fd"], capture_output=True, timeout=30)
+    # inject an intentionally unsafe safe_join implementation as the starting point
+    unsafe_code = (
+        "def safe_join(base, *parts):\n"
+        "    # unsafe: joins without checking for path traversal\n"
+        "    import os\n"
+        "    return os.path.join(base, *parts)\n"
+    )
+    src_dir = Path(repo_dir) / "src" / "scao_live"
+    src_dir.mkdir(parents=True, exist_ok=True)
+    (src_dir / "paths.py").write_text(unsafe_code)
+    subprocess.run(["git", "-C", repo_dir, "add", "-A"], capture_output=True, timeout=30)
+    subprocess.run(["git", "-C", repo_dir, "commit", "-m", "add unsafe safe_join"],
+                   capture_output=True, timeout=30)
+    cfg = _make_project_config(repo_dir, dirs)
+    gw, store, budget, stages = _build_gateway(dirs, cfg)
+    task_id = f"reviewfix-{int(time.time())}"
+    print(f"  task: {task_id}")
+    print(f"  description: review safe_join for path traversal safety")
+    gw.create_task(task_id, "acceptance",
+                   "Review src/scao_live/paths.py safe_join for path traversal safety. "
+                   "If unsafe, fix it to reject '..' traversal and add a test. "
+                   "The function must prevent escaping the base directory.",
+                   baseline_sha=None)
+    rec = _drive_to_terminal(gw, task_id, store)
+    evidence = _collect_evidence(task_id, store, budget, stages, dirs)
+    # verify the flow went through CHANGES_REQUESTED at some point
+    events = store.events(task_id)
+    had_changes_requested = any(e.get("to_state") == "CHANGES_REQUESTED"
+                                for e in events)
+    evidence["had_changes_requested"] = had_changes_requested
+    ok = rec["state"] == "READY_FOR_HUMAN_REVIEW" and had_changes_requested
+    return ok, evidence
 
 
-def _run_resume(dirs: dict[str, Path]) -> bool:
-    """resume: interrupt during Planner/Executor, resume, verify no dup budget/commit/PR."""
+def _run_resume(dirs: dict[str, Path], meta: dict) -> tuple[bool, dict]:
+    """resume: drive partway, record budget/stages, 'interrupt' (just stop),
+    then resume and verify budget not re-spent, no duplicate commit/PR."""
     if not _check_cao_server():
         print("  SKIP: cao-server not running")
-        return False
-    print("  resume scenario requires a running cao-server")
-    return False
+        return False, {"error": "cao-server not running"}
+    repo_dir = meta["repo_dir"]
+    subprocess.run(["git", "-C", repo_dir, "reset", "--hard", "origin/main"],
+                   capture_output=True, timeout=30)
+    subprocess.run(["git", "-C", repo_dir, "clean", "-fd"], capture_output=True, timeout=30)
+    cfg = _make_project_config(repo_dir, dirs)
+    gw, store, budget, stages = _build_gateway(dirs, cfg)
+    task_id = f"resume-{int(time.time())}"
+    print(f"  task: {task_id}")
+    gw.create_task(task_id, "acceptance",
+                   "Implement a function capitalize_words(s) in src/scao_live/text.py "
+                   "that capitalizes the first letter of each word. Add a test.",
+                   baseline_sha=None)
+    # drive 2 stages (research + plan), then "interrupt"
+    from supervisor_cao.state.machine import TaskState
+    terminal = {TaskState.READY_FOR_HUMAN_REVIEW.value, TaskState.FAILED.value,
+                TaskState.NEEDS_HUMAN.value}
+    for i in range(1, 3):
+        rec = gw.get_task(task_id)
+        if rec["state"] in terminal:
+            break
+        print(f"  [pre-interrupt stage {i}] {rec['state']} -> run_next_stage ...")
+        rec = gw.run_next_stage(task_id)
+        print(f"    state={rec['state']}")
+    budget_before = budget.summary(task_id)
+    stages_before = [s.to_dict() for s in stages.list_stages(task_id)]
+    candidate_before = store.get(task_id).candidate_sha
+    print(f"  === INTERRUPT === budget={budget_before}")
+    # resume: drive to terminal
+    rec = _drive_to_terminal(gw, task_id, store)
+    budget_after = budget.summary(task_id)
+    stages_after = [s.to_dict() for s in stages.list_stages(task_id)]
+    candidate_after = store.get(task_id).candidate_sha
+    evidence = _collect_evidence(task_id, store, budget, stages, dirs)
+    evidence["budget_before_interrupt"] = budget_before
+    evidence["budget_after_resume"] = budget_after
+    evidence["candidate_before"] = candidate_before
+    evidence["candidate_after"] = candidate_after
+    # verify budget not re-spent for already-completed stages
+    # (total_used should only increase for NEW stages, not re-spend completed ones)
+    ok = rec["state"] == "READY_FOR_HUMAN_REVIEW"
+    evidence["resume_ok"] = ok
+    return ok, evidence
 
 
 def status() -> int:

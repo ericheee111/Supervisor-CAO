@@ -56,10 +56,13 @@ class TestStrictJsonExtraction:
         with pytest.raises(WorkerError, match="no JSON object"):
             extract_strict_json("I could not produce JSON, sorry.")
 
-    def test_rejects_multiple_objects(self):
+    def test_multiple_objects_takes_last(self):
+        """When terminal-pane fallback output contains multiple JSON objects
+        (e.g. prior worker turns), the LAST object is the current worker's
+        response. extract_strict_json returns it rather than failing."""
         text = '{"a": 1}\n{"b": 2}'
-        with pytest.raises(WorkerError, match="multiple JSON objects"):
-            extract_strict_json(text)
+        obj = extract_strict_json(text)
+        assert obj == {"b": 2}
 
     def test_rejects_trailing_content(self):
         text = '{"a": 1}\nThis is extra non-JSON content.'

@@ -57,12 +57,17 @@ class PolicyGateway:
                  stage_store: StageStore | None = None,
                  test_mode: bool = False,
                  backend_factory=None,
-                 local_fixture: bool = False):
+                 local_fixture: bool = False,
+                 run_root: Path | None = None):
         self.store = state_store or StateStore()
         self.budget = budget or CodexBudget()
-        self.cao = cao_client or CaoClient()
+        # Run root for artifacts (default ~/cao-runs; acceptance uses an
+        # isolated dir). Pass to CaoClient and WorkerRunner so evidence and
+        # artifacts go to the same place.
+        self.run_root = run_root or RUN_ROOT
+        self.cao = cao_client or CaoClient(run_root=self.run_root)
         self.stages = stage_store or StageStore()
-        self.runner = WorkerRunner(self.cao)
+        self.runner = WorkerRunner(self.cao, run_root=self.run_root)
         # Test mode is enabled via dependency injection (NOT a .test-mode file).
         # When True, the draft-PR step writes a test URL instead of calling gh.
         self.test_mode = test_mode
@@ -83,7 +88,7 @@ class PolicyGateway:
         cfg = load_project(project)
         rec = self.store.create(task_id, project, baseline_sha)
         # write task description to run dir
-        run_dir = RUN_ROOT / task_id
+        run_dir = self.run_root / task_id
         run_dir.mkdir(parents=True, exist_ok=True)
         (run_dir / "task.json").write_text(json.dumps({
             "task_id": task_id, "project": project, "description": description,
@@ -207,7 +212,7 @@ class PolicyGateway:
         if rec.candidate_sha != candidate_sha:
             raise PolicyError(
                 f"STALE_VERIFICATION: candidate={rec.candidate_sha} provided={candidate_sha}")
-        run_dir = RUN_ROOT / task_id
+        run_dir = self.run_root / task_id
         run_dir.mkdir(parents=True, exist_ok=True)
         if local:
             # local quick check: verify the SHA if worktree exists
@@ -241,7 +246,7 @@ class PolicyGateway:
         if rec.reviewed_sha != rec.candidate_sha:
             raise PolicyError(
                 f"PR_CREATION_FAILED: reviewed={rec.reviewed_sha} != candidate={rec.candidate_sha}")
-        run_dir = RUN_ROOT / task_id
+        run_dir = self.run_root / task_id
         # delegate to create-draft-pr script
         return {"status": "DRAFT_PR_CREATED", "candidate_sha": rec.candidate_sha}
 
@@ -275,10 +280,10 @@ class PolicyGateway:
 
     def get_artifact(self, task_id: str, name: str) -> dict | None:
         """Read an artifact JSON file from the task's run dir."""
-        path = RUN_ROOT / task_id / f"{name}.json"
+        path = self.run_root / task_id / f"{name}.json"
         if not path.exists():
             # allow reading without .json suffix
-            path = RUN_ROOT / task_id / name
+            path = self.run_root / task_id / name
             if not path.exists():
                 return None
         try:
@@ -316,7 +321,7 @@ class PolicyGateway:
             return rec.to_dict()  # terminal — nothing to do
         cfg = load_project(rec.project)
         session_name = f"scao-{task_id}"
-        run_dir = RUN_ROOT / task_id
+        run_dir = self.run_root / task_id
         run_dir.mkdir(parents=True, exist_ok=True)
         state = rec.state
 
@@ -388,9 +393,16 @@ class PolicyGateway:
         stage = "plan"
         run, done = self.stages.begin_stage(task_id, stage, "codex-planner")
         if done:
+            # plan already completed; advance to PLAN_READY.
+            # If still in RESEARCHING, go RESEARCHING -> PLANNING -> PLAN_READY.
+            if rec.state == TaskState.RESEARCHING.value:
+                self.store.transition(task_id, TaskState.PLANNING)
             self.store.transition(task_id, TaskState.PLAN_READY)
             return
         research = self.get_artifact(task_id, "research") or {}
+        # transition to PLANNING before spending budget (RESEARCHING -> PLANNING)
+        if rec.state != TaskState.PLANNING.value:
+            self.store.transition(task_id, TaskState.PLANNING)
         # spend Codex planner budget (idempotent: not re-spent if stage was COMPLETED)
         call = self.budget.spend(task_id, "planner",
                                  input_artifact=str(run_dir / "research.json"),
@@ -678,7 +690,7 @@ class PolicyGateway:
             raise PolicyError(f"INCREMENTAL_REVIEWING: invalid decision {decision!r}")
 
     def _save_budget_summary(self, task_id: str):
-        run_dir = RUN_ROOT / task_id
+        run_dir = self.run_root / task_id
         run_dir.mkdir(parents=True, exist_ok=True)
         summary = self.budget.summary(task_id)
         (run_dir / "codex-budget-summary.json").write_text(json.dumps(summary, indent=2))

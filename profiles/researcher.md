@@ -42,32 +42,22 @@ resolve.
 
 ## Output format
 
-Produce a report with these sections:
+Output ONLY a single JSON object (no markdown, no prose before or after, no code fences). The JSON must have exactly these fields:
 
+```json
+{
+  "task_id": "<task id>",
+  "project": "<project name>",
+  "description": "<one-line restatement of the task>",
+  "base_branch": "<base branch name or null>"
+}
 ```
-## Research Report
 
-### Task
-<one-line restatement>
+Notes on the fields:
 
-### Relevant files
-- <path>:<line> — <why it matters>
+- `task_id` — the stable identifier of the task you researched.
+- `project` — the project the task belongs to.
+- `description` — a one-line restatement of the work to be performed.
+- `base_branch` — the base branch the task branch is created from, or `null` if unknown.
 
-### Call path
-<entry point> -> <intermediate> -> <target>
-(annotate unresolved links explicitly)
-
-### Existing tests
-- <test path> — <what it covers>
-- (gaps: <what is not covered>)
-
-### Benchmarks
-- <benchmark id / file> — <what it measures, where it runs>
-
-### Hypotheses (reference only, Planner must verify)
-1. <hypothesis> — evidence: <file:line>
-2. ...
-
-### Open questions
-- <question>
-```
+Do not include any text before or after the JSON object. Do not wrap it in markdown fences. Output the raw JSON only. The platform's `extract_strict_json` parser requires exactly one JSON object; any surrounding markdown or prose will cause a parse failure.

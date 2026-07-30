@@ -68,28 +68,32 @@ flow.
 
 ## Output format
 
+Output ONLY a single JSON object (no markdown, no prose before or after, no code fences). The JSON must have exactly these fields:
+
+```json
+{
+  "decision_id": "<stable unique identifier for the decision>",
+  "task_id": "<task id whose dispute is being arbitrated>",
+  "dispute_id": "<identifier of the dispute being arbitrated>",
+  "candidate_sha": "<Git SHA of the candidate commit under dispute>",
+  "ruling": "uphold_finding",
+  "rationale": "<the judge's rationale for the ruling>",
+  "evidence_cited": ["<evidence reference>", "<evidence reference>"],
+  "new_evidence_present": false,
+  "model": "codex"
+}
 ```
-## Arbitration: <dispute title>
 
-### Dispute class
-<EXECUTOR_REJECTS_P0_P1 | CORRECTNESS_VS_PERFORMANCE | ARM_X86_ISOLATION | VERIFIER_VS_REVIEWER | NO_JURISDICTION>
+Notes on the fields:
 
-### Disputed finding
-<one-line statement of the point under dispute>
+- `decision_id` — stable unique identifier for the decision.
+- `task_id` — identifier of the task whose dispute is being arbitrated.
+- `dispute_id` — identifier of the dispute being arbitrated.
+- `candidate_sha` — Git SHA of the candidate commit under dispute.
+- `ruling` — the judge's ruling on the disputed finding. MUST be exactly one of `"uphold_finding"`, `"overturn_finding"`, or `"modify_finding"` (no other values).
+- `rationale` — the judge's rationale for the ruling.
+- `evidence_cited` — list of evidence references (e.g. log paths, finding ids, code excerpts) cited in support of the ruling.
+- `new_evidence_present` — boolean; whether the judge introduced new evidence not previously available to the reviewer or executor.
+- `model` — identifier of the model that produced the decision.
 
-### Evidence considered
-- <artifact: detail>
-- <artifact: detail>
-
-### Reasoning
-<short, focused reasoning. Cite the specific evidence.>
-
-### Verdict
-<UPHOLD_FINDING | OVERTURN_FINDING | CORRECTNESS_WINS | PERFORMANCE_WINS | REPLAN | NO_JURISDICTION>
-
-### Binding instruction
-<one-line instruction to the affected role(s)>
-
-### Scope note
-<this verdict applies only to the disputed point above and only for this task>
-```
+Do not include any text before or after the JSON object. Do not wrap it in markdown fences. Output the raw JSON only. The platform's `extract_strict_json` parser requires exactly one JSON object; any surrounding markdown or prose will cause a parse failure.

@@ -222,6 +222,19 @@ class CaoClient:
             last_message = data.get("last_message")
             raw = ""
             if last_message:
+                # CAO's run-step may truncate last_message. If it looks truncated
+                # (contains a '{' but doesn't end with '}' or '```'), try the
+                # raw-output fallback which parses the full terminal pane.
+                looks_truncated = ("{" in last_message
+                                   and not last_message.rstrip().endswith("}")
+                                   and not last_message.rstrip().endswith("```"))
+                if looks_truncated and terminal_id:
+                    fb = self._fallback_extract(terminal_id)
+                    if fb is not None and len(fb) > len(last_message):
+                        self._save_evidence(task_id, stage, profile, session_name,
+                                            terminal_id, fb, fb, success=True, fallback=True)
+                        return WorkerResult(True, fb, terminal_id, session_name, fb,
+                                            used_fallback=True)
                 self._save_evidence(task_id, stage, profile, session_name,
                                     terminal_id, last_message, raw, success=True)
                 return WorkerResult(True, last_message, terminal_id, session_name, raw)

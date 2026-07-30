@@ -303,6 +303,17 @@ class StateStore:
         # error states reachable from any non-terminal state
         if to_str in ERROR_STATES:
             return True
+        # FAILED and NEEDS_HUMAN are reachable from any non-terminal state
+        # (a stage can fail or need human intervention at any point)
+        if to_str in (TaskState.FAILED.value, TaskState.NEEDS_HUMAN.value):
+            try:
+                src = TaskState(from_str)
+            except ValueError:
+                return False
+            # terminal states cannot transition out
+            if src in (TaskState.READY_FOR_HUMAN_REVIEW, TaskState.NEEDS_HUMAN):
+                return False
+            return True
         try:
             src = TaskState(from_str)
         except ValueError:

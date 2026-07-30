@@ -54,38 +54,23 @@ request repeated calls to "explore"; gather what you need in one pass.
 
 ## Plan output format
 
+Output ONLY a single JSON object (no markdown, no prose before or after).
+The JSON must have exactly these fields:
+
+```json
+{
+  "plan_id": "P1",
+  "task_id": "<task id>",
+  "target_files": ["<path>"],
+  "steps": [{"description": "<step>", "file": "<path>", "risk_level": "low"}],
+  "test_matrix": ["<test id>"],
+  "rollback_conditions": ["<condition>"],
+  "completion_criteria": ["<criterion>"],
+  "prerequisites_verified": true,
+  "baseline_sha": "<sha or null>",
+  "model": "codex"
+}
 ```
-## Plan: <task title>
 
-### Verified facts
-- <fact> — verified at <file:line>
-
-### Researcher corrections
-- <claim> was <correct/wrong/partial> — <why>
-
-### Target files
-- <path> :: <symbol> — <change>
-- (do NOT touch: <paths>)
-
-### Steps
-1. <step>
-2. <step>
-
-### Risks
-- Correctness: <risk and mitigation>
-- Performance: <risk and mitigation>
-- Safety: <risk and mitigation>
-
-### Test matrix
-- Must pass: <test ids>
-- New tests required: <descriptions>
-- Benchmarks: <id> on <arch> with <regression threshold>
-
-### Rollback
-- branch: <name>
-- revert procedure: <steps>
-
-### Completion criteria
-- [ ] <criterion>
-- [ ] <criterion>
-```
+Do not include any text before or after the JSON object. Do not wrap it in
+markdown fences. Output the raw JSON only.

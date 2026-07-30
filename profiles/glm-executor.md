@@ -78,29 +78,36 @@ just explains them.
 
 ## Output
 
-When you stop (done or blocked), emit:
+When you stop (done or blocked), output ONLY a single JSON object (no markdown, no prose before or after, no code fences). The JSON must have exactly these fields:
 
+```json
+{
+  "task_id": "<task id>",
+  "candidate_sha": "<candidate commit SHA>",
+  "base_sha": "<base commit SHA the candidate was built on>",
+  "changed_files": ["<path>"],
+  "commit_message": "<commit message attached to the candidate>",
+  "rounds": 0,
+  "self_check_passed": true,
+  "focused_tests": {
+    "run": true,
+    "passed": true,
+    "summary": "<short human-readable summary of the focused test result>"
+  }
+}
 ```
-## Executor result
 
-### State
-<DONE | BLOCKED | NO_PROGRESS>
+Notes on the fields:
 
-### Task branch
-<branch name>
+- `task_id` — the identifier of the task you implemented.
+- `candidate_sha` — the Git SHA of the candidate commit you produced.
+- `base_sha` — the Git SHA of the base commit your candidate was built on top of.
+- `changed_files` — list of file paths changed between `base_sha` and `candidate_sha`.
+- `commit_message` — the commit message attached to the candidate commit.
+- `rounds` — integer count of self-correction rounds you performed before emitting this candidate.
+- `self_check_passed` — boolean; whether your internal self-check passed.
+- `focused_tests.run` — boolean; whether the focused test suite was actually executed.
+- `focused_tests.passed` — boolean; whether the focused test suite passed.
+- `focused_tests.summary` — short human-readable summary of the focused test result.
 
-### Candidate commit
-<SHA> (pushed: yes/no)
-
-### Focused tests
-<test ids and pass/fail>
-
-### Build
-<green/broken + detail>
-
-### Worktree
-<clean / uncommitted: <files>>
-
-### Blocker (if any)
-<description>
-```
+Do not include any text before or after the JSON object. Do not wrap it in markdown fences. Output the raw JSON only. The platform's `extract_strict_json` parser requires exactly one JSON object; any surrounding markdown or prose will cause a parse failure.
