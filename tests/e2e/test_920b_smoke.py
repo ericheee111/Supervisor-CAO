@@ -99,7 +99,7 @@ def main() -> int:
     run_dir = Path.home() / "cao-runs" / f"920b-smoke-{int(time.time())}"
     run_dir.mkdir(parents=True, exist_ok=True)
     r = subprocess.run(
-        ["python", str(RUN_VERIFICATION),
+        ["python3", str(RUN_VERIFICATION),
          "--ssh-host", ssh_host, "--container", healthy, "--user", user,
          "--repo-path", repo_path, "--conda-env", conda_env,
          "--candidate-sha", candidate_sha, "--task-id", f"smoke-{int(time.time())}",
