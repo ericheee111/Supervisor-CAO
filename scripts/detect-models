@@ -25,30 +25,44 @@ DEFAULT_AUTH = Path.home() / ".local" / "share" / "opencode" / "auth.json"
 # On WSL2 the OpenCode install may be shared from Windows; allow override via env.
 WIN_AUTH = Path(os.environ.get("OPENCODE_AUTH_PATH", "")) if os.environ.get("OPENCODE_AUTH_PATH") else None
 
-# Role -> (provider preference order, model-id matcher)
-# Matchers are substring/regex on the model id (provider/model).
-ROLE_SPECS = {
-    "supervisor_primary": {
-        "candidates": ["zhipuai/glm-5.2", "alibaba-cn/qwen3.7-max"],
-        "label": "GLM 5.2",
-    },
-    "supervisor_backup": {
-        "candidates": ["alibaba-cn/qwen3.7-max", "zhipuai/glm-5.2"],
-        "label": "Qwen 3.7 Max",
-    },
-    "glm_executor": {
-        "candidates": ["zhipuai/glm-5.2", "alibaba-cn/glm-5.2"],
-        "label": "GLM 5.2",
-    },
-    "qwen_verifier": {
-        "candidates": ["alibaba-cn/qwen3.7-max", "alibaba-cn/qwen3-max", "alibaba-cn/qwen-plus"],
-        "label": "Qwen",
-    },
-    "researcher": {
-        "candidates": ["zhipuai/glm-5.2", "alibaba-cn/qwen3.7-max"],
-        "label": "GLM/Qwen cheap",
-    },
+# Candidate model ids are NOT hard-coded here. They are read from a local
+# (gitignored) candidates file so the public source contains no specific model
+# ids. The file maps role -> ordered list of candidate "provider/model" ids.
+# If absent, detection lists available models without preferring any.
+CANDIDATES_FILE = Path.home() / ".config" / "supervisor-cao" / "model-candidates.yaml"
+
+# Role labels are generic descriptors (not model ids).
+ROLE_LABELS = {
+    "supervisor_primary": "primary supervisor model",
+    "supervisor_backup": "backup supervisor model",
+    "glm_executor": "executor model",
+    "qwen_verifier": "verifier model",
+    "researcher": "researcher model",
 }
+
+
+def _load_role_specs() -> dict:
+    """Load role -> candidate model list from the local candidates file.
+
+    Returns {} if the file is absent (no preferences; all detected models
+    listed without selection). Never hard-codes model ids in source.
+    """
+    if not CANDIDATES_FILE.exists():
+        return {role: {"candidates": [], "label": lbl}
+                for role, lbl in ROLE_LABELS.items()}
+    try:
+        import yaml
+        data = yaml.safe_load(CANDIDATES_FILE.read_text()) or {}
+    except Exception:
+        return {role: {"candidates": [], "label": lbl}
+                for role, lbl in ROLE_LABELS.items()}
+    specs = {}
+    for role, lbl in ROLE_LABELS.items():
+        cands = data.get(role, [])
+        if isinstance(cands, str):
+            cands = [cands]
+        specs[role] = {"candidates": list(cands or []), "label": lbl}
+    return specs
 
 
 def find_auth_json(opencode_config: str | None) -> Path | None:
@@ -111,9 +125,10 @@ def pick_model(available: list[str], candidates: list[str]) -> str | None:
 
 
 def build_mapping(providers: list[str], models: list[str]) -> dict:
+    specs = _load_role_specs()
     mapping = {"providers": providers, "models_available_count": len(models)}
     roles = {}
-    for role, spec in ROLE_SPECS.items():
+    for role, spec in specs.items():
         chosen = pick_model(models, spec["candidates"])
         roles[role] = {"model": chosen, "label": spec["label"], "configured": chosen is not None}
     mapping["roles"] = roles

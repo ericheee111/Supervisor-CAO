@@ -25,7 +25,7 @@ boundary is treated as potentially unsafe.
 ```
 ~/.config/supervisor-cao/          # models.local.yaml, projects/*.local.yaml, secrets.env
 ~/.local/state/supervisor-cao/     # task DB, codex budget DB
-~/cao-runs/                        # logs, test results, ASV, audit records
+~/cao-runs/                        # logs, test results, verification artifacts, audit records
 ```
 
 ### Secret scanner
@@ -85,7 +85,7 @@ Only the platform sync script may operate on the Windows repository.
 - Refuse dirty repositories (`REMOTE_WORKTREE_DIRTY`)
 - Restore original branch and HEAD after (no `reset --hard`, no `clean -fdx`)
 - Validate restoration; mark `UNHEALTHY` on failure
-- LLMs never poll long-running ASV; deterministic runners execute and collect
+- LLMs never poll long-running verification; deterministic runners execute and collect
 
 ## Codex budget enforcement
 
@@ -151,7 +151,7 @@ Supervisor-CAO 协调外部模型提供商、本地 CLI 工具、Git
 ```
 ~/.config/supervisor-cao/          # models.local.yaml, projects/*.local.yaml, secrets.env
 ~/.local/state/supervisor-cao/     # task DB, codex budget DB
-~/cao-runs/                        # logs, test results, ASV, audit records
+~/cao-runs/                        # logs, test results, verification artifacts, audit records
 ```
 
 ### Secret scanner
@@ -211,7 +211,7 @@ auto-merge of dev
 - 拒绝脏仓库（`REMOTE_WORKTREE_DIRTY`）
 - 操作后恢复原始分支和 HEAD（不使用 `reset --hard`，不使用 `clean -fdx`）
 - 验证恢复；失败时标记为 `UNHEALTHY`
-- LLM 永不轮询长时间运行的 ASV；由确定性 runner 执行并收集
+- LLM 永不轮询长时间运行的验证；由确定性 runner 执行并收集
 
 ## Codex 预算强制
 

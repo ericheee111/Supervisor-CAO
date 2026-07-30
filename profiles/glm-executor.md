@@ -3,7 +3,6 @@ name: glm-executor
 description: GLM Executor editing only its assigned worktree; build, focused test, commit, push task branch.
 role: developer
 provider: opencode_cli
-model: zhipuai/glm-5.2
 ---
 
 # GLM Executor

@@ -1,20 +1,27 @@
 #!/usr/bin/env python3
 """run-verification: deterministic remote verification runner (spec §13, §14).
 
-Runs the 920B pool verification as a single try/finally transaction:
+Runs remote verification as a single try/finally transaction:
   select container -> acquire owner lock -> check clean -> record git state
-  -> checkout candidate -> install -> pytest -> ASV -> restore git state
-  -> verify restoration -> release lock (same owner only).
+  -> checkout candidate -> run configured verification commands -> restore
+  git state -> verify restoration -> release lock (same owner only).
 
-Failure handling:
+The verification commands are NOT hard-coded here. They come from:
+  - the project config's ``default_verification.remote`` steps, OR
+  - the ``--verify-command`` argument (repeatable), OR
+  - a ``--verify-script`` file run inside the container.
+
+The platform core only reads this script's exit code and the structured
+verification.json it writes. Failure handling:
   - stale lock: detect and refuse (don't delete someone else's lock)
   - restore failure: keep lock, mark container UNHEALTHY
   - never reset --hard, never clean -fdx
 
 Usage:
-  run-verification --ssh-host H --container C --user U --repo-path P \
-      --conda-env E --candidate-sha SHA --task-id T [--run-dir PATH] \
-      [--conda-path /opt/miniforge3] [--toolchain-enable /opt/rh/gcc-toolset-12/enable]
+  run-verification --ssh-host H --container C --user U --repo-path P \\
+      --candidate-sha SHA --task-id T [--run-dir PATH] \\
+      [--verify-command 'CMD'] [--verify-script FILE] \\
+      [--setup-command 'CMD'] [--env KEY=VAL]...
 """
 from __future__ import annotations
 
@@ -57,36 +64,32 @@ def _acquire_lock(ssh_host: str, container: str, task_id: str,
              timeout=20)
     if r.returncode == 0 and "ACQUIRED" in r.stdout:
         return True
-    # lock exists — check if it's ours or stale
     r2 = _ssh(ssh_host, f"cat {lock_file} 2>/dev/null || echo EMPTY", timeout=15)
     try:
         owner_info = json.loads(r2.stdout.strip())
         if owner_info.get("task_id") == task_id:
-            return True  # already ours
-        # check stale: if lock older than 2 hours, it's stale
+            return True
         lock_ts = owner_info.get("ts", 0)
         if time.time() - lock_ts > 7200:
-            # stale lock — take over atomically
             r3 = _ssh(ssh_host,
                       f"echo '{info}' > {lock_file} 2>/dev/null && echo ACQUIRED || echo TAKEN",
                       timeout=15)
             return r3.returncode == 0 and "ACQUIRED" in r3.stdout
     except (json.JSONDecodeError, TypeError):
         pass
-    return False  # locked by someone else, not stale
+    return False
 
 
 def _release_lock(ssh_host: str, container: str, task_id: str) -> bool:
     """Release lock ONLY if owned by task_id. Never deletes others' locks."""
     lock_file = f"/tmp/scao-{container}.lock"
-    # verify ownership before deleting
     r = _ssh(ssh_host, f"cat {lock_file} 2>/dev/null || echo EMPTY", timeout=15)
     try:
         owner_info = json.loads(r.stdout.strip())
         if owner_info.get("task_id") != task_id:
-            return False  # not ours, refuse to delete
+            return False
     except (json.JSONDecodeError, TypeError):
-        return False  # can't verify ownership, refuse
+        return False
     r2 = _ssh(ssh_host, f"rm -f {lock_file} && echo RELEASED", timeout=20)
     return r2.returncode == 0 and "RELEASED" in r2.stdout
 
@@ -94,25 +97,40 @@ def _release_lock(ssh_host: str, container: str, task_id: str) -> bool:
 def main() -> int:
     ap = argparse.ArgumentParser(description="Remote verification runner")
     ap.add_argument("--ssh-host", required=True)
-    ap.add_argument("--container", required=True)
+    ap.add_argument("--containers", required=True, help="comma-separated container names")
     ap.add_argument("--user", required=True)
     ap.add_argument("--repo-path", required=True)
-    ap.add_argument("--conda-env", required=True)
-    ap.add_argument("--conda-path", default="/opt/miniforge3")
-    ap.add_argument("--toolchain-enable", default="/opt/rh/gcc-toolset-12/enable")
     ap.add_argument("--candidate-sha", required=True)
     ap.add_argument("--task-id", required=True)
     ap.add_argument("--run-dir", default=None)
+    # Configurable verification commands (NOT hard-coded pytest/ASV).
+    ap.add_argument("--setup-command", action="append", default=[],
+                    help="setup command to run in the container before verify (repeatable)")
+    ap.add_argument("--verify-command", action="append", default=[],
+                    help="verification command to run in the container (repeatable; ALL must pass)")
+    ap.add_argument("--verify-script", default=None,
+                    help="path to a script file copied into the container and run")
+    ap.add_argument("--env", action="append", default=[],
+                    help="environment variable KEY=VAL for the verify commands (repeatable)")
     args = ap.parse_args()
+
+    containers = [c.strip() for c in args.containers.split(",") if c.strip()]
+    container = containers[0] if containers else ""
 
     run_dir = Path(args.run_dir) if args.run_dir else RUN_ROOT / args.task_id
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    result = {"task_id": args.task_id, "container": args.container,
+    result = {"task_id": args.task_id, "container": container,
               "candidate_sha": args.candidate_sha, "started": time.time(), "stale": False}
 
+    env_exports = ""
+    for kv in args.env:
+        if "=" in kv:
+            k, v = kv.split("=", 1)
+            env_exports += f"export {shlex.quote(k)}={shlex.quote(v)}; "
+
     # 1. reachability
-    r = _ssh(args.ssh_host, f"docker inspect --format='{{{{.State.Running}}}}' {args.container}", timeout=20)
+    r = _ssh(args.ssh_host, f"docker inspect --format='{{{{.State.Running}}}}' {container}", timeout=20)
     if r.returncode != 0 or "true" not in r.stdout:
         result["status"] = "UNREACHABLE"
         result["error"] = r.stderr.strip()
@@ -121,7 +139,7 @@ def main() -> int:
         return 3
 
     # 2. acquire lock (owner = task_id)
-    locked = _acquire_lock(args.ssh_host, args.container, args.task_id, args.candidate_sha)
+    locked = _acquire_lock(args.ssh_host, container, args.task_id, args.candidate_sha)
     if not locked:
         result["status"] = "BUSY"
         result["error"] = "container locked by another task"
@@ -129,37 +147,32 @@ def main() -> int:
         print(json.dumps(result, indent=2))
         return 5
 
-    # === TRY/FINALLY TRANSACTION ===
-    git_before = {}
+    git_before: dict = {}
     try:
         # 3. record git state before
         for k, c in [("branch", "git rev-parse --abbrev-ref HEAD"),
                      ("head", "git rev-parse HEAD"),
                      ("porcelain", "git status --porcelain")]:
-            rr = _in_container(args.ssh_host, args.container, args.user,
+            rr = _in_container(args.ssh_host, container, args.user,
                                f"cd {args.repo_path} && {c}", timeout=25)
             git_before[k] = rr.stdout.strip() if rr.returncode == 0 else f"ERR:{rr.stderr.strip()}"
         (run_dir / "git-state-before.json").write_text(json.dumps(git_before, indent=2))
 
-        # refuse dirty
         if git_before.get("porcelain"):
-            # Requirement 5: dirty-on-start — release the lock we acquired,
-            # return REMOTE_WORKTREE_DIRTY WITHOUT checkout/install/test.
-            # Do NOT modify the repository; do NOT run restore/after-check.
             result["status"] = "REMOTE_WORKTREE_DIRTY"
             result["git_before"] = git_before
-            result["restored"] = True  # nothing was changed
-            _release_lock(args.ssh_host, args.container, args.task_id)
+            result["restored"] = True
+            _release_lock(args.ssh_host, container, args.task_id)
             result["finished"] = time.time()
             (run_dir / "verification.json").write_text(json.dumps(result, indent=2))
             print(json.dumps(result, indent=2))
-            return 4  # dirty-on-start exit code
+            return 4
 
         # 4. fetch + checkout candidate (NO reset --hard, NO clean)
         for name, cmd in [("fetch", f"cd {args.repo_path} && git fetch origin"),
                           ("checkout", f"cd {args.repo_path} && git checkout {args.candidate_sha}"),
                           ("head_check", f"cd {args.repo_path} && git rev-parse HEAD")]:
-            rr = _in_container(args.ssh_host, args.container, args.user, cmd, timeout=120)
+            rr = _in_container(args.ssh_host, container, args.user, cmd, timeout=120)
             (run_dir / f"{name}.log").write_text(rr.stdout + rr.stderr)
             if name == "head_check":
                 result["remote_head"] = rr.stdout.strip()
@@ -167,24 +180,47 @@ def main() -> int:
                     result["status"] = "STALE_VERIFICATION"
                     result["stale"] = True
 
-        # 5. editable install (pipefail so a failed install is not masked)
-        install_cmd = (f"cd {args.repo_path} && set -o pipefail && source {args.conda_path}/etc/profile.d/conda.sh "
-                       f"&& conda activate {args.conda_env} && source {args.toolchain_enable} "
-                       f"&& export CC=gcc CXX=g++ && python -m pip install -e . --no-build-isolation 2>&1")
-        rr = _in_container(args.ssh_host, args.container, args.user, install_cmd, timeout=900)
-        (run_dir / "install.log").write_text(rr.stdout + rr.stderr)
-        result["install_ok"] = rr.returncode == 0
+        # 5. setup commands (configurable; e.g. activate env, install)
+        setup_results = []
+        for i, cmd in enumerate(args.setup_command):
+            full = f"{env_exports}cd {args.repo_path} && set -o pipefail && {cmd}"
+            rr = _in_container(args.ssh_host, container, args.user, full, timeout=900)
+            (run_dir / f"setup-{i}.log").write_text(rr.stdout + rr.stderr)
+            setup_results.append({"command": cmd, "ok": rr.returncode == 0})
+            if rr.returncode != 0:
+                result["status"] = "FAILED"
+                result["setup"] = setup_results
+                break
+        result["setup"] = setup_results
 
-        # 6. focused pytest — pipefail so pytest's exit code is NOT masked by tail
-        # (requirement 5: pytest ... | tail must not let tail's exit code win).
-        pytest_cmd = (f"cd {args.repo_path} && set -o pipefail && source {args.conda_path}/etc/profile.d/conda.sh "
-                      f"&& conda activate {args.conda_env} && source {args.toolchain_enable} "
-                      f"&& export CC=gcc CXX=g++ && python -m pytest -q 2>&1 | tail -20")
-        rr = _in_container(args.ssh_host, args.container, args.user, pytest_cmd, timeout=1800)
-        (run_dir / "pytest.log").write_text(rr.stdout + rr.stderr)
-        result["pytest_passed"] = rr.returncode == 0
+        # 6. verification commands (configurable). The exit code is authoritative.
+        verify_results = []
+        all_passed = result.get("status") != "FAILED"
+        if all_passed and (args.verify_command or args.verify_script):
+            cmds = list(args.verify_command)
+            if args.verify_script:
+                script_text = Path(args.verify_script).read_text()
+                cmds.append(script_text)
+            for i, cmd in enumerate(cmds):
+                full = f"{env_exports}cd {args.repo_path} && set -o pipefail && {cmd}"
+                rr = _in_container(args.ssh_host, container, args.user, full, timeout=1800)
+                (run_dir / f"verify-{i}.log").write_text(rr.stdout + rr.stderr)
+                ok = rr.returncode == 0
+                verify_results.append({"command": cmd[:80], "ok": ok, "exit_code": rr.returncode})
+                if not ok:
+                    all_passed = False
+                    break
+        elif all_passed and not args.verify_command and not args.verify_script:
+            # No verification commands configured: cannot claim verified.
+            all_passed = False
+            result["error"] = "no verify-command or verify-script configured"
+        result["verify"] = verify_results
+        result["verify_passed"] = all_passed
 
-        result["status"] = result.get("status", "REMOTE_VERIFIED" if result["pytest_passed"] else "FAILED")
+        if all_passed and result.get("status") != "STALE_VERIFICATION":
+            result["status"] = "REMOTE_VERIFIED"
+        elif "status" not in result:
+            result["status"] = "FAILED"
 
     except Exception as e:
         result["status"] = result.get("status", "FAILED")
@@ -193,15 +229,14 @@ def main() -> int:
     finally:
         # 7. restore git state (NO reset --hard, NO clean -fdx)
         if git_before.get("branch") and git_before["branch"] != "ERR":
-            _in_container(args.ssh_host, args.container, args.user,
+            _in_container(args.ssh_host, container, args.user,
                           f"cd {args.repo_path} && git checkout {shlex.quote(git_before['branch'])}",
                           timeout=30)
-        # 8. verify restoration
         git_after = {}
         for k, c in [("branch", "git rev-parse --abbrev-ref HEAD"),
                      ("head", "git rev-parse HEAD"),
                      ("porcelain", "git status --porcelain")]:
-            rr = _in_container(args.ssh_host, args.container, args.user,
+            rr = _in_container(args.ssh_host, container, args.user,
                                f"cd {args.repo_path} && {c}", timeout=25)
             git_after[k] = rr.stdout.strip() if rr.returncode == 0 else f"ERR:{rr.stderr.strip()}"
         (run_dir / "git-state-after.json").write_text(json.dumps(git_after, indent=2))
@@ -209,16 +244,13 @@ def main() -> int:
                     and not git_after.get("porcelain", ""))
 
         if not restored:
-            # restore failed: keep lock, mark UNHEALTHY
             result["status"] = "UNHEALTHY"
             result["restored"] = False
             result["error"] = (result.get("error", "") +
                                f"; restore failed: head {git_after.get('head')} != {git_before.get('head')}")
-            # DO NOT release lock — container is unhealthy
         else:
             result["restored"] = True
-            # 9. release lock (same owner only)
-            _release_lock(args.ssh_host, args.container, args.task_id)
+            _release_lock(args.ssh_host, container, args.task_id)
 
         result["finished"] = time.time()
         (run_dir / "verification.json").write_text(json.dumps(result, indent=2))

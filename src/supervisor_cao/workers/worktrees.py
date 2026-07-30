@@ -1,9 +1,9 @@
 """Git worktree management (spec §12).
 
-Per-task isolated worktrees under ~/cao-worktrees/pandas/<task-id>/{executor,verifier,reviewer}.
+Per-task isolated worktrees under ~/cao-worktrees/<project>/<task-id>/{executor,verifier,reviewer}.
 - executor: writable, on agent/<task-id> branch
 - verifier/reviewer: read-only checkouts of the candidate SHA
-- main clone (~/projects/pandas) only used for fetch/branch/worktree mgmt, never edited.
+- main clone (project repo) only used for fetch/branch/worktree mgmt, never edited.
 - no force push, no base-branch rewrite, every valid candidate committed+pushed.
 """
 from __future__ import annotations
@@ -53,14 +53,14 @@ def git_porcelain_clean(repo: str) -> bool:
     return r.stdout.strip() == ""
 
 
-def fetch_main(main_repo: str, base_branch: str = "dev") -> str:
+def fetch_main(main_repo: str, base_branch: str = "main") -> str:
     """Fetch origin and return the latest base-branch SHA. Does NOT modify working tree."""
     _run(["git", "-C", main_repo, "fetch", "origin"])
     r = _run(["git", "-C", main_repo, "rev-parse", f"origin/{base_branch}"])
     return r.stdout.strip()
 
 
-def create_task_branch(main_repo: str, task_id: str, base_branch: str = "dev") -> str:
+def create_task_branch(main_repo: str, task_id: str, base_branch: str = "main") -> str:
     """Create agent/<task-id> from latest origin/<base> in the main clone (no checkout).
     Returns the new branch HEAD SHA. Idempotent: if branch exists, returns its SHA.
     """

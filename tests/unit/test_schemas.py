@@ -17,15 +17,15 @@ def _load(name):
 def test_task_schema_valid():
     schema = _load("task.schema.json")
     validate({
-        "task_id": "T1", "project": "pandas", "description": "optimize X",
-        "base_branch": "dev",
+        "task_id": "T1", "project": "demo-project", "description": "optimize X",
+        "base_branch": "main",
     }, schema)
 
 
 def test_task_schema_missing_required():
     schema = _load("task.schema.json")
     with pytest.raises(ValidationError):
-        validate({"project": "pandas"}, schema)
+        validate({"project": "demo-project"}, schema)
 
 
 def test_plan_schema_valid():

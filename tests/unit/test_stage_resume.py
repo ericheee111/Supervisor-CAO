@@ -94,3 +94,33 @@ class TestStageStoreIdempotency:
         assert run is not None
         assert run.status == COMPLETED
         assert run.artifact_path == "/p/review.json"
+
+    def test_completed_stage_with_different_candidate_sha_is_rerun(self, store):
+        """A fix produces a new candidate_sha. The old COMPLETED verification
+        must be stale and re-run (spec: after a fix, re-verification mandatory)."""
+        # first verification completed at sha c1
+        store.begin_stage("T1", "verification", "qwen-verifier", candidate_sha="c1")
+        store.mark_running("T1", "verification", candidate_sha="c1")
+        store.complete_stage("T1", "verification", candidate_sha="c1")
+        # resume after a fix: candidate is now c2 — must NOT skip
+        run, done = store.begin_stage("T1", "verification", "qwen-verifier",
+                                      candidate_sha="c2")
+        assert done is False
+        assert run.status == PENDING
+
+    def test_completed_stage_same_candidate_sha_skips(self, store):
+        """Same candidate_sha on resume = idempotent skip."""
+        store.begin_stage("T1", "verification", "qwen-verifier", candidate_sha="c1")
+        store.complete_stage("T1", "verification", candidate_sha="c1")
+        run, done = store.begin_stage("T1", "verification", "qwen-verifier",
+                                      candidate_sha="c1")
+        assert done is True
+        assert run.status == COMPLETED
+
+    def test_completed_stage_no_candidate_sha_passed_skips(self, store):
+        """When begin_stage is called without candidate_sha, a COMPLETED record
+        is treated as idempotent (backward-compatible)."""
+        store.begin_stage("T1", "plan", "codex-planner")
+        store.complete_stage("T1", "plan", candidate_sha="c1")
+        run, done = store.begin_stage("T1", "plan", "codex-planner")
+        assert done is True

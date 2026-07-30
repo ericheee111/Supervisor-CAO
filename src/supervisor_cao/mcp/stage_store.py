@@ -23,8 +23,10 @@ Schema (SQLite, persisted under ~/.local/state/supervisor-cao/stages.db):
     )
 
 Requirement 2 hard rules (enforced here, in code):
-  - COMPLETED stage is never re-run on resume.
-  - Codex budget is never re-spent for a COMPLETED stage.
+  - COMPLETED stage with the SAME candidate_sha is never re-run on resume.
+  - A COMPLETED stage with a DIFFERENT candidate_sha (after a fix) is stale and
+    MUST be re-run — re-verification and incremental review are mandatory.
+  - Codex budget is never re-spent for a COMPLETED stage with the same SHA.
   - No duplicate commit, PR creation, or Windows sync for a COMPLETED stage.
 """
 from __future__ import annotations
@@ -119,11 +121,17 @@ class StageStore:
             c.commit()
 
     def begin_stage(self, task_id: str, stage: str,
-                    worker_profile: str | None = None) -> tuple[StageRun, bool]:
+                    worker_profile: str | None = None,
+                    candidate_sha: str | None = None) -> tuple[StageRun, bool]:
         """Begin a stage. Returns (stage_run, already_completed).
 
-        - If a COMPLETED record exists: returns it with already_completed=True.
-          The caller MUST NOT re-run the Worker or re-spend budget.
+        - If a COMPLETED record exists with the SAME candidate_sha: returns it
+          with already_completed=True. The caller MUST NOT re-run the Worker or
+          re-spend budget. (Idempotent resume.)
+        - If a COMPLETED record exists with a DIFFERENT candidate_sha (a fix
+          produced a new SHA): the old result is stale. Reclaim the record and
+          re-run. This enforces "after a fix, re-verification and incremental
+          review are mandatory" (spec §9).
         - If a RUNNING record exists and is not stale: returns it with
           already_completed=False (caller reuses its terminal_id).
         - If a RUNNING record is stale: reclaim it (mark FAILED, begin new).
@@ -138,7 +146,11 @@ class StageStore:
             if row:
                 rec = self._row_to_run(row)
                 if rec.status == COMPLETED:
-                    return rec, True
+                    # Same candidate_sha -> idempotent skip. Different -> stale, re-run.
+                    if candidate_sha is None or rec.candidate_sha == candidate_sha:
+                        return rec, True
+                    # stale: a new candidate invalidates this COMPLETED record.
+                    # Fall through to reclaim.
                 if rec.status == RUNNING:
                     if now - rec.started < STALE_RUNNING_SECS:
                         return rec, False
@@ -147,7 +159,7 @@ class StageStore:
                         "UPDATE stage_runs SET status=?, finished=? WHERE task_id=? AND stage=?",
                         (FAILED, now, task_id, stage),
                     )
-                # FAILED or PENDING: reclaim by updating in place
+                # FAILED, PENDING, or stale-COMPLETED: reclaim by updating in place
                 run_id = str(uuid.uuid4())
                 c.execute(
                     "UPDATE stage_runs SET stage_run_id=?, status=?, terminal_id=?, "

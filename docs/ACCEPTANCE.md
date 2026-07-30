@@ -6,28 +6,33 @@ Run from the repo root on WSL2 Ubuntu-24.04: `python -m pytest tests/ -q`.
 
 ## Current status: BLOCKED
 
-The policy MCP architecture, state machine, budget, schema validation, idempotent
-resume, remote pipefail fix, and draft-PR artifact gate are all implemented and
-unit-tested (97 tests pass). The live CAO E2E is blocked by a Codex CLI
-cold-start timeout (CAO's `provider_init_timeout` of 60s is too short; even raised
-to 180s, Codex's ChatGPT Pro session initialization exceeds it on a cold start).
-The 920B smoke proved SSH/containers/lock/fetch/checkout/install all work, but
-the full pandas pytest suite did not complete within the test timeout.
+Per the active goal, the overall status stays **BLOCKED** until generalization
+is complete and CI is green on GitHub Actions (not just locally).
+
+The generic, project-agnostic state of the platform is implemented and locally
+verified: the policy MCP architecture, state machine, budget, schema validation,
+idempotent resume, remote pipefail fix, and draft-PR artifact gate are all in
+place and unit-tested. The generic temp-repository E2E
+(`tests/e2e/test_temp_repo_e2e.py`) drives the full deterministic policy flow on
+a throwaway git repo with mocked workers and passes. Unit and integration tests
+pass locally. Remaining work: the real GitHub Actions CI run must be green
+end-to-end (it currently defines the steps below; this doc tracks that it must
+pass on the remote, not only locally).
 
 ## Test suite
 
-| Level | Count | Scope |
-|-------|-------|-------|
-| Unit | 97 | state machine, budget, schema, SHA, locks, windows-dirty, ff, PR body, secret scan, config, config-safety, permissions, **worker runner (strict JSON extraction)**, **stage resume (idempotency)**, **policy MCP protocol**, **remote pipefail** |
-| Integration | 10 | planner, executor-fix, verifier-fail, stale, budget, pool, windows-blocked, happy-path |
-| Simulated E2E | 13/13 | temp-repo full flow with mocked workers |
-| Stability | 10/10 | 10 consecutive simulated E2E runs |
-| Live CAO E2E | partial | researcher (opencode run --format json) ✅; Codex planner (run-step) blocked by cold-start timeout |
-| 920B smoke | partial | SSH ✅, containers ✅, lock ✅, fetch/checkout ✅, editable install ✅; pytest timed out (full suite too slow) |
-| Fresh clone | ✓ | state machine tracked, 97 tests pass, doctor green |
-| CI | ✓ | GitHub Actions: install + unit + integration + E2E + secret scan |
+| Level | Scope |
+|-------|-------|
+| Unit | state machine, budget, schema, SHA, locks, windows-dirty, ff, PR body, secret scan, config, config-safety, permissions, model resolver, worker runner (strict JSON extraction), stage resume (idempotency), policy MCP protocol, remote pipefail |
+| Integration | planner, executor-fix, verifier-fail, stale, budget, pool, windows-blocked, happy-path |
+| Temp-repo E2E | `tests/e2e/test_temp_repo_e2e.py` — full deterministic policy flow on a temporary git repo with mocked workers |
+| Secret scan | `scripts/scan-secrets` over tracked files (private identifiers read from `~/.config/supervisor-cao/private-identifiers.txt`) |
+| CI | GitHub Actions: install dependencies + unit + integration + temp-repo E2E + secret scan + CLI import smoke |
 
-## Unit tests (69)
+Run locally from the repo root: `python -m pytest tests/ -q` (unit + integration)
+and `PYTHONPATH=src python tests/e2e/test_temp_repo_e2e.py` (temp-repo E2E).
+
+## Unit tests
 
 Cover every deterministic enforcement path:
 
@@ -40,21 +45,21 @@ Cover every deterministic enforcement path:
   (cross-process safe); `CODEX_BUDGET_EXHAUSTED` on overflow; persisted log.
 - **Config safety**: task overrides may only touch test/benchmark/acceptance
   fields; repo paths, SSH, containers, base_branch, codex_budget,
-  executor_limits are forbidden in task overrides (8 tests).
+  executor_limits are forbidden in task overrides.
 - **Schema**: `task`/`plan`/`implementation`/`verification`/`review`/`decision`.
-- **SHA / locks / windows-dirty / fast-forward / PR body / secret scan**:
-  each enforced and tested.
+- **SHA / locks / windows-dirty / fast-forward / PR body / secret scan /
+  model resolver**: each enforced and tested.
 
-## Integration tests (10)
+## Integration tests
 
 `planner`, `executor-fix`, `verifier-fail`, `stale`, `budget`, `pool`,
-`windows-blocked`, `happy-path`. No live destructive tests against the real
-project repo; the real-project integration test is read-only unless a human
-explicitly starts a real task.
+`windows-blocked`, `happy-path`. These run against fixtures and temp repos —
+no live destructive tests against any real project repository.
 
-## Simulated E2E (13/13)
+## Temp-repo E2E
 
-Temporary-repository full flow with mocked worker results:
+`tests/e2e/test_temp_repo_e2e.py` — full deterministic policy flow on a
+temporary git repo with mocked worker results:
 
 ```
 Supervisor -> Codex Planner -> GLM Executor -> Qwen Verifier
@@ -62,37 +67,18 @@ Supervisor -> Codex Planner -> GLM Executor -> Qwen Verifier
 -> Draft PR path -> protected sync path
 ```
 
-## Real CAO E2E (9/9)
-
-`tests/e2e/test_real_cao_e2e.py` — exercises the policy gateway with **real
-LLM calls**:
-
-```
-create_task -> research (GLM via opencode run) -> plan (Codex via codex exec)
--> implement (GLM) -> verify -> review (Codex) -> budget (2/4) -> READY_FOR_HUMAN_REVIEW
-```
-
-All 9 checks pass: task creation, GLM research, Codex planner (1/4 budget),
-GLM executor commit, multiply function added, verification, Codex reviewer
-(2/4 budget), budget accounting, final state.
-
-## Stability (10/10)
-
-10 consecutive simulated E2E runs pass (no drift, no leaked state, no stale
-worktree references).
-
-## Pandas read-only smoke (9/9 PASS)
-
-Confirms without modifying anything: config loads, base branch (`dev`)
-reachable, Windows repo dirty-state detection, SSH to validation host, both
-Docker containers running, conda env + pandas import on both containers, pool
-lock detection.
+This is the generic, project-agnostic E2E. It creates a throwaway git repo,
+exercises the state machine end-to-end, and validates worktree create + commit
++ push, Codex budget, the Windows-sync gate (blocked when dirty, passes when
+clean), and Draft-PR body generation. It does not call real LLM/Codex agents.
 
 ## Supervisor benchmark
 
-`scripts/supervisor-benchmark` — both models 4/4 (minimal conversation, JSON
-output, SHA fidelity, gate awareness). Qwen 3.7 Max is primary (faster
-latency), GLM 5.2 is backup.
+`scripts/supervisor-benchmark` exercises the Supervisor role on a canned task
+against the configured providers (minimal conversation, JSON output, SHA
+fidelity, gate awareness). Provider/model IDs come from
+`~/.config/supervisor-cao/models.local.yaml` (produced by `scripts/detect-models`);
+no model IDs are hardcoded in the repo.
 
 ## Policy gateway
 
@@ -105,41 +91,49 @@ worktree, and gates in code.
 ## Remote verification pool
 
 `scripts/run-verification` — single try/finally transaction: acquire owner
-lock → check clean → record git state → checkout → install → pytest → restore
-→ verify → release (same owner only). Stale lock detection (2h). Restore
-failure keeps lock + marks UNHEALTHY. Never `reset --hard` or `clean -fdx`.
+lock → check clean → record git state → checkout → install → run the
+configured verification command → restore → release (same owner only). The
+verification command is generic and configurable via
+`scripts/run-verification --verify-command` (repeatable) or `--verify-script`;
+the core only reads exit codes, logs, SHAs, and structured results. Stale lock
+detection (2h). Restore failure keeps lock + marks UNHEALTHY. Never
+`reset --hard` or `clean -fdx`.
 
 ## Security acceptance
 
-- `scripts/scan-secrets` passes on all tracked files.
+- `scripts/scan-secrets` passes on all tracked files. Private identifiers are
+  read from `~/.config/supervisor-cao/private-identifiers.txt` (private, never
+  committed).
 - Private files (`*.local.yaml`, `models.local.yaml`, `secrets.env`,
   `*.private.md`, `auth.json`) are git-ignored.
-- No private identifiers in tracked files.
+- No private identifiers (real hosts, container names, usernames, paths) in
+  tracked files.
 - `.gitignore` no longer ignores `src/supervisor_cao/state/` (critical fix).
 
 ## Known limitations
 
 1. **CAO OpenCode provider experimental.** Multi-agent callback uses inbox
-   polling fallback (CAO issues #203/#115). The real CAO E2E uses `opencode
-   run` (single-agent) + `codex exec` (non-interactive) rather than live
+   polling fallback (CAO issues #203/#115). The generic temp-repo E2E drives
+   the deterministic policy layer with mocked workers rather than live
    `cao launch` multi-agent tmux sessions. Full `handoff`/`assign`/
    `send_message` multi-agent testing requires a live `cao-server` + multiple
-   worker sessions in tmux.
-2. **opencode run doesn't edit files in non-interactive mode.** The real E2E
-   applies the GLM-generated code programmatically (simulating what a full
-   opencode TUI session would do). Interactive `supervisor-cao chat` uses the
-   full TUI where file editing works.
+   worker sessions in tmux and is out of scope for the generic E2E.
+2. **Live-LLM E2E not in CI.** `tests/e2e/test_live_cao_e2e.py` exercises the
+   policy gateway with real provider calls; it requires configured providers
+   and a live `cao-server`, so it is not part of the generic CI matrix. The
+   generic, repeatable E2E is `tests/e2e/test_temp_repo_e2e.py`.
 
 ## Final status
 
-- `READY` — all mandatory checks pass.
-- `READY_WITH_KNOWN_LIMITATIONS` — core workflow works; documented non-critical
-  limitation remains.
+- `READY` — all mandatory checks pass (including green GitHub Actions CI).
+- `READY_WITH_KNOWN_LIMITATIONS` — core workflow works; a documented
+  non-critical limitation remains.
 - `BLOCKED` — a mandatory capability cannot be completed.
 
-Current overall: **READY_WITH_KNOWN_LIMITATIONS** (CAO OpenCode multi-agent
-callback is experimental; all local, unit, integration, simulated E2E, real
-CAO E2E, stability, and fresh-clone tests pass).
+Current overall: **BLOCKED** — generalization is complete at the code/doc
+level and all local checks (unit, integration, temp-repo E2E, secret scan)
+pass, but real GitHub Actions CI must be confirmed green before moving to
+`READY`/`READY_WITH_KNOWN_LIMITATIONS`.
 
 ## See also
 
@@ -151,31 +145,47 @@ CAO E2E, stability, and fresh-clone tests pass).
 
 在 WSL2 Ubuntu-24.04 上从仓库根目录运行：`python -m pytest tests/ -q`。
 
-## 测试套件（全部通过）
+## 当前状态：BLOCKED
 
-| 级别 | 数量 | 范围 |
-|-------|-------|-------|
-| 单元 | 51 | 状态机、预算、schema、SHA、锁、windows-dirty、ff、PR body、密钥扫描、配置、权限 |
-| 集成 | 10 | planner、executor-fix、verifier-fail、stale、budget、pool、windows-blocked、happy-path |
-| E2E | 13 | 临时仓库完整流程 |
-| 稳定性 | 10/10 | 短回调 x10、一个长 worker、一个超时、一个回调恢复 |
+按当前目标，在通用化完成且 GitHub Actions CI 变绿（不仅是本地）之前，总体状态保持
+**BLOCKED**。
 
-## 单元测试（51）
+平台的通用、与项目无关状态已实现并在本地验证：policy MCP 架构、状态机、预算、schema
+校验、幂等恢复、远程 pipefail 修复以及 draft-PR 产物门禁均已就绪并通过单元测试。通用的
+临时仓库 E2E（`tests/e2e/test_temp_repo_e2e.py`）在一个一次性 git 仓库上以 mocked worker
+驱动完整的确定性策略流程并通过。单元与集成测试在本地通过。剩余工作：真实的 GitHub Actions
+CI 运行必须端到端变绿（它当前定义了下列步骤；本文档跟踪它必须在远端通过，而不仅是本地）。
+
+## 测试套件
+
+| 级别 | 范围 |
+|-------|-------|
+| 单元 | 状态机、预算、schema、SHA、锁、windows-dirty、ff、PR body、密钥扫描、配置、配置安全、权限、model resolver、worker runner（严格 JSON 抽取）、stage resume（幂等）、policy MCP 协议、remote pipefail |
+| 集成 | planner、executor-fix、verifier-fail、stale、budget、pool、windows-blocked、happy-path |
+| 临时仓库 E2E | `tests/e2e/test_temp_repo_e2e.py` — 在临时 git 仓库上以 mocked worker 驱动完整确定性策略流程 |
+| 密钥扫描 | `scripts/scan-secrets` 扫描受跟踪文件（私有标识符读取自 `~/.config/supervisor-cao/private-identifiers.txt`） |
+| CI | GitHub Actions：安装依赖 + 单元 + 集成 + 临时仓库 E2E + 密钥扫描 + CLI 导入冒烟 |
+
+本地从仓库根目录运行：`python -m pytest tests/ -q`（单元 + 集成）以及
+`PYTHONPATH=src python tests/e2e/test_temp_repo_e2e.py`（临时仓库 E2E）。
+
+## 单元测试
 
 覆盖每一条确定性强制执行路径：
 
 - **状态机**：仅允许合法的前向转换（不可跳过）；`tested_sha == candidate_sha`；`reviewed_sha == tested_sha`；新候选使 tested/reviewed 失效；在 `LOCAL_VERIFIED`、`REMOTE_VERIFIED`、`APPROVED`、`DRAFT_PR_CREATED` 之前进行门禁检查；错误状态可从任何非终止状态到达；完整审计日志。
-- **预算**：每任务每角色的 Codex 上限；锁下原子化消费；溢出时 `CODEX_BUDGET_EXHAUSTED`；持久化调用日志。
+- **预算**：每任务每角色的 Codex 上限；通过 `BEGIN IMMEDIATE` 原子化消费（跨进程安全）；溢出时 `CODEX_BUDGET_EXHAUSTED`；持久化调用日志。
+- **配置安全**：任务覆盖只允许触碰 test/benchmark/acceptance 字段；repo 路径、SSH、containers、base_branch、codex_budget、executor_limits 在任务覆盖中被禁止。
 - **Schema**：`task`/`plan`/`implementation`/`verification`/`review`/`decision`。
-- **SHA / 锁 / windows-dirty / fast-forward / PR body / 密钥扫描 / 配置 / 权限**：每项都被强制执行并测试。
+- **SHA / 锁 / windows-dirty / fast-forward / PR body / 密钥扫描 / model resolver**：每项都被强制执行并测试。
 
-## 集成测试（10）
+## 集成测试
 
-`planner`、`executor-fix`、`verifier-fail`、stale、budget、pool、`windows-blocked`、`happy-path`，外加 report-compression 和 dispute-arbitration。不对真实项目仓库做实时破坏性测试；真实项目集成测试是只读的，除非人工显式启动真实任务。
+`planner`、`executor-fix`、`verifier-fail`、stale、budget、pool、`windows-blocked`、`happy-path`。这些针对 fixtures 和临时仓库运行 — 不对任何真实项目仓库做实时破坏性测试。
 
-## E2E（13）
+## 临时仓库 E2E
 
-临时仓库完整流程：
+`tests/e2e/test_temp_repo_e2e.py` — 在临时 git 仓库上以 mocked worker 结果驱动完整确定性策略流程：
 
 ```
 Supervisor -> Codex Planner -> GLM Executor -> Qwen Verifier
@@ -183,48 +193,53 @@ Supervisor -> Codex Planner -> GLM Executor -> Qwen Verifier
 -> Draft PR path -> protected sync path
 ```
 
-## 稳定性（10/10）
-
-短回调流程重复 10 次（无漂移、无泄漏状态）；一个长时间运行的 worker；一个超时；一个回调恢复。已知的 CAO/OpenCode 局限性已如实记录（见下文）。
-
-## Pandas 只读 smoke test
-
-在不动任何内容的情况下确认：配置加载、base 分支（`dev`）可达、本地仓库可检查、远程槽位健康检查通过。
-
-结果：**3 PASS**（配置加载、base 分支可达、本地仓库可检查）+ **1 LIMITATION**（通过 SSH 的远程池/容器/conda — 见已知局限性）。
+这是通用的、与项目无关的 E2E。它创建一个一次性 git 仓库，端到端驱动状态机，并验证
+worktree 创建 + commit + push、Codex 预算、Windows 同步门禁（脏时阻塞，干净时通过）以及
+Draft-PR body 生成。它不调用真实 LLM/Codex agent。
 
 ## Supervisor 基准测试
 
-`scripts/supervisor-benchmark` 使用两个廉价 provider 对 canned 任务执行 Supervisor 角色。
+`scripts/supervisor-benchmark` 对 canned 任务执行 Supervisor 角色（最小化对话、JSON 输出、
+SHA 保真、门禁感知）。Provider/model ID 来自 `~/.config/supervisor-cao/models.local.yaml`
+（由 `scripts/detect-models` 生成）；仓库中不硬编码任何 model ID。
 
-- **GLM（主 Supervisor）**：4/4。
-- **Qwen（备用 Supervisor）**：4/4。
-- **Qwen 作为主 Supervisor**（按 model map）：4/4。
+## Policy gateway
 
-两个 provider 都可作为 Supervisor；GLM 是配置的主，Qwen 是配置的备。
+`src/supervisor_cao/mcp/policy_gateway.py` — Supervisor 没有任意 bash。它只能调用：
+`create_task`、`advance_task`、`call_planner`、`start_executor`、`run_verification`、
+`call_reviewer`、`call_judge`、`create_draft_pr`、`sync_windows`。每一项都在代码中强制执行
+状态机、预算、SHA、worktree 与门禁。
 
-## 已知局限性
+## 远程验证池
 
-这些不阻塞核心工作流；按稳定性标准如实记录。
-
-1. **远程 SSH 未配置。** 通过 SSH 的远程验证池（容器、conda 环境）是一个 `LIMITATION`。远程池的 acquire/release 与恢复由单元/集成 fixtures 覆盖；实时远程路径未端到端执行，因为此环境中未配置到验证主机的 SSH。依赖远程池任务的状态：`READY_WITH_KNOWN_LIMITATIONS`。
-2. **WSL2 网络受限。** 一个 fake-ip VPN 劫持了 DNS。使用离线 wheelhouse 安装路径（`docs/INSTALL.md`）以及 DoH + `/etc/hosts` 缓解措施（`docs/TROUBLESHOOTING.md`）；CAO 和各 provider 均离线安装。
-3. **Codex CLI 在 Windows 路径上。** `codex` 默认不在 WSL PATH 上。将 `CODEX_BIN` 设为绝对路径（WSL 或 `/mnt/c/...`）；`doctor` 会遵循它。
-4. **CAO OpenCode provider 为实验性。** 多 agent 回调使用 inbox 轮询回退（CAO issue #203/#115）；长任务交付与回调恢复被分别测试，而非通过实时回调路径。
+`scripts/run-verification` — 单次 try/finally 事务：获取 owner 锁 → 检查干净 → 记录 git 状态
+→ checkout → install → 运行配置的验证命令 → 恢复 → 释放（仅同一 owner）。验证命令是通用的，
+可通过 `scripts/run-verification --verify-command`（可重复）或 `--verify-script` 配置；核心
+只读取退出码、日志、SHA 与结构化结果。陈旧锁检测（2 小时）。恢复失败保留锁并标记 UNHEALTHY。
+绝不 `reset --hard` 或 `clean -fdx`。
 
 ## 安全验收
 
-- `scripts/scan-secrets` 在所有受跟踪文件上通过。
+- `scripts/scan-secrets` 在所有受跟踪文件上通过。私有标识符读取自
+  `~/.config/supervisor-cao/private-identifiers.txt`（私有，绝不提交）。
 - 私有文件（`*.local.yaml`、`models.local.yaml`、`secrets.env`、`*.private.md`、`auth.json`）被 git-ignored。
-- 受跟踪文件中无私有标识符（内部主机名、容器名、用户名、私有路径）。
+- 受跟踪文件中无私有标识符（真实主机名、容器名、用户名、路径）。
+- `.gitignore` 不再忽略 `src/supervisor_cao/state/`（关键修复）。
+
+## 已知局限性
+
+1. **CAO OpenCode provider 为实验性。** 多 agent 回调使用 inbox 轮询回退（CAO issue #203/#115）。通用临时仓库 E2E 以 mocked worker 驱动确定性策略层，而非实时 `cao launch` 多 agent tmux 会话。完整的 `handoff`/`assign`/`send_message` 多 agent 测试需要实时 `cao-server` + 多个 tmux worker 会话，不在通用 E2E 范围内。
+2. **实时 LLM E2E 不在 CI 中。** `tests/e2e/test_live_cao_e2e.py` 以真实 provider 调用驱动 policy gateway；它要求已配置的 provider 和实时 `cao-server`，因此不属于通用 CI 矩阵。通用、可重复的 E2E 是 `tests/e2e/test_temp_repo_e2e.py`。
 
 ## 最终状态
 
-- `READY` — 所有强制检查通过。
-- `READY_WITH_KNOWN_LIMITATIONS` — 核心工作流可用；存在已记录的非关键性局限（远程 SSH 池）。
+- `READY` — 所有强制检查通过（包括 GitHub Actions CI 变绿）。
+- `READY_WITH_KNOWN_LIMITATIONS` — 核心工作流可用；存在已记录的非关键性局限。
 - `BLOCKED` — 某项强制能力无法完成。
 
-当前总体：**READY_WITH_KNOWN_LIMITATIONS**（远程 SSH 池未配置实时；所有本地、单元、集成、E2E 与稳定性测试通过）。
+当前总体：**BLOCKED** — 通用化在代码/文档层面已完成，所有本地检查（单元、集成、临时仓库 E2E、
+密钥扫描）通过，但在转向 `READY`/`READY_WITH_KNOWN_LIMITATIONS` 之前，必须确认真实的 GitHub
+Actions CI 变绿。
 
 ## 另请参阅
 

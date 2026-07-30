@@ -3,10 +3,10 @@
 
 After APPROVED:
   1. push agent/<task-id>
-  2. create/update Draft PR (base = dev)
+  2. create/update Draft PR (base = project base branch)
   3. write PR body: task summary, plan summary, baseline/candidate SHA,
-     changed files, WSL2 tests, 920B tests + ASV, Codex review, known risks,
-     Codex call count, artifact paths, READY_FOR_HUMAN_REVIEW.
+     changed files, local test results, remote test results, Codex review,
+     known risks, Codex call count, artifact paths, READY_FOR_HUMAN_REVIEW.
   4. do NOT mark Ready, do NOT squash, do NOT merge, do NOT delete branch.
 
 Requires gh CLI authenticated. Never force-pushes.
@@ -48,12 +48,12 @@ def build_pr_body(task_id: str, plan_summary: str, baseline_sha: str, candidate_
         "### Changed files",
         *[f"- {f}" for f in changed_files],
         "",
-        "### WSL2 test results",
+        "### Local test results",
         "```json",
         json.dumps(wsl_tests, indent=2, default=str),
         "```",
         "",
-        "### 920B test + ASV results",
+        "### Remote test results",
         "```json",
         json.dumps(remote_tests, indent=2, default=str),
         "```",
@@ -133,7 +133,7 @@ def main() -> int:
     ap.add_argument("--repo", required=True, help="git repo path")
     ap.add_argument("--task-id", required=True)
     ap.add_argument("--task-branch", required=True)
-    ap.add_argument("--base-branch", default="dev")
+    ap.add_argument("--base-branch", default="main")
     ap.add_argument("--run-dir", required=True, help="artifact dir for this task")
     ap.add_argument("--test-mode", action="store_true",
                     help="write a test PR URL without calling gh (temp repos only). "

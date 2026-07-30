@@ -1,7 +1,8 @@
 """Project configuration loader (spec §13, §19).
 
-Project config = project defaults + task-level overrides. Never hard-code pandas.
-Platform stays generic; adding a project = add config + validation plugin + optional prompts.
+Project config = project defaults + task-level overrides. Never hard-code a
+project name. Platform stays generic; adding a project = add config + validation
+plugin + optional prompts.
 
 Config resolution order (later wins):
   1. builtin defaults
@@ -24,9 +25,9 @@ LOCAL_CONFIG_DIR = Path.home() / ".config" / "supervisor-cao" / "projects"
 @dataclass
 class ProjectConfig:
     name: str
-    base_branch: str = "dev"
+    base_branch: str = "main"
     task_branch_prefix: str = "agent/"
-    wsl_repo: str = ""              # WSL Linux fs path, e.g. ~/projects/pandas
+    wsl_repo: str = ""              # Linux fs path to the project's main clone
     windows_repo: str = ""          # Windows path (private, set in local config)
     remote_validation: dict = field(default_factory=dict)  # SSH host, containers (private)
     default_verification: dict = field(default_factory=dict)
@@ -101,7 +102,7 @@ def load_project(name: str, task_override_path: str | Path | None = None) -> Pro
             cfg = _deep_merge(cfg, filtered)
     return ProjectConfig(
         name=cfg.get("name", name),
-        base_branch=cfg.get("base_branch", "dev"),
+        base_branch=cfg.get("base_branch", "main"),
         task_branch_prefix=cfg.get("task_branch_prefix", "agent/"),
         wsl_repo=cfg.get("wsl_repo", ""),
         windows_repo=cfg.get("windows_repo", ""),

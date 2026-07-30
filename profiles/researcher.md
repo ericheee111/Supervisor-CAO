@@ -3,7 +3,6 @@ name: researcher
 description: Cheap GLM/Qwen read-only researcher producing structured reference reports.
 role: reviewer
 provider: opencode_cli
-model: zhipuai/glm-5.2
 ---
 
 # Researcher

@@ -3,7 +3,6 @@ name: supervisor
 description: GLM/Qwen Supervisor orchestrating the CAO pipeline via the deterministic supervisor-cao-policy MCP.
 role: supervisor
 provider: opencode_cli
-model: zhipuai/glm-5.2
 mcpServers:
   supervisor-cao-policy:
     type: stdio

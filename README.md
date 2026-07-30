@@ -23,9 +23,9 @@ enforced in Python — not left to an LLM's self-discipline.
 - **Safety**: no auto-merge, no force-push, no base-branch rewrite, no
   overwriting dirty worktrees. The platform always stops at
   `READY_FOR_HUMAN_REVIEW`.
-- **Generic by design**: pandas is the first project, but the platform has zero
-  project-specific code. Add a new project = add a config file + optional
-  validation rules.
+- **Generic by design**: the platform has zero project-specific code. A fully
+  fictional `demo-project` example ships in `config/examples/`. Add a new
+  project = add a config file + optional validation rules.
 - **Auditable**: every state transition, Codex call, SHA, and lock is persisted
   to SQLite with a full event log.
 
@@ -59,7 +59,7 @@ You describe a task
 
 ```
 Research → Codex Plan → GLM Implement → WSL2 quick verify
-→ Remote pool verify (920B) → Qwen report → Codex full Review
+→ Remote pool verify → Qwen report → Codex full Review
 → (if changes requested: GLM Fix → re-verify → Codex incremental Review)
 → APPROVED → Draft PR → Windows sync → READY_FOR_HUMAN_REVIEW
 ```
@@ -94,7 +94,7 @@ pip install -e .              # installs the supervisor-cao CLI
 python scripts/detect-models
 
 # 2. Create a project config (copy the sanitized example)
-cp config/examples/pandas.example.yaml ~/.config/supervisor-cao/projects/myproject.local.yaml
+cp config/examples/demo-project.example.yaml ~/.config/supervisor-cao/projects/myproject.local.yaml
 # edit myproject.local.yaml with your real paths, SSH host, containers, etc.
 ```
 
@@ -271,7 +271,7 @@ Apache-2.0
 
 - **成本控制**：90%+ 的工作跑在便宜模型上；Codex 每任务最多 4 次调用。
 - **安全**：不自动合并、不 force-push、不改写基础分支、不覆盖未提交改动。平台始终停在 `READY_FOR_HUMAN_REVIEW`。
-- **通用设计**：pandas 是第一个接入项目，但平台没有任何项目特定代码。新增项目 = 加一个配置文件 + 可选验证规则。
+- **通用设计**：平台没有任何项目特定代码，`config/examples/` 下提供完全虚构的 `demo-project` 示例。新增项目 = 加一个配置文件 + 可选验证规则。
 - **可审计**：每次状态转换、Codex 调用、SHA、锁都持久化到 SQLite，含完整事件日志。
 
 ## 工作原理
@@ -330,7 +330,7 @@ pip install -e .              # 安装 supervisor-cao CLI
 python scripts/detect-models
 
 # 2. 创建项目配置（复制脱敏示例）
-cp config/examples/pandas.example.yaml ~/.config/supervisor-cao/projects/myproject.local.yaml
+cp config/examples/demo-project.example.yaml ~/.config/supervisor-cao/projects/myproject.local.yaml
 # 编辑 myproject.local.yaml，填入真实路径、SSH 主机、容器等
 ```
 

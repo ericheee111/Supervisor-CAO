@@ -1,8 +1,9 @@
 """Remote validation pool manager (spec §14).
 
-Manages the 920B dual-container pool over SSH. Each container runs one task at
-a time. Atomic lock via remote flock. Records original branch/HEAD, refuses
-dirty repos, restores after, marks UNHEALTHY on restore failure.
+Manages a remote validation environment (containers over SSH). Each container
+runs one task at a time. Atomic lock via remote flock. Records original
+branch/HEAD, refuses dirty repos, restores after, marks UNHEALTHY on restore
+failure.
 
 This module is the deterministic runner. The Supervisor/Verifier only READS the
 script's return values: AVAILABLE / BUSY / UNHEALTHY / DIRTY. No LLM polls.

@@ -3,7 +3,6 @@ name: qwen-verifier
 description: Qwen Verifier running controlled verification scripts and compressing a structured report.
 role: reviewer
 provider: opencode_cli
-model: alibaba-cn/qwen3.7-max
 ---
 
 # Qwen Verifier

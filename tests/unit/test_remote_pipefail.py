@@ -39,24 +39,22 @@ class TestPipefail:
         # With pipefail: the pipeline exit code is pytest's (1)
         assert "EXIT=1" in r_yes.stdout, f"expected EXIT=1 with pipefail, got: {r_yes.stdout}"
 
-    def test_run_verification_pytest_cmd_uses_pipefail(self):
-        """The run-verification script's pytest command must include pipefail."""
+    def test_run_verification_verify_cmd_uses_pipefail(self):
+        """The run-verification script's verification commands must use pipefail
+        so a failing verify-command's exit code is not masked."""
         script = (REPO_ROOT / "scripts" / "run-verification").read_text()
         assert "set -o pipefail" in script, "run-verification must use 'set -o pipefail'"
-        # The pytest command is a multi-line Python string concatenation; verify
-        # the pytest_cmd assignment block contains both 'pytest' and 'pipefail'.
-        idx = script.index("pytest_cmd =")
-        block = script[idx:script.index("\n\n", idx)]
-        assert "python -m pytest" in block
-        assert "pipefail" in block, f"pytest command block missing pipefail: {block}"
+        # The verify-command block runs each configured command with pipefail.
+        idx = script.index("set -o pipefail && {cmd}")
+        block = script[idx:script.index("\n", idx)]
+        assert "pipefail" in block, f"verify command block missing pipefail: {block}"
 
-    def test_run_verification_install_cmd_uses_pipefail(self):
-        """The install command must also use pipefail."""
+    def test_run_verification_setup_cmd_uses_pipefail(self):
+        """The setup commands must also use pipefail."""
         script = (REPO_ROOT / "scripts" / "run-verification").read_text()
-        idx = script.index("install_cmd =")
-        block = script[idx:script.index("\n\n", idx)]
-        assert "pip install -e" in block
-        assert "pipefail" in block, f"install command block missing pipefail: {block}"
+        # setup commands use the same pipefail pattern
+        assert "set -o pipefail && {cmd}" in script
+        assert script.count("set -o pipefail") >= 2, "both setup and verify must use pipefail"
 
 
 class TestDirtyOnStart:

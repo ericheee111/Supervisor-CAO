@@ -33,12 +33,66 @@ Standard task lifecycle:
 
 ```
 Research → Codex Plan → GLM Implement → WSL2 quick verify
-→ 920B remote verify → Qwen report → Codex full Review
+→ remote pool verify → Qwen report → Codex full Review
 → (if CHANGES_REQUESTED: GLM Fix → reverify → Codex incremental Review)
 → APPROVED → Draft PR → Windows sync → READY_FOR_HUMAN_REVIEW
 ```
 
 The platform never auto-merges. It stops at `READY_FOR_HUMAN_REVIEW`.
+
+## Project adapter and validation backend (`src/supervisor_cao/projects/adapter.py`)
+
+The platform core never hard-codes a project name, base branch, test runner, or
+model id. Everything comes from a `ProjectConfig` and two generic interfaces:
+
+- **`ProjectAdapter`**: exposes base branch, task-branch template, worktree
+  root, and repo paths from project config. The core asks the adapter; it never
+  assumes them.
+- **`ValidationBackend`**: runs local and remote verification via configured
+  commands/plugins (`run_local` / `run_remote`). The core only reads the exit
+  code, logs, SHA, and structured result. The backend CANNOT change pass/fail —
+  that is the exit code's job. The model only summarizes the result.
+
+`local_fixture` is a test-only marker: a backend flagged as a local fixture MAY
+simulate verification in tests, but production code must never write a simulated
+result into `REMOTE_VERIFIED`. `test_mode` is injected via
+`PolicyGateway(test_mode=True)` — there is no `.test-mode` file.
+
+## Configurable verification commands
+
+Verification commands are NOT hard-coded to any test runner, benchmark suite, or
+environment manager. `scripts/run-verification` runs remote verification as a
+single try/finally transaction (select container → acquire owner lock → check
+clean → record git state → checkout candidate → run commands → restore git
+state → release lock) and accepts:
+
+- `--verify-command 'CMD'` (repeatable) — one or more shell commands run inside
+  the container,
+- `--verify-script FILE` — a script file run inside the container, or
+- `--setup-command 'CMD'` — a one-shot setup command before verification.
+
+If none are passed, the project config's `default_verification.remote` steps
+are used. The platform core only reads this script's exit code and the
+structured `verification.json` it writes.
+
+## StageStore and candidate_sha invalidation (`src/supervisor_cao/mcp/stage_store.py`)
+
+Each stage of a task is recorded in SQLite with its status, the CAO
+`terminal_id`, its artifact, the `candidate_sha` at the time, and the Codex
+budget call id (if any). Resume rules (enforced in code):
+
+- A **COMPLETED** stage with the **SAME** `candidate_sha` is never re-run on
+  resume — the Worker is not re-launched, Codex budget is not re-spent, no
+  duplicate commit/PR/Windows-sync happens.
+- A **COMPLETED** stage with a **DIFFERENT** `candidate_sha` (a fix produced a
+  new SHA) is **stale and MUST be re-run** — re-verification and incremental
+  review are mandatory.
+- A stale **RUNNING** record (older than the staleness TTL) is reclaimed and a
+  new run begins; a live RUNNING record is reused.
+
+The Executor verifies, before accepting a candidate, that its SHA differs from
+the base SHA, that a real diff exists, that it is on the correct task branch,
+and that it has been pushed to the remote.
 
 ## CAO integration
 
@@ -93,10 +147,12 @@ Per-task isolated worktrees: `~/cao-worktrees/<project>/<task-id>/{executor,veri
 
 ### Remote validation pool (`src/supervisor_cao/validation/remote_pool.py`)
 
-920B dual-container pool over SSH. Atomic lock (remote flock/mkdir). Records
-original branch/HEAD before, refuses dirty repos, restores after (no
-`reset --hard`, no `clean -fdx`). Marks UNHEALTHY on restore failure.
-Supervisor only reads: AVAILABLE / BUSY / UNHEALTHY / DIRTY / UNREACHABLE.
+Generic remote validation pool, managed over SSH with atomic locks (remote
+flock/mkdir). Records original branch/HEAD before, refuses dirty repos,
+restores after (no `reset --hard`, no `clean -fdx`). Marks UNHEALTHY on restore
+failure. Supervisor only reads: AVAILABLE / BUSY / UNHEALTHY / DIRTY /
+UNREACHABLE. The actual host names, container names, users, and paths are
+private (local config only); the core treats the pool opaquely.
 
 ### Windows sync (`src/supervisor_cao/validation/windows_sync.py`)
 
@@ -110,7 +166,10 @@ Final check: `Windows HEAD == candidate SHA`.
 
 Layered: public example (`config/examples/<project>.example.yaml`) + private
 local (`~/.config/supervisor-cao/projects/<project>.local.yaml`) + task
-override. Never hard-codes project specifics.
+override. Never hard-codes project specifics. The base branch is project
+configuration (default `main`); profiles no longer carry hardcoded `model:`
+lines — model ids come from `~/.config/supervisor-cao/models.local.yaml`,
+produced by `scripts/detect-models`.
 
 ## Role permissions
 
@@ -167,12 +226,56 @@ OpenCode + GLM/Qwen Supervisor
 
 ```
 Research → Codex Plan → GLM Implement → WSL2 快速验证
-→ 920B 远程验证 → Qwen 报告 → Codex 完整 Review
+→ 远程验证池验证 → Qwen 报告 → Codex 完整 Review
 →（如 CHANGES_REQUESTED：GLM Fix → 重新验证 → Codex 增量 Review）
 → APPROVED → Draft PR → Windows 同步 → READY_FOR_HUMAN_REVIEW
 ```
 
 平台永不自动合并，始终停在 `READY_FOR_HUMAN_REVIEW`。
+
+## 项目适配器与验证后端（`src/supervisor_cao/projects/adapter.py`）
+
+平台核心永不硬编码项目名、基础分支、测试运行器或模型 id。一切来自
+`ProjectConfig` 和两个通用接口：
+
+- **`ProjectAdapter`**：从项目配置暴露基础分支、任务分支模板、worktree 根
+  目录及仓库路径。核心向适配器询问，绝不自行假设。
+- **`ValidationBackend`**：通过配置的命令/插件运行本地与远程验证
+  （`run_local` / `run_remote`）。核心仅读取退出码、日志、SHA 和结构化
+  结果。后端不能改变通过/失败的判定 —— 那是退出码的职责。模型仅负责总结。
+
+`local_fixture` 是仅测试用的标记：被标记为 local fixture 的后端可在测试中
+模拟验证，但生产代码绝不能把模拟结果写入 `REMOTE_VERIFIED`。`test_mode`
+通过 `PolicyGateway(test_mode=True)` 依赖注入 —— 没有 `.test-mode` 文件。
+
+## 可配置的验证命令
+
+验证命令不硬编码到任何测试运行器、基准套件或环境管理器。
+`scripts/run-verification` 以单次 try/finally 事务运行远程验证
+（选择容器 → 获取 owner 锁 → 检查干净 → 记录 git 状态 → checkout 候选 →
+运行命令 → 恢复 git 状态 → 释放锁），并接受：
+
+- `--verify-command 'CMD'`（可重复）—— 在容器内运行的一条或多条 shell 命令，
+- `--verify-script FILE` —— 在容器内运行的脚本文件，或
+- `--setup-command 'CMD'` —— 验证前的一次性 setup 命令。
+
+若都不传入，则使用项目配置的 `default_verification.remote` 步骤。平台核心
+仅读取该脚本的退出码及其写入的结构化 `verification.json`。
+
+## StageStore 与 candidate_sha 失效（`src/supervisor_cao/mcp/stage_store.py`）
+
+任务的每个阶段都以 SQLite 记录，含状态、CAO `terminal_id`、artifact、当时
+的 `candidate_sha` 以及 Codex 预算调用 id（如有）。恢复规则（在代码中强制）：
+
+- **COMPLETED** 阶段且 `candidate_sha` **相同**：恢复时永不重跑 —— Worker 不
+  重新启动、Codex 预算不重复花费、不产生重复 commit/PR/Windows-sync。
+- **COMPLETED** 阶段但 `candidate_sha` **不同**（修复产生了新 SHA）：视为
+  **过期，必须重跑** —— 重新验证与增量评审是强制性的。
+- 过期的 **RUNNING** 记录（超过过期 TTL）会被回收并开始新一轮；仍在活动的
+  RUNNING 记录会被复用。
+
+Executor 在接受候选前会验证：其 SHA 与 base SHA 不同、存在真实 diff、位于
+正确的任务分支、且已推送到远程。
 
 ## CAO 集成
 
@@ -211,7 +314,7 @@ CAO 锁定到特定 commit（`config/cao_pinned.sha`）。升级是显式的（`
 
 ### 远程验证池（`src/supervisor_cao/validation/remote_pool.py`）
 
-通过 SSH 管理的 920B 双容器池。原子锁（远程 flock/mkdir）。验证前记录原始分支/HEAD，拒绝 dirty 仓库，验证后恢复（不 `reset --hard`，不 `clean -fdx`）。恢复失败标记 UNHEALTHY。Supervisor 只读取：AVAILABLE / BUSY / UNHEALTHY / DIRTY / UNREACHABLE。
+通用的远程验证池，通过 SSH 管理并使用原子锁（远程 flock/mkdir）。验证前记录原始分支/HEAD，拒绝 dirty 仓库，验证后恢复（不 `reset --hard`，不 `clean -fdx`）。恢复失败标记 UNHEALTHY。Supervisor 只读取：AVAILABLE / BUSY / UNHEALTHY / DIRTY / UNREACHABLE。真实主机名、容器名、用户名和路径均为私有（仅本地配置）；核心对池保持不透明。
 
 ### Windows 同步（`src/supervisor_cao/validation/windows_sync.py`）
 
@@ -219,7 +322,7 @@ CAO 锁定到特定 commit（`config/cao_pinned.sha`）。升级是显式的（`
 
 ### 项目配置（`src/supervisor_cao/projects/config.py`）
 
-分层加载：公开示例（`config/examples/<project>.example.yaml`）+ 私有本地（`~/.config/supervisor-cao/projects/<project>.local.yaml`）+ 任务级覆盖。永不硬编码项目特定逻辑。
+分层加载：公开示例（`config/examples/<project>.example.yaml`）+ 私有本地（`~/.config/supervisor-cao/projects/<project>.local.yaml`）+ 任务级覆盖。永不硬编码项目特定逻辑。基础分支属于项目配置（默认 `main`）；profiles 不再带有硬编码的 `model:` 行 —— 模型 id 来自 `~/.config/supervisor-cao/models.local.yaml`，由 `scripts/detect-models` 生成。
 
 ## 角色权限
 

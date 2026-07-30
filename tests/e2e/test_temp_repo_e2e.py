@@ -55,12 +55,12 @@ def setup_temp_repos(tmp: Path):
     (main_repo / "README.md").write_text("# test project\n")
     git(["add", "-A"], cwd=str(main_repo))
     git(["commit", "-m", "init"], cwd=str(main_repo))
-    git(["branch", "dev"], cwd=str(main_repo))  # base branch
+    git(["branch", "main"], cwd=str(main_repo), check=False)  # base branch already main
     git(["remote", "add", "origin", str(bare)], cwd=str(main_repo))
-    git(["push", "origin", "main", "dev"], cwd=str(main_repo))
-    # windows clone (simulates D:\Projects\pandas)
+    git(["push", "origin", "main"], cwd=str(main_repo))
+    # secondary clone (simulates a platform-side sync target)
     win_repo = tmp / "windows"
-    git(["clone", "-b", "dev", str(bare), str(win_repo)])
+    git(["clone", "-b", "main", str(bare), str(win_repo)])
     git(["config", "user.email", "t@t.t"], cwd=str(win_repo))
     git(["config", "user.name", "tester"], cwd=str(win_repo))
     return str(main_repo), str(win_repo), str(bare)
@@ -79,7 +79,7 @@ def main() -> int:
     main_repo, win_repo, bare = setup_temp_repos(tmp)
     # unique task id per run to avoid worktree path collisions across stability runs
     task_id = f"e2e-{int(time.time()*1000) % 1000000}"
-    cfg = ProjectConfig(name="testproj", base_branch="dev", task_branch_prefix="agent/",
+    cfg = ProjectConfig(name="testproj", base_branch="main", task_branch_prefix="agent/",
                         wsl_repo=main_repo, windows_repo=win_repo)
 
     # state store + budget in temp
@@ -96,7 +96,7 @@ def main() -> int:
 
     # 2. IMPLEMENT: create branch + worktree + commit + push
     store.transition(task_id, TaskState.IMPLEMENTING)
-    sha1 = create_task_branch(main_repo, task_id, "dev")
+    sha1 = create_task_branch(main_repo, task_id, cfg.base_branch)
     wt = add_executor_worktree(main_repo, "testproj", task_id)
     (Path(wt) / "feature.py").write_text("def f(): return 42\n")
     candidate_sha = commit_and_push(wt, f"agent/{task_id}", "implement feature")

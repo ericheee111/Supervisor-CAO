@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""remote-pool: CLI for the 920B validation pool (spec §14).
+"""remote-pool: CLI for the remote validation pool (spec §14).
 
 Deterministic pool management. Supervisor only reads these return values:
   AVAILABLE / BUSY / UNHEALTHY / DIRTY / UNREACHABLE
@@ -23,7 +23,7 @@ from supervisor_cao.validation.remote_pool import (  # noqa: E402
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="920B validation pool manager")
+    ap = argparse.ArgumentParser(description="Remote validation pool manager")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p_st = sub.add_parser("status")

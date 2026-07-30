@@ -2,9 +2,9 @@
 """manage-worktrees: CLI wrapper for worktree lifecycle (spec §12).
 
 Usage:
-  manage-worktrees create --main-repo PATH --project pandas --task-id T1
-  manage-worktrees add-readonly --main-repo PATH --project pandas --task-id T1 --role verifier [--sha SHA]
-  manage-worktrees clean --main-repo PATH --project pandas --task-id T1
+  manage-worktrees create --main-repo PATH --project <project> --task-id T1 [--base-branch main]
+  manage-worktrees add-readonly --main-repo PATH --project <project> --task-id T1 --role verifier [--sha SHA]
+  manage-worktrees clean --main-repo PATH --project <project> --task-id T1
   manage-worktrees current-sha --repo PATH
   manage-worktrees commit-push --repo PATH --branch agent/T1 --message "..."
 """
@@ -28,7 +28,7 @@ def main() -> int:
     p_create.add_argument("--main-repo", required=True)
     p_create.add_argument("--project", required=True)
     p_create.add_argument("--task-id", required=True)
-    p_create.add_argument("--base-branch", default="dev")
+    p_create.add_argument("--base-branch", default="main")
 
     p_ro = sub.add_parser("add-readonly", help="add verifier/reviewer worktree")
     p_ro.add_argument("--main-repo", required=True)
@@ -52,7 +52,7 @@ def main() -> int:
 
     p_fetch = sub.add_parser("fetch", help="fetch origin, print base sha")
     p_fetch.add_argument("--main-repo", required=True)
-    p_fetch.add_argument("--base-branch", default="dev")
+    p_fetch.add_argument("--base-branch", default="main")
 
     args = ap.parse_args()
     try:

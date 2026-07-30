@@ -343,13 +343,15 @@ class WorkerRunner:
     # --- implementation (GLM Executor) ---
 
     def run_executor(self, task_id: str, plan: dict, base_sha: str,
-                     executor_worktree: str, session_name: str | None) -> tuple[dict, str]:
+                     executor_worktree: str, session_name: str | None,
+                     expected_branch: str | None = None) -> tuple[dict, str]:
         """Run the GLM Executor. Returns (implementation_artifact, real_candidate_sha).
 
         The Executor edits files in its worktree, commits, and pushes. After the
         Worker returns, we read the REAL git HEAD SHA from the worktree (not the
-        LLM claim) and verify the worktree is clean. The candidate_sha in the
-        artifact is the real SHA.
+        LLM claim), verify the worktree is clean, verify a real diff exists, the
+        correct task branch is checked out, and the commit was pushed to the remote.
+        The candidate_sha in the artifact is the real SHA.
         """
         prompt = (
             f"You are the GLM Executor. Your worktree is {executor_worktree}.\n"
@@ -370,8 +372,24 @@ class WorkerRunner:
         real_sha = _git_head(executor_worktree)
         if not real_sha:
             raise WorkerError("executor: could not read HEAD SHA from worktree")
+        # Requirement: new SHA must differ from base (no-progress check).
+        if base_sha and real_sha == base_sha:
+            raise WorkerError("executor: HEAD SHA equals base SHA (no progress; no commit made)")
+        # Requirement: worktree must be clean after the run.
         if not _git_porcelain_clean(executor_worktree):
             raise WorkerError("executor: worktree dirty after run (uncommitted changes)")
+        # Requirement: verify a real diff exists against the base.
+        if not _has_diff_against(executor_worktree, base_sha):
+            raise WorkerError("executor: no diff against base (empty change)")
+        # Requirement: verify the correct task branch is checked out.
+        if expected_branch:
+            cur_branch = _current_branch(executor_worktree)
+            if cur_branch != expected_branch:
+                raise WorkerError(
+                    f"executor: on branch {cur_branch!r}, expected {expected_branch!r}")
+        # Requirement: verify the commit was pushed to the remote.
+        if expected_branch and not _branch_pushed(executor_worktree, expected_branch):
+            raise WorkerError(f"executor: branch {expected_branch} not pushed to remote")
         obj = validate_and_stamp("implementation", obj, task_id, real_sha)
         obj["candidate_sha"] = real_sha
         obj["base_sha"] = base_sha
@@ -482,6 +500,43 @@ def _git_head(repo: str) -> str | None:
         return r.stdout.strip() if r.returncode == 0 else None
     except Exception:
         return None
+
+
+def _has_diff_against(repo: str, base_sha: str | None) -> bool:
+    """Return True if the repo HEAD has a real diff against base_sha."""
+    if not base_sha:
+        return True
+    try:
+        r = subprocess.run(["git", "-C", repo, "diff", "--quiet", base_sha, "HEAD"],
+                           capture_output=True, text=True, timeout=30)
+        # exit code 1 means there IS a diff; 0 means no diff.
+        return r.returncode == 1
+    except Exception:
+        return True
+
+
+def _current_branch(repo: str) -> str | None:
+    try:
+        r = subprocess.run(["git", "-C", repo, "rev-parse", "--abbrev-ref", "HEAD"],
+                           capture_output=True, text=True, timeout=15)
+        return r.stdout.strip() if r.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def _branch_pushed(repo: str, branch: str) -> bool:
+    """Return True if the local branch HEAD matches its upstream (pushed)."""
+    try:
+        r = subprocess.run(
+            ["git", "-C", repo, "rev-parse", "--verify", f"origin/{branch}"],
+            capture_output=True, text=True, timeout=15)
+        if r.returncode != 0:
+            return False
+        remote_sha = r.stdout.strip()
+        local_sha = _git_head(repo)
+        return bool(local_sha) and local_sha == remote_sha
+    except Exception:
+        return False
 
 
 def _git_porcelain_clean(repo: str) -> bool:

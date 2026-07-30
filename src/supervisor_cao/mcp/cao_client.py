@@ -32,12 +32,14 @@ from typing import Any
 
 import requests
 
+from supervisor_cao.projects.model_resolver import resolve_model
+
 DEFAULT_SERVER_URL = "http://127.0.0.1:9889"
 DEFAULT_WORKER_TIMEOUT = 300  # seconds; OpenCode TUI can be slow to settle
 RUN_ROOT = Path.home() / "cao-runs"
 
 # Provider mapping: profile name prefix -> CAO provider type.
-# opencode_cli profiles use OpenCode (GLM/Qwen); codex profiles use Codex CLI.
+# opencode_cli profiles use OpenCode; codex profiles use Codex CLI.
 CODEX_PROFILES = {"codex-planner", "codex-reviewer", "codex-judge"}
 OPENCODE_PROVIDER = "opencode_cli"
 CODEX_PROVIDER = "codex"
@@ -390,18 +392,14 @@ def extract_agent_turn(output: str) -> str | None:
     return text if text else None
 
 
-# Profile -> default model (for opencode run -m). These match the profile
-# frontmatter model fields; kept here so the client doesn't need to parse YAML.
-_PROFILE_MODELS = {
-    "researcher": "zhipuai/glm-5.2",
-    "glm-executor": "zhipuai/glm-5.2",
-    "qwen-verifier": "alibaba-cn/qwen3.7-max",
-    "supervisor": "zhipuai/glm-5.2",
-}
-
-
 def _profile_model(profile: str) -> str | None:
-    return _PROFILE_MODELS.get(profile)
+    """Resolve the model id for a profile from the local models.local.yaml.
+
+    Model ids are never hard-coded here; they come from the local (gitignored)
+    config produced by ``scripts/detect-models``. Returns None if unset, in
+    which case the CAO provider applies its own default.
+    """
+    return resolve_model(profile)
 
 
 def _extract_opencode_message(stdout: str) -> str | None:

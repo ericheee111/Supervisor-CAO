@@ -37,9 +37,9 @@ def test_unknown_keys_silently_ignored():
 
 
 def test_name_is_allowed():
-    raw = {"name": "pandas"}
+    raw = {"name": "demo-project"}
     filtered = _filter_task_override(raw)
-    assert filtered["name"] == "pandas"
+    assert filtered["name"] == "demo-project"
 
 
 def test_executor_limits_not_overridable():

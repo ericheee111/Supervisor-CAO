@@ -30,7 +30,7 @@ def budget(tmp_path):
 
 @pytest.fixture
 def task(store):
-    return store.create("T1", "pandas", baseline_sha="base1")
+    return store.create("T1", "demo-project", baseline_sha="base1")
 
 
 def run_to_review_ready(store, task_id, sha="c1"):

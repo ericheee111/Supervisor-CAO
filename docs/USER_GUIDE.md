@@ -17,8 +17,8 @@ Fix any `MISSING`/`down` entry before running tasks (see `docs/TROUBLESHOOTING.m
 ## Enter a Supervisor / run a task
 
 ```bash
-supervisor-cao chat pandas                       # interactive Supervisor (CAO tmux TUI)
-supervisor-cao run pandas --task-file task.md    # full non-interactive pipeline
+supervisor-cao chat demo-project                 # interactive Supervisor (CAO tmux TUI)
+supervisor-cao run demo-project --task-file task.md    # full non-interactive pipeline
 ```
 
 `chat` loads project config (local layered over example) and launches an
@@ -30,7 +30,7 @@ policy layer; requires `cao-server` up + providers configured.
 ```bash
 supervisor-cao status                 # cao-server health + task count + recent tasks
 supervisor-cao task list              # id, state, candidate/tested SHA
-supervisor-cao task list --project pandas
+supervisor-cao task list --project demo-project
 supervisor-cao task show <task-id>    # full record + event/audit log
 supervisor-cao task logs <task-id>    # per-run artifacts under ~/cao-runs/<task-id>/
 supervisor-cao down                   # shut down all CAO tmux sessions
@@ -72,20 +72,21 @@ YAML (or Markdown YAML front matter) validated against
 parameters — missing critical fields route to `NEEDS_HUMAN`.
 
 ```yaml
-task_id: pandas-groupby-rolling-001
-project: pandas
+task_id: demo-project-feature-001
+project: demo-project
 description: |
-  Optimize Rolling.apply hot path for Cython backend; do not regress GroupBy.
-base_branch: dev                       # optional, defaults to project config
+  Implement and verify a small feature in the demo-project codebase without
+  regressing existing behavior.
+base_branch: main                      # optional, defaults to project config
 baseline_sha: <git-sha>                # commit performance is measured against
-benchmark_selector: "asv:benchmarks/rolling_apply.py"
+benchmark_selector: "demo:benchmarks/feature_bench.py"
 performance_acceptance:
   threshold: 0.95
   direction: higher_better             # or lower_better (<= threshold passes)
 regression_threshold: 0.05             # max tolerated regression vs baseline
 required_test_scope:                   # test selectors that MUST be exercised
-  - "pandas/tests/groupby/"
-  - "pandas/tests/window/"
+  - "tests/unit/"
+  - "tests/integration/"
 ```
 
 Required: `task_id`, `project`, `description`. For performance tasks the
@@ -139,8 +140,8 @@ supervisor-cao doctor    # 验证 CAO、OpenCode、Codex、uv、tmux、模型、
 ## 进入 Supervisor / 运行任务
 
 ```bash
-supervisor-cao chat pandas                       # 交互式 Supervisor（CAO tmux TUI）
-supervisor-cao run pandas --task-file task.md    # 完整非交互式流水线
+supervisor-cao chat demo-project                 # 交互式 Supervisor（CAO tmux TUI）
+supervisor-cao run demo-project --task-file task.md    # 完整非交互式流水线
 ```
 
 `chat` 加载项目配置（本地配置叠加在示例之上）并启动一个 OpenCode
@@ -152,7 +153,7 @@ Supervisor。`run` 通过确定性策略层驱动完整流水线；要求 `cao-s
 ```bash
 supervisor-cao status                 # cao-server 健康 + 任务计数 + 最近任务
 supervisor-cao task list              # id、状态、candidate/tested SHA
-supervisor-cao task list --project pandas
+supervisor-cao task list --project demo-project
 supervisor-cao task show <task-id>    # 完整记录 + 事件/审计日志
 supervisor-cao task logs <task-id>    # ~/cao-runs/<task-id>/ 下的每次运行产物
 supervisor-cao down                   # 关闭所有 CAO tmux 会话
@@ -192,20 +193,20 @@ YAML（或 Markdown YAML front matter），依据 `schemas/task.schema.json`
 校验。平台拒绝猜测缺失的性能参数 — 缺失关键字段会路由到 `NEEDS_HUMAN`。
 
 ```yaml
-task_id: pandas-groupby-rolling-001
-project: pandas
+task_id: demo-project-feature-001
+project: demo-project
 description: |
-  优化 Cython 后端的 Rolling.apply 热路径；不得回归 GroupBy。
-base_branch: dev                       # 可选，默认来自项目配置
+  在 demo-project 代码库中实现并验证一个小特性，且不回归现有行为。
+base_branch: main                      # 可选，默认来自项目配置
 baseline_sha: <git-sha>                # 性能测量基准的 commit
-benchmark_selector: "asv:benchmarks/rolling_apply.py"
+benchmark_selector: "demo:benchmarks/feature_bench.py"
 performance_acceptance:
   threshold: 0.95
   direction: higher_better             # 或 lower_better（<= threshold 即通过）
 regression_threshold: 0.05             # 相对 baseline 容忍的最大回归
 required_test_scope:                   # 必须执行到的测试选择器
-  - "pandas/tests/groupby/"
-  - "pandas/tests/window/"
+  - "tests/unit/"
+  - "tests/integration/"
 ```
 
 必填：`task_id`、`project`、`description`。对于性能任务，四元组

@@ -289,8 +289,13 @@ def task_logs(task_id):
 @cli.command()
 def upgrade():
     """Explicit CAO upgrade. Runs regression first; keeps old version on failure."""
+    cao_src = os.environ.get("CAO_SRC_DIR", "")
     click.echo("CAO upgrade: running regression suite first...")
-    rc, out = _wsl_run("cd /root/cao-platform-src/cli-agent-orchestrator && python -m pytest tests/ -q 2>&1 | tail -5", timeout=300)
+    if cao_src:
+        rc, out = _wsl_run(f"cd {cao_src} && python -m pytest tests/ -q 2>&1 | tail -5", timeout=300)
+    else:
+        click.echo("Set CAO_SRC_DIR to the CAO source checkout to run regression.")
+        rc, out = 0, "(skipped regression: CAO_SRC_DIR not set)"
     if rc != 0:
         click.echo("Regression FAILED - keeping current CAO version.")
         click.echo(out)

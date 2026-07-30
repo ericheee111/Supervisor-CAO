@@ -1,23 +1,68 @@
 #!/usr/bin/env bash
 # install-profiles: install all Supervisor-CAO agent profiles into CAO.
 # Idempotent: safe to re-run. Uses `cao install` with the correct provider.
+#
+# Model ids are rendered from the local (gitignored) models.local.yaml if
+# present (produced by scripts/detect-models). If absent, profiles install
+# without a model field and the CAO provider applies its own default.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROFILES_DIR="$SCRIPT_DIR/../profiles"
+MODELS_LOCAL="${HOME}/.config/supervisor-cao/models.local.yaml"
+
+# Render a profile's frontmatter model field from models.local.yaml.
+# Usage: render_model <profile> <profile.md>
+render_model() {
+    local profile="$1" src="$2"
+    if [[ ! -f "$MODELS_LOCAL" ]]; then
+        echo "$src"
+        return
+    fi
+    local rendered
+    rendered="$(mktemp)"
+    python3 - "$src" "$rendered" "$profile" "$MODELS_LOCAL" <<'PY'
+import sys, yaml
+src, out, profile, models_file = sys.argv[1:5]
+text = open(src).read()
+mapping = yaml.safe_load(open(models_file).read()) or {}
+role_map = {
+    "researcher": "research", "glm-executor": "executor",
+    "qwen-verifier": "verifier", "supervisor": "supervisor_primary",
+}
+role = role_map.get(profile)
+model = None
+if role and isinstance(mapping.get(role), str):
+    model = mapping[role]
+elif isinstance(mapping.get("roles"), dict):
+    model = mapping["roles"].get(role)
+if model:
+    # insert model: line after the provider: line in frontmatter
+    lines = text.split("\n")
+    for i, ln in enumerate(lines):
+        if ln.startswith("provider:"):
+            lines.insert(i + 1, f"model: {model}")
+            break
+    text = "\n".join(lines)
+open(out, "w").write(text)
+PY
+    echo "$rendered"
+}
 
 echo "Installing Supervisor-CAO profiles into CAO..."
 
-# OpenCode profiles (GLM/Qwen)
+# OpenCode provider profiles
 for profile in supervisor researcher glm-executor qwen-verifier; do
     f="$PROFILES_DIR/$profile.md"
     if [[ -f "$f" ]]; then
+        rendered="$(render_model "$profile" "$f")"
         echo "  installing $profile (opencode_cli)..."
-        cao install "$f" --provider opencode_cli 2>&1 | tail -1 || echo "  WARN: $profile install failed (may already exist)"
+        cao install "$rendered" --provider opencode_cli 2>&1 | tail -1 || echo "  WARN: $profile install failed (may already exist)"
+        rm -f "$rendered"
     fi
 done
 
-# Codex profiles (Codex CLI)
+# Codex provider profiles
 for profile in codex-planner codex-reviewer codex-judge; do
     f="$PROFILES_DIR/$profile.md"
     if [[ -f "$f" ]]; then

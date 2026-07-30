@@ -16,7 +16,7 @@ def store(tmp_path):
 
 @pytest.fixture
 def task(store):
-    return store.create("T1", "pandas", baseline_sha="aaa111")
+    return store.create("T1", "demo-project", baseline_sha="aaa111")
 
 
 # --- legal transitions ---

@@ -47,12 +47,16 @@ class PolicyGateway:
     def __init__(self, state_store: StateStore | None = None,
                  budget: CodexBudget | None = None,
                  cao_client: CaoClient | None = None,
-                 stage_store: StageStore | None = None):
+                 stage_store: StageStore | None = None,
+                 test_mode: bool = False):
         self.store = state_store or StateStore()
         self.budget = budget or CodexBudget()
         self.cao = cao_client or CaoClient()
         self.stages = stage_store or StageStore()
         self.runner = WorkerRunner(self.cao)
+        # Test mode is enabled via dependency injection (NOT a .test-mode file).
+        # When True, the draft-PR step writes a test URL instead of calling gh.
+        self.test_mode = test_mode
 
     # --- task lifecycle ---
 
@@ -406,14 +410,16 @@ class PolicyGateway:
         base_sha = rec.baseline_sha or _safe_head(executor_wt)
         self.stages.mark_running(task_id, stage, candidate_sha=base_sha)
         impl, real_sha = self.runner.run_executor(
-            task_id, plan, base_sha, executor_wt, session_name)
+            task_id, plan, base_sha, executor_wt, session_name,
+            expected_branch=f"agent/{task_id}")
         self.stages.complete_stage(task_id, stage, artifact_path=str(run_dir / "implementation.json"),
                                    candidate_sha=real_sha)
         self.store.transition(task_id, TaskState.IMPLEMENTED, new_candidate_sha=real_sha)
 
     def _stage_local_verify(self, task_id, rec, cfg, session_name, run_dir):
         stage = "verification"
-        run, done = self.stages.begin_stage(task_id, stage, "qwen-verifier")
+        run, done = self.stages.begin_stage(task_id, stage, "qwen-verifier",
+                                            candidate_sha=rec.candidate_sha)
         if done:
             self.store.transition(task_id, TaskState.LOCAL_VERIFIED, tested_sha=rec.candidate_sha)
             return
@@ -436,11 +442,12 @@ class PolicyGateway:
         self.store.transition(task_id, TaskState.LOCAL_VERIFIED, tested_sha=rec.candidate_sha)
 
     def _stage_remote_verify(self, task_id, rec, cfg, session_name, run_dir):
-        # For temp-repo E2E (no real 920B pool), remote verification is simulated
-        # by treating the local verification as the remote result. The real 920B
+        # For temp-repo E2E (no real remote pool), remote verification is simulated
+        # by treating the local verification as the remote result. The real remote
         # path delegates to scripts/run-verification (Stage 5 fixes the pipefail bug).
         stage = "remote_verification"
-        run, done = self.stages.begin_stage(task_id, stage, "qwen-verifier")
+        run, done = self.stages.begin_stage(task_id, stage, "qwen-verifier",
+                                            candidate_sha=rec.candidate_sha)
         if done:
             self.store.transition(task_id, TaskState.REMOTE_VERIFIED)
             return
@@ -454,7 +461,7 @@ class PolicyGateway:
         verify["remote_results"] = {
             "container": "temp-repo-local", "install_ok": True,
             "correctness_passed": verify.get("passed", True),
-            "summary": "remote verification simulated on temp repo (no 920B pool)",
+            "summary": "remote verification simulated on temp repo (no remote pool)",
         }
         (run_dir / "verification.json").write_text(json.dumps(verify, indent=2))
         self.stages.complete_stage(task_id, stage, candidate_sha=rec.candidate_sha)
@@ -462,7 +469,8 @@ class PolicyGateway:
 
     def _stage_review(self, task_id, rec, cfg, session_name, run_dir):
         stage = "review"
-        run, done = self.stages.begin_stage(task_id, stage, "codex-reviewer")
+        run, done = self.stages.begin_stage(task_id, stage, "codex-reviewer",
+                                            candidate_sha=rec.candidate_sha)
         if done:
             review = self.get_artifact(task_id, "review") or {}
             self._apply_review_decision(task_id, rec, review)
@@ -486,7 +494,8 @@ class PolicyGateway:
     def _stage_fix(self, task_id, rec, cfg, session_name, run_dir):
         # CHANGES_REQUESTED -> FIXING -> re-implement -> re-verify -> incremental review
         stage = "fix"
-        run, done = self.stages.begin_stage(task_id, stage, "glm-executor")
+        run, done = self.stages.begin_stage(task_id, stage, "glm-executor",
+                                            candidate_sha=rec.candidate_sha)
         if done:
             self.store.transition(task_id, TaskState.LOCAL_VERIFYING)
             return
@@ -502,7 +511,8 @@ class PolicyGateway:
         fix_plan["_prior_review_findings"] = prior_review.get("findings", [])
         impl, real_sha = self.runner.run_executor(
             task_id, fix_plan, rec.baseline_sha or _safe_head(executor_wt),
-            executor_wt, session_name)
+            executor_wt, session_name,
+            expected_branch=f"agent/{task_id}")
         self.stages.complete_stage(task_id, stage, artifact_path=str(run_dir / "implementation.json"),
                                    candidate_sha=real_sha)
         # new SHA invalidates old verification/review — re-verify then incremental review
@@ -511,7 +521,8 @@ class PolicyGateway:
 
     def _stage_incremental_review(self, task_id, rec, cfg, session_name, run_dir):
         stage = "incremental_review"
-        run, done = self.stages.begin_stage(task_id, stage, "codex-reviewer")
+        run, done = self.stages.begin_stage(task_id, stage, "codex-reviewer",
+                                            candidate_sha=rec.candidate_sha)
         if done:
             review = self.get_artifact(task_id, "incremental_review") or self.get_artifact(task_id, "review") or {}
             self._apply_incremental_decision(task_id, rec, review)
@@ -542,11 +553,10 @@ class PolicyGateway:
         # delegate to create-draft-pr script (validates all 5 artifacts exist)
         script = Path(__file__).resolve().parents[3] / "scripts" / "create-draft-pr"
         task_branch = f"agent/{task_id}"
-        test_mode = _is_test_mode(cfg, run_dir)
         cmd = ["python", str(script), "--repo", cfg.wsl_repo or str(run_dir),
                "--task-id", task_id, "--task-branch", task_branch,
                "--base-branch", cfg.base_branch, "--run-dir", str(run_dir)]
-        if test_mode:
+        if self.test_mode:
             cmd.append("--test-mode")
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         if r.returncode != 0:
@@ -633,9 +643,3 @@ def _safe_head(repo: str) -> str | None:
         return current_sha(repo)
     except Exception:
         return None
-
-
-def _is_test_mode(cfg, run_dir: Path) -> bool:
-    """Test mode is enabled when the run dir contains a temp-repo marker or the
-    project config has no real GitHub remote. Production mode requires real gh."""
-    return (run_dir / ".test-mode").exists()

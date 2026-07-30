@@ -71,12 +71,15 @@ python3 scripts/detect-models            # writes ~/.config/supervisor-cao/model
 
 ## 5. Create project local config
 
+`config/examples/demo-project.example.yaml` is a fully fictional, public
+template — real hosts, container names, usernames, and paths never go in it.
+
 ```bash
 mkdir -p ~/.config/supervisor-cao/projects
-cp config/examples/pandas.example.yaml \
-   ~/.config/supervisor-cao/projects/pandas.local.yaml
-# Edit: real wsl_repo, windows_repo, remote_validation (ssh_host, containers,
-# user, repo_path, conda_env). Never commit this file.
+cp config/examples/demo-project.example.yaml \
+   ~/.config/supervisor-cao/projects/demo-project.local.yaml
+# Edit the local copy: real wsl_repo, windows_repo, remote_validation
+# (ssh_host, containers, user, repo_path, env). Never commit this file.
 ```
 
 ## 6. Initialize CAO and verify
@@ -210,12 +213,15 @@ python3 scripts/detect-models            # 写入 ~/.config/supervisor-cao/model
 
 ## 5. 创建项目本地配置
 
+`config/examples/demo-project.example.yaml` 是一个完全虚构的、公开的模板
+— 真实的主机名、容器名、用户名和路径绝不放入其中。
+
 ```bash
 mkdir -p ~/.config/supervisor-cao/projects
-cp config/examples/pandas.example.yaml \
-   ~/.config/supervisor-cao/projects/pandas.local.yaml
-# 编辑：真实的 wsl_repo、windows_repo、remote_validation（ssh_host、containers、
-# user、repo_path、conda_env）。切勿提交此文件。
+cp config/examples/demo-project.example.yaml \
+   ~/.config/supervisor-cao/projects/demo-project.local.yaml
+# 编辑本地副本：真实的 wsl_repo、windows_repo、remote_validation
+#（ssh_host、containers、user、repo_path、env）。切勿提交此文件。
 ```
 
 ## 6. 初始化 CAO 并验证

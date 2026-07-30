@@ -1,0 +1,63 @@
+# demo-project: a fully fictional example project configuration (PUBLIC).
+#
+# This is a reference template showing every field the platform understands.
+# All values here are placeholders — real hosts, container names, usernames,
+# and paths go in the private ~/.config/supervisor-cao/projects/<project>.local.yaml
+# (never committed). Nothing here refers to a real repository or environment.
+name: demo-project
+base_branch: main
+task_branch_prefix: agent/
+
+# Main clone path for the agent. Real value is private (set in local config).
+# This placeholder is intentionally generic.
+wsl_repo: "<PROJECT_REPO_PATH>"
+# Optional secondary repository path (private). Used by the platform sync step.
+windows_repo: "<WINDOWS_REPO_PATH>"
+
+# Project-default verification rules. Local and remote verification are driven
+# by configured commands/plugins; the core only reads exit codes, logs, SHAs,
+# and structured results.
+default_verification:
+  local:
+    build: true
+    focused_tests: true
+    candidate_sha_check: true
+  remote:
+    install: true
+    correctness_tests: true
+    log_collection: true
+  report:
+    structured: true
+
+# Remote validation environment (private details in local config). Sanitized.
+# The platform treats this opaquely: it acquires a lock, records/restores git
+# state, runs the configured verification command, and reads the exit code.
+remote_validation:
+  ssh_host: "<SSH_HOST>"
+  containers: ["<CONTAINER_A>", "<CONTAINER_B>"]
+  user: "<REMOTE_USER>"
+  repo_path: "<REMOTE_REPOSITORY_PATH>"
+  env: "<REMOTE_ENV>"
+
+# Executor loop limits.
+executor_limits:
+  max_rounds: 8
+  max_no_progress_rounds: 2
+  push_every_valid_candidate: true
+  require_clean_worktree: true
+  require_commit: true
+
+# Codex budget per task. Enforced in code, not by the Supervisor.
+codex_budget:
+  max_calls_per_task: 4
+  planner: 1
+  full_review: 1
+  incremental_review: 1
+  judge: 1
+
+# Task-level overrides MUST supply (no guessing allowed):
+#   baseline_sha: <SHA>
+#   required_test_scope: <list>
+#   performance_acceptance: <threshold>   # optional, project-dependent
+#   regression_threshold: <max regression> # optional, project-dependent
+# Missing critical params -> NEEDS_HUMAN.

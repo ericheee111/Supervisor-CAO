@@ -159,7 +159,7 @@ Supervisor prompts may explain these rules, but prompts are not enforcement.
 ## Git rules
 
 - Base branch is project configuration, not hard-coded globally.
-- For pandas, the default base branch is `dev`.
+- The default base branch is `main` unless a project config overrides it.
 - Task branches use `agent/<task-id>`.
 - Every valid candidate must be committed and pushed.
 - Verification and review results are valid only for their exact SHA.
@@ -176,8 +176,8 @@ Every feature needs tests at the appropriate levels:
 - Unit tests for state, budgets, configuration, locks, and safety gates.
 - Integration tests for worker results, callback handling, and failure recovery.
 - End-to-end tests using temporary repositories.
-- No live destructive tests against the real pandas Windows repository.
-- The real pandas integration test is read-only unless the user explicitly starts a real task.
+- No live destructive tests against real project repositories.
+- Real project integration tests are read-only unless the user explicitly starts a real task.
 
 Test output must be captured as artifacts. Do not report success from memory or from an agent summary alone.
 

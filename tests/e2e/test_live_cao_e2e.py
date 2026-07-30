@@ -123,14 +123,14 @@ def main() -> int:
     LOCAL_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     local_cfg_path = LOCAL_CONFIG_DIR / "testproj.local.yaml"
     local_cfg_path.write_text(yaml.dump({
-        "name": "testproj", "base_branch": "dev", "task_branch_prefix": "agent/",
+        "name": "testproj", "base_branch": "main", "task_branch_prefix": "agent/",
         "wsl_repo": main_repo, "windows_repo": win_repo,
     }))
 
-    gw = PolicyGateway(state_store=store, budget=budget, stage_store=stages)
+    gw = PolicyGateway(state_store=store, budget=budget, stage_store=stages,
+                       test_mode=True)
     run_dir = RUN_ROOT / task_id
     run_dir.mkdir(parents=True, exist_ok=True)
-    (run_dir / ".test-mode").write_text("")  # enable test-mode PR adapter
     (run_dir / "task.json").write_text(json.dumps({"task_id": task_id, "description": ""}))
 
     try:
