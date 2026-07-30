@@ -400,6 +400,16 @@ def _run_review_fix(dirs: dict[str, Path], meta: dict) -> tuple[bool, dict]:
             "    return os.path.join(base, *parts)\n"
         )
         (Path(wt) / "src" / "scao_live" / "paths.py").write_text(unsafe_code)
+        # Also inject simple tests that DON'T test path traversal rejection
+        # (so the unsafe version passes verification and reaches the reviewer).
+        simple_tests = (
+            "from scao_live.paths import safe_join\n\n"
+            "def test_basic_join():\n"
+            "    assert safe_join('/base', 'a', 'b') == '/base/a/b'\n\n"
+            "def test_single_part():\n"
+            "    assert safe_join('/base', 'x') == '/base/x'\n"
+        )
+        (Path(wt) / "tests" / "test_paths.py").write_text(simple_tests)
         # Commit the unsafe version as a new candidate
         subprocess.run(["git", "-C", wt, "add", "-A"], capture_output=True, timeout=30)
         subprocess.run(["git", "-C", wt, "commit", "-m", "revert to unsafe safe_join for review"],
