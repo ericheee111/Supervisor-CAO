@@ -178,18 +178,23 @@ def _make_project_config(repo_dir: str, dirs: dict[str, Path], *,
     """Build a ProjectConfig pointing at the acceptance repo with isolated dirs."""
     from supervisor_cao.projects.config import ProjectConfig
     if local_command is None:
-        # use the test repo's own test suite as the verification command
-        local_command = ["python", "-m", "pytest", "tests/", "-q"]
+        # use the workspace venv's python (has pytest installed) to run the
+        # test repo's test suite. The command runs in the executor worktree
+        # cwd; PYTHONPATH=src is set so the src-layout package is importable.
+        venv_python = "/mnt/d/Projects/Supervisor-CAO/.venv/bin/python"
+        local_command = ["bash", "-lc", f"PYTHONPATH=src {venv_python} -m pytest tests/ -q"]
     # Ensure __pycache__ is gitignored so the executor worktree stays clean
     # after Python runs (pytest creates __pycache__ dirs). Commit the .gitignore
     # so the main clone stays clean.
     gitignore = Path(repo_dir) / ".gitignore"
-    if not gitignore.exists() or "__pycache__" not in (gitignore.read_text() if gitignore.exists() else ""):
+    needed = "__pycache__"
+    current = gitignore.read_text() if gitignore.exists() else ""
+    if needed not in current:
         with open(gitignore, "a") as f:
-            f.write("\n__pycache__/\n*.pyc\n")
+            f.write("\n__pycache__/\n*.pyc\n*.egg-info/\n.eggs/\nbuild/\ndist/\n")
         subprocess.run(["git", "-C", repo_dir, "add", ".gitignore"],
                        capture_output=True, timeout=30)
-        subprocess.run(["git", "-C", repo_dir, "commit", "-m", "add gitignore for pycache"],
+        subprocess.run(["git", "-C", repo_dir, "commit", "-m", "add gitignore for pycache and build artifacts"],
                        capture_output=True, timeout=30)
     return ProjectConfig(
         name="acceptance",
@@ -221,9 +226,16 @@ def _build_gateway(dirs: dict[str, Path], cfg, *, test_mode: bool = True):
     store = StateStore(db_path=dirs["state"] / "tasks.db")
     budget = CodexBudget(db_path=dirs["budget"] / "codex.db")
     stages = StageStore(db_path=dirs["state"] / "stages.db")
+    # Build a backend factory that uses local_fixture=True for remote verification
+    # (acceptance has no real remote pool; local tests pass is the evidence).
+    # Local verification still uses the real configured command (exit code authoritative).
+    def backend_factory(cfg, *, local_fixture=False):
+        from supervisor_cao.projects.adapter import ValidationBackend
+        return ValidationBackend(cfg, local_fixture=True)
     # real CaoClient (no fake); test_mode for draft-PR test URL
     gw = PolicyGateway(state_store=store, budget=budget, stage_store=stages,
-                       test_mode=test_mode, run_root=dirs["runs"])
+                       test_mode=test_mode, run_root=dirs["runs"],
+                       backend_factory=backend_factory, local_fixture=True)
     # inject the acceptance config so run_next_stage uses it
     _inject_config(None, cfg)
     return gw, store, budget, stages

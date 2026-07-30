@@ -399,7 +399,8 @@ class WorkerRunner:
         # is clean. Untracked __pycache__ is handled by .gitignore.
         subprocess.run(["git", "-C", executor_worktree, "checkout", "--", "."],
                        capture_output=True, timeout=30)
-        subprocess.run(["git", "-C", executor_worktree, "clean", "-fd", "--", "__pycache__"],
+        subprocess.run(["git", "-C", executor_worktree, "clean", "-fd",
+                        "--", "__pycache__", "*.egg-info", ".eggs", "build", "dist"],
                        capture_output=True, timeout=30)
         # Requirement: worktree must be clean after the run.
         if not _git_porcelain_clean(executor_worktree):
