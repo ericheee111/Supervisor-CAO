@@ -16,6 +16,7 @@ dependencies = [
     "jsonschema>=4.25",
     "pydantic>=2.10.0",
     "requests>=2.31.0",
+    "fastmcp>=0.3.0",
 ]
 
 [project.optional-dependencies]
@@ -26,6 +27,7 @@ dev = [
 
 [project.scripts]
 supervisor-cao = "supervisor_cao.cli.main:cli"
+supervisor-cao-policy-mcp = "supervisor_cao.mcp.server:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/supervisor_cao"]

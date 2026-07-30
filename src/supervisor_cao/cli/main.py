@@ -127,6 +127,19 @@ def chat(project):
     click.echo(out.strip())
 
 
+@cli.command("policy-mcp")
+def policy_mcp():
+    """Run the supervisor-cao-policy stdio MCP server (for debugging / CAO registration).
+
+    This is the deterministic policy layer. The Supervisor profile registers it
+    via frontmatter mcpServers; the Supervisor LLM calls its tools
+    (create_task, run_next_stage, get_task, get_artifact, resume_task) to drive
+    the pipeline. The built-in @cao-mcp-server is NOT enabled on the Supervisor.
+    """
+    from supervisor_cao.mcp.server import main as mcp_main
+    sys.exit(mcp_main())
+
+
 @cli.command()
 @click.argument("project")
 @click.option("--task-file", required=True, type=click.Path(exists=True))
