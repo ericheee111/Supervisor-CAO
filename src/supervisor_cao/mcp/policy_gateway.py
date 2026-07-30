@@ -423,9 +423,14 @@ class PolicyGateway:
         if done:
             # already implemented — candidate_sha was recorded
             cand = run.candidate_sha or rec.candidate_sha
+            if rec.state == TaskState.PLAN_READY.value:
+                self.store.transition(task_id, TaskState.IMPLEMENTING)
             self.store.transition(task_id, TaskState.IMPLEMENTED, new_candidate_sha=cand)
             return
         plan = self.get_artifact(task_id, "plan") or {}
+        # transition to IMPLEMENTING before running the executor
+        if rec.state == TaskState.PLAN_READY.value:
+            self.store.transition(task_id, TaskState.IMPLEMENTING)
         # create the executor worktree via the ProjectAdapter (generic)
         adapter = ProjectAdapter(cfg)
         main_repo = adapter.main_repo or str(run_dir)

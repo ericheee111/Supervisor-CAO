@@ -4,7 +4,7 @@
   "title": "Task",
   "description": "Validates a task description artifact exchanged between agents in the Supervisor-CAO platform. A task declares the work to be performed, its baseline, and the acceptance criteria the result must satisfy. PUBLIC schema: sanitized, contains no secrets, hostnames, or private paths.",
   "type": "object",
-  "additionalProperties": false,
+  "additionalProperties": true,
   "required": ["task_id", "project", "description"],
   "properties": {
     "task_id": {

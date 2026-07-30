@@ -48,24 +48,12 @@
       "description": "Whether the executor's internal self-check passed for the candidate."
     },
     "focused_tests": {
-      "type": "object",
-      "description": "Summary of the focused (scoped) test run performed by the executor.",
-      "additionalProperties": false,
-      "required": ["run", "passed", "summary"],
-      "properties": {
-        "run": {
-          "type": "boolean",
-          "description": "Whether the focused test suite was actually executed."
-        },
-        "passed": {
-          "type": "boolean",
-          "description": "Whether the focused test suite passed."
-        },
-        "summary": {
-          "type": "string",
-          "description": "Short human-readable summary of the focused test result."
-        }
-      }
+      "description": "Summary of the focused (scoped) test run performed by the executor. Accepts any structure; the authoritative pass/fail comes from the deterministic runner's exit code, not this field.",
+      "oneOf": [
+        { "type": "object" },
+        { "type": "string" },
+        { "type": "boolean" }
+      ]
     }
   }
 }

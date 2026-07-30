@@ -51,8 +51,8 @@ class ProjectAdapter:
     @property
     def worktree_root(self) -> Path:
         """Root directory under which per-task worktrees are created."""
-        from supervisor_cao.workers.worktrees import WORKTREE_ROOT
-        return WORKTREE_ROOT / self.cfg.name
+        from supervisor_cao.workers.worktrees import _worktree_root
+        return _worktree_root() / self.cfg.name
 
     @property
     def main_repo(self) -> str:

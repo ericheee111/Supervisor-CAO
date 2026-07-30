@@ -46,6 +46,13 @@ def _isolated_dirs() -> dict[str, Path]:
     }
 
 
+def _win_accessible_repo_dir() -> Path:
+    """A Windows-accessible repo dir (under /mnt/) so OpenCode's write tool
+    (a Windows binary) can edit files. WSL ext4 paths (/root/) are invisible
+    to Windows OpenCode."""
+    return Path("/mnt/d/Projects/scao-acceptance-repo")
+
+
 def _write_meta(meta: dict) -> None:
     _subdir("state").mkdir(parents=True, exist_ok=True)
     (_subdir("state") / "meta.json").write_text(json.dumps(meta, indent=2))
@@ -70,7 +77,10 @@ def prepare(repo_path: str | None = None, repo_url: str | None = None) -> int:
     dirs = _isolated_dirs()
     for d in dirs.values():
         d.mkdir(parents=True, exist_ok=True)
-    repo_dir = dirs["repo"]
+    # Use a Windows-accessible repo dir so OpenCode (a Windows binary) can
+    # edit files via its write tool. WSL ext4 paths are invisible to it.
+    repo_dir = _win_accessible_repo_dir()
+    repo_dir.parent.mkdir(parents=True, exist_ok=True)
     if repo_url:
         if repo_dir.exists() and (repo_dir / ".git").exists():
             print(f"Updating existing acceptance repo at {repo_dir}...")
@@ -170,6 +180,17 @@ def _make_project_config(repo_dir: str, dirs: dict[str, Path], *,
     if local_command is None:
         # use the test repo's own test suite as the verification command
         local_command = ["python", "-m", "pytest", "tests/", "-q"]
+    # Ensure __pycache__ is gitignored so the executor worktree stays clean
+    # after Python runs (pytest creates __pycache__ dirs). Commit the .gitignore
+    # so the main clone stays clean.
+    gitignore = Path(repo_dir) / ".gitignore"
+    if not gitignore.exists() or "__pycache__" not in (gitignore.read_text() if gitignore.exists() else ""):
+        with open(gitignore, "a") as f:
+            f.write("\n__pycache__/\n*.pyc\n")
+        subprocess.run(["git", "-C", repo_dir, "add", ".gitignore"],
+                       capture_output=True, timeout=30)
+        subprocess.run(["git", "-C", repo_dir, "commit", "-m", "add gitignore for pycache"],
+                       capture_output=True, timeout=30)
     return ProjectConfig(
         name="acceptance",
         base_branch=base_branch,
@@ -192,6 +213,11 @@ def _build_gateway(dirs: dict[str, Path], cfg, *, test_mode: bool = True):
     from supervisor_cao.mcp.stage_store import StageStore
     from supervisor_cao.mcp.policy_gateway import PolicyGateway
     from supervisor_cao.mcp.cao_client import CaoClient
+    # Set worktree root to a Windows-accessible path so OpenCode (Windows binary)
+    # can edit files in executor worktrees.
+    wt_root = _win_accessible_repo_dir().parent / "scao-acceptance-worktrees"
+    wt_root.mkdir(parents=True, exist_ok=True)
+    os.environ["SCAO_WORKTREE_ROOT"] = str(wt_root)
     store = StateStore(db_path=dirs["state"] / "tasks.db")
     budget = CodexBudget(db_path=dirs["budget"] / "codex.db")
     stages = StageStore(db_path=dirs["state"] / "stages.db")

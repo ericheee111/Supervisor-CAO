@@ -118,7 +118,7 @@ class TestCustomBranchPrefix:
 
     def test_worktree_root_uses_project_name(self, tmp_path, monkeypatch):
         from supervisor_cao.projects.adapter import ProjectAdapter
-        monkeypatch.setattr(wtmod, "WORKTREE_ROOT", tmp_path / "wt")
+        monkeypatch.setenv("SCAO_WORKTREE_ROOT", str(tmp_path / "wt"))
         cfg = ProjectConfig(name="myproj", base_branch="main")
         adapter = ProjectAdapter(cfg)
         assert adapter.worktree_root == tmp_path / "wt" / "myproj"

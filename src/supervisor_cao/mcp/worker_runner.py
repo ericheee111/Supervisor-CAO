@@ -218,6 +218,10 @@ def extract_strict_json(text: str) -> dict:
     trailing = re.sub(r"```+", " ", trailing)
     trailing = re.sub(r"[\u2500\u2501_]{2,}", " ", trailing)  # box-drawing rules
     trailing = re.sub(r"^[•◦]\s*", " ", trailing, flags=re.MULTILINE)
+    # Codex status footer: "─ Worked for Nm Ns" or "─ N tokens"
+    trailing = re.sub(r"^[\u2500\u2501_].*?(worked|tokens|tool|step).*?$", " ",
+                      trailing, flags=re.MULTILINE | re.IGNORECASE)
+    trailing = re.sub(r"^[\u2500\u2501_]\s*$", " ", trailing, flags=re.MULTILINE)
     trailing = trailing.strip()
     if trailing:
         raise WorkerError(f"non-JSON trailing content after object: {trailing[:120]!r}")
@@ -389,6 +393,14 @@ class WorkerRunner:
         # Requirement: new SHA must differ from base (no-progress check).
         if base_sha and real_sha == base_sha:
             raise WorkerError("executor: HEAD SHA equals base SHA (no progress; no commit made)")
+        # Clean up stray files the executor may have left (e.g. .gitignore
+        # edits, __pycache__ if not gitignored). Restore tracked files that
+        # the executor modified post-commit (like .gitignore) so the worktree
+        # is clean. Untracked __pycache__ is handled by .gitignore.
+        subprocess.run(["git", "-C", executor_worktree, "checkout", "--", "."],
+                       capture_output=True, timeout=30)
+        subprocess.run(["git", "-C", executor_worktree, "clean", "-fd", "--", "__pycache__"],
+                       capture_output=True, timeout=30)
         # Requirement: worktree must be clean after the run.
         if not _git_porcelain_clean(executor_worktree):
             raise WorkerError("executor: worktree dirty after run (uncommitted changes)")

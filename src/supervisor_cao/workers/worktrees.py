@@ -8,11 +8,18 @@ Per-task isolated worktrees under ~/cao-worktrees/<project>/<task-id>/{executor,
 """
 from __future__ import annotations
 
+import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-WORKTREE_ROOT = Path.home() / "cao-worktrees"
+def _worktree_root() -> Path:
+    """Worktree root, read from SCAO_WORKTREE_ROOT env at call time (not import
+    time) so acceptance can redirect it after import."""
+    return Path(os.environ.get("SCAO_WORKTREE_ROOT", str(Path.home() / "cao-worktrees")))
+
+
+WORKTREE_ROOT = _worktree_root()
 
 
 class WorktreeError(Exception):
@@ -36,7 +43,7 @@ class WorktreePaths:
 
 
 def task_worktree_root(project: str, task_id: str) -> Path:
-    return WORKTREE_ROOT / project / task_id
+    return _worktree_root() / project / task_id
 
 
 def paths_for(project: str, task_id: str) -> WorktreePaths:
