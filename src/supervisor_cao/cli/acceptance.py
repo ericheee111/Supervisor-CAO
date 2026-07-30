@@ -366,6 +366,55 @@ def _run_review_fix(dirs: dict[str, Path], meta: dict) -> tuple[bool, dict]:
                    "Add any missing tests and improve the implementation if needed. "
                    "The function should correctly join paths. Run pytest to verify.",
                    baseline_sha=None)
+    # Drive stages 1-5 (research, plan, implement, local-verify, remote-verify)
+    # but STOP before review (stage 6). The executor may "improve" the code,
+    # but we need the reviewer to see the unsafe candidate. So after the
+    # executor runs, we RESET the worktree to the unsafe version so the
+    # reviewer sees the path traversal vulnerability.
+    from supervisor_cao.state.machine import TaskState
+    terminal = {TaskState.READY_FOR_HUMAN_REVIEW.value, TaskState.FAILED.value,
+                TaskState.NEEDS_HUMAN.value, TaskState.APPROVED.value,
+                TaskState.CHANGES_REQUESTED.value}
+    for i in range(1, 20):
+        rec = gw.get_task(task_id)
+        if rec["state"] in terminal or rec["state"] == TaskState.REMOTE_VERIFIED.value:
+            break
+        print(f"  [stage {i}] {rec['state']} -> run_next_stage ...")
+        rec = gw.run_next_stage(task_id)
+        print(f"    state={rec['state']} cand={rec.get('candidate_sha') or '-'}")
+    # If we reached REMOTE_VERIFIED, reset the worktree to the unsafe version
+    # so the reviewer catches the path traversal issue.
+    rec = gw.get_task(task_id)
+    if rec["state"] == TaskState.REMOTE_VERIFIED.value:
+        # Re-inject the unsafe safe_join into the executor worktree
+        from supervisor_cao.workers.worktrees import paths_for
+        p = paths_for("acceptance", task_id)
+        wt = str(p.executor)
+        unsafe_code = (
+            "def safe_join(base, *parts):\n"
+            "    import os\n"
+            "    return os.path.join(base, *parts)\n"
+        )
+        (Path(wt) / "src" / "scao_live" / "paths.py").write_text(unsafe_code)
+        # Commit the unsafe version as a new candidate
+        subprocess.run(["git", "-C", wt, "add", "-A"], capture_output=True, timeout=30)
+        subprocess.run(["git", "-C", wt, "commit", "-m", "revert to unsafe safe_join for review"],
+                       capture_output=True, timeout=30)
+        new_sha = subprocess.run(["git", "-C", wt, "rev-parse", "HEAD"],
+                                capture_output=True, text=True, timeout=15).stdout.strip()
+        # Update the state machine with the new (unsafe) candidate
+        store.transition(task_id, TaskState.REMOTE_VERIFIED)  # already there
+        # Update candidate_sha to the unsafe version
+        store_meta = store.get(task_id)
+        store.transition(task_id, TaskState.REMOTE_VERIFIED)
+        # Hack: directly update the candidate in the DB
+        import sqlite3
+        with sqlite3.connect(str(dirs["state"] / "tasks.db")) as conn:
+            conn.execute("UPDATE tasks SET candidate_sha=? WHERE task_id=?",
+                         (new_sha, task_id))
+            conn.commit()
+        print(f"  injected unsafe candidate: {new_sha[:12]}")
+    # Now drive the rest (review should catch the issue -> CHANGES_REQUESTED -> fix -> ...)
     rec = _drive_to_terminal(gw, task_id, store)
     evidence = _collect_evidence(task_id, store, budget, stages, dirs)
     # verify the flow went through CHANGES_REQUESTED at some point
