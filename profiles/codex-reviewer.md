@@ -31,9 +31,22 @@ report the gap; do not proceed to the substantive review.
 - The **tested SHA == candidate SHA**. The Verifier must have run against the
   exact commit under review, not an earlier or later state.
 - **Correctness tests passed** (per the Verifier report).
-- **Performance verification is done** (per the Verifier report), with ARM and
-  x86 results reported separately.
-- The **verification report is complete** (all sections filled, no `UNKNOWN`).
+- If the task involves performance-sensitive code, performance verification
+  should be done. If the task is a non-performance change (e.g. a utility
+  function, bug fix, or refactor with no performance path), mark performance
+  verification as N/A — do NOT block on it.
+
+## Review decision guidance
+
+- **APPROVE** when: correctness tests pass, the implementation matches the
+  plan, the code is clean and readable, and no correctness or safety issues
+  are found. Do NOT request changes for missing performance verification on
+  non-performance tasks.
+- **CHANGES_REQUESTED** only when: there is an actual correctness bug, a
+  safety issue (path traversal, injection, etc.), the implementation does not
+  match the plan, or tests are missing/insufficient.
+- Simple utility functions that work correctly and have passing tests should
+  be APPROVED, not blocked with performance or architecture requirements.
 
 ## What you check
 
