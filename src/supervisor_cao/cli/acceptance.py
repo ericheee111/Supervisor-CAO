@@ -49,8 +49,10 @@ def _isolated_dirs() -> dict[str, Path]:
 def _win_accessible_repo_dir() -> Path:
     """A Windows-accessible repo dir (under /mnt/) so OpenCode's write tool
     (a Windows binary) can edit files. WSL ext4 paths (/root/) are invisible
-    to Windows OpenCode."""
-    return Path("/mnt/d/Projects/scao-acceptance-repo")
+    to Windows OpenCode. Configurable via SCAO_ACCEPTANCE_REPO_DIR env;
+    defaults to /mnt/d/Projects/scao-acceptance-repo on WSL."""
+    return Path(os.environ.get("SCAO_ACCEPTANCE_REPO_DIR",
+                               "/mnt/d/Projects/scao-acceptance-repo"))
 
 
 def _write_meta(meta: dict) -> None:

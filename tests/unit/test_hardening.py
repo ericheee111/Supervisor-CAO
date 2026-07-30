@@ -265,6 +265,8 @@ class TestAcceptanceIsolation:
         and does not touch the default ~/.local/state/supervisor-cao."""
         from supervisor_cao.cli import acceptance as accmod
         monkeypatch.setattr(accmod, "ACCEPTANCE_ROOT", tmp_path / "acc")
+        # redirect the Windows-accessible repo dir to the temp dir (CI has no /mnt/d)
+        monkeypatch.setenv("SCAO_ACCEPTANCE_REPO_DIR", str(tmp_path / "acc" / "repo"))
         # prepare with a local repo path
         repo = tmp_path / "repo"
         repo.mkdir()
