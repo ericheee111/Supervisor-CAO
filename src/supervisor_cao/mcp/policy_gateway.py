@@ -502,6 +502,13 @@ class PolicyGateway:
         run, done = self.stages.begin_stage(task_id, stage, "qwen-verifier",
                                             candidate_sha=rec.candidate_sha)
         if done:
+            # Must go through REMOTE_QUEUED -> REMOTE_VERIFYING -> REMOTE_VERIFIED.
+            # Direct LOCAL_VERIFIED -> REMOTE_VERIFIED is illegal.
+            if rec.state == TaskState.LOCAL_VERIFIED.value:
+                self.store.transition(task_id, TaskState.REMOTE_QUEUED)
+                self.store.transition(task_id, TaskState.REMOTE_VERIFYING)
+            elif rec.state == TaskState.REMOTE_QUEUED.value:
+                self.store.transition(task_id, TaskState.REMOTE_VERIFYING)
             self.store.transition(task_id, TaskState.REMOTE_VERIFIED)
             return
         self.stages.mark_running(task_id, stage, candidate_sha=rec.candidate_sha)
