@@ -143,9 +143,17 @@ def main() -> int:
 
         # refuse dirty
         if git_before.get("porcelain"):
+            # Requirement 5: dirty-on-start — release the lock we acquired,
+            # return REMOTE_WORKTREE_DIRTY WITHOUT checkout/install/test.
+            # Do NOT modify the repository; do NOT run restore/after-check.
             result["status"] = "REMOTE_WORKTREE_DIRTY"
             result["git_before"] = git_before
-            raise RuntimeError("dirty worktree")
+            result["restored"] = True  # nothing was changed
+            _release_lock(args.ssh_host, args.container, args.task_id)
+            result["finished"] = time.time()
+            (run_dir / "verification.json").write_text(json.dumps(result, indent=2))
+            print(json.dumps(result, indent=2))
+            return 4  # dirty-on-start exit code
 
         # 4. fetch + checkout candidate (NO reset --hard, NO clean)
         for name, cmd in [("fetch", f"cd {args.repo_path} && git fetch origin"),
@@ -159,16 +167,17 @@ def main() -> int:
                     result["status"] = "STALE_VERIFICATION"
                     result["stale"] = True
 
-        # 5. editable install
-        install_cmd = (f"cd {args.repo_path} && source {args.conda_path}/etc/profile.d/conda.sh "
+        # 5. editable install (pipefail so a failed install is not masked)
+        install_cmd = (f"cd {args.repo_path} && set -o pipefail && source {args.conda_path}/etc/profile.d/conda.sh "
                        f"&& conda activate {args.conda_env} && source {args.toolchain_enable} "
                        f"&& export CC=gcc CXX=g++ && python -m pip install -e . --no-build-isolation 2>&1")
         rr = _in_container(args.ssh_host, args.container, args.user, install_cmd, timeout=900)
         (run_dir / "install.log").write_text(rr.stdout + rr.stderr)
         result["install_ok"] = rr.returncode == 0
 
-        # 6. focused pytest
-        pytest_cmd = (f"cd {args.repo_path} && source {args.conda_path}/etc/profile.d/conda.sh "
+        # 6. focused pytest — pipefail so pytest's exit code is NOT masked by tail
+        # (requirement 5: pytest ... | tail must not let tail's exit code win).
+        pytest_cmd = (f"cd {args.repo_path} && set -o pipefail && source {args.conda_path}/etc/profile.d/conda.sh "
                       f"&& conda activate {args.conda_env} && source {args.toolchain_enable} "
                       f"&& export CC=gcc CXX=g++ && python -m pytest -q 2>&1 | tail -20")
         rr = _in_container(args.ssh_host, args.container, args.user, pytest_cmd, timeout=1800)
