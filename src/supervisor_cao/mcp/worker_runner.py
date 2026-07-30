@@ -315,29 +315,57 @@ class WorkerRunner:
              working_directory: str, session_name: str | None,
              model: str | None = None, timeout: int | None = None,
              candidate_sha: str | None = None) -> dict:
-        """Launch a Worker, extract+validate JSON, stamp, and save the artifact."""
+        """Launch a Worker, extract+validate JSON, stamp, and save the artifact.
+
+        If the Worker's output has no parseable JSON (intermittent Codex CLI
+        issue where it emits conversation text instead of JSON), retry once
+        with a stronger JSON-only prompt before failing.
+        """
+        obj = self._try_extract_json(task_id, stage, profile, prompt,
+                                     working_directory, session_name, model,
+                                     timeout, candidate_sha)
+        if obj is None:
+            # Retry with a stronger JSON-only prompt
+            retry_prompt = (
+                "CRITICAL: Your previous response did not contain a valid JSON "
+                "object. You MUST output ONLY a raw JSON object now. No prose, "
+                "no markdown, no explanation, no code fences. Start with { and "
+                "end with }. Nothing before or after.\n\n" + prompt
+            )
+            obj = self._try_extract_json(task_id, stage, profile, retry_prompt,
+                                         working_directory, session_name, model,
+                                         timeout, candidate_sha)
+        if obj is None:
+            raise WorkerError(
+                f"{stage} worker: no JSON object found after retry "
+                f"(last_message + terminal fallback both failed)")
+        obj = validate_and_stamp(stage, obj, task_id, candidate_sha)
+        _save_artifact(task_id, stage, obj, run_root=self._run_root)
+        return obj
+
+    def _try_extract_json(self, task_id: str, stage: str, profile: str,
+                          prompt: str, working_directory: str,
+                          session_name: str | None, model: str | None,
+                          timeout: int | None,
+                          candidate_sha: str | None) -> dict | None:
+        """Launch a Worker and try to extract JSON. Returns obj or None."""
         result = self.client.launch_worker(
             profile, prompt, working_directory, session_name, model, timeout,
             task_id=task_id, stage=stage)
         if not result.success or not result.last_message:
-            raise WorkerError(f"{stage} worker failed: {result.error or 'no output'}")
+            return None
         try:
-            obj = extract_strict_json(result.last_message)
+            return extract_strict_json(result.last_message)
         except WorkerError:
-            # If the last_message has no parseable JSON, try the raw terminal
-            # output fallback (the full pane may have the JSON that was
-            # truncated or surrounded by TUI chrome in last_message).
+            # Try the raw terminal output fallback
             if result.terminal_id:
                 fb = self.client._fallback_extract(result.terminal_id)
                 if fb:
-                    obj = extract_strict_json(fb)
-                else:
-                    raise
-            else:
-                raise
-        obj = validate_and_stamp(stage, obj, task_id, candidate_sha)
-        _save_artifact(task_id, stage, obj, run_root=self._run_root)
-        return obj
+                    try:
+                        return extract_strict_json(fb)
+                    except WorkerError:
+                        pass
+            return None
 
     # --- research ---
 
