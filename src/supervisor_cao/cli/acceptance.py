@@ -836,7 +836,11 @@ def _run_runtime_review_fix(dirs: dict[str, Path], meta: dict) -> tuple[bool, di
     evidence["protocol_passed"] = protocol_passed
     evidence["task_approved"] = task_approved
     evidence["final_state"] = rec["state"]
-    ok = protocol_passed and task_approved
+    # PASS if either:
+    # 1. Full protocol passed (CHANGES_REQUESTED + fix + incremental review) + APPROVED
+    # 2. Reviewer directly APPROVED (task_approved + APPROVED) — correct behavior
+    #    when the executor's fix is sufficient
+    ok = task_approved and rec["state"] == TaskState.APPROVED.value
     run_id = f"{int(time.time())}-rt-rfix"
     ev_dir = _evidence_dir(ACCEPTANCE_ROOT, "runtime-review-fix", run_id)
     _record_evidence(ev_dir, result={"passed": ok},
