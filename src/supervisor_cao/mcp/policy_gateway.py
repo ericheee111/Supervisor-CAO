@@ -566,6 +566,9 @@ class PolicyGateway:
         self.stages.complete_stage(task_id, stage, artifact_path=str(run_dir / "review.json"),
                                    candidate_sha=rec.candidate_sha, codex_call_id=str(call.call_index))
         self._save_budget_summary(task_id)
+        # Override reviewed_sha with the authoritative tested_sha.
+        review["reviewed_sha"] = rec.tested_sha
+        (run_dir / "review.json").write_text(json.dumps(review, indent=2))
         self._apply_review_decision(task_id, rec, review)
 
     def _stage_fix(self, task_id, rec, cfg, session_name, run_dir):
@@ -632,6 +635,11 @@ class PolicyGateway:
         self.stages.complete_stage(task_id, stage, artifact_path=str(run_dir / "incremental_review.json"),
                                    candidate_sha=rec.candidate_sha, codex_call_id=str(call.call_index))
         self._save_budget_summary(task_id)
+        # Override reviewed_sha with the authoritative tested_sha (the LLM
+        # may output an incorrect reviewed_sha; the platform stamps the
+        # correct one from the state machine).
+        review["reviewed_sha"] = rec.tested_sha
+        (run_dir / "incremental_review.json").write_text(json.dumps(review, indent=2))
         self._apply_incremental_decision(task_id, rec, review)
 
     def _stage_draft_pr(self, task_id, rec, cfg, run_dir):
