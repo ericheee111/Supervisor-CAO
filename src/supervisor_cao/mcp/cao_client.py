@@ -353,8 +353,8 @@ class CaoClient:
 
     def _wait_for_terminal_done(self, terminal_id: str,
                                 initial_message: str,
-                                max_wait: int = 300,
-                                poll_interval: int = 5) -> str:
+                                max_wait: int = 600,
+                                poll_interval: int = 3) -> str:
         """Poll terminal status until output contains a JSON object.
 
         CAO's run-step may return 200 early while Codex is still running.
