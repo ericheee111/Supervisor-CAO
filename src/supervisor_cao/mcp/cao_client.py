@@ -276,7 +276,8 @@ class CaoClient:
                 has_json = "{" in last_message and "}" in last_message
                 if not has_json and terminal_id:
                     last_message = self._wait_for_terminal_done(terminal_id, last_message)
-                # If still truncated, try fallback
+                    has_json = "{" in last_message and "}" in last_message
+                # If still no JSON or truncated, try fallback one more time
                 looks_truncated = ("{" in last_message
                                    and not last_message.rstrip().endswith("}")
                                    and not last_message.rstrip().endswith("```"))
@@ -359,7 +360,7 @@ class CaoClient:
         CAO's run-step may return 200 early (on Codex's first step-finish
         with reason="tool-calls") while Codex is still running. This method
         polls GET /terminals/{id} until status is not 'processing', then
-        returns the final output.
+        uses _fallback_extract to get the clean agent output.
         """
         import time as _time
         deadline = _time.time() + max_wait
@@ -369,15 +370,12 @@ class CaoClient:
                 ts = self.get_terminal_status(terminal_id)
                 status = ts.get("status", "unknown")
                 if status in ("completed", "idle", "waiting_user_answer", "error", "unknown"):
-                    # Terminal is done — read the full output
-                    output = self.get_terminal_output(terminal_id, mode="full")
-                    if output and len(output) > len(last_output):
-                        last_output = output
+                    # Terminal is done — use fallback to extract clean agent output
+                    fb = self._fallback_extract(terminal_id)
+                    if fb and len(fb) > 0:
+                        last_output = fb
                     break
-                # Still processing — read output for progress, keep waiting
-                output = self.get_terminal_output(terminal_id, mode="full")
-                if output and len(output) > len(last_output):
-                    last_output = output
+                # Still processing — keep waiting
             except Exception:
                 pass
             _time.sleep(poll_interval)
