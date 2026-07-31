@@ -2,8 +2,8 @@
 
 **日期**: 2026-07-31
 **分支**: `feat/pr-content-handoff`
-**状态**: 设计待批准
-**输入**: 用户 2026-07-31 规格书（pasted-text-20260731-174617-0c8fef1e.txt）
+**状态**: 设计已批准（用户 2026-07-31 确认 10 条修订意见），进入实现
+**输入**: 用户 2026-07-31 规格书 + 10 条修订意见
 
 ## 1. 背景与目标
 
@@ -53,19 +53,23 @@ gate 实际只是硬编码 `True`（`windows_sync.py:84` + `policy_gateway.py:27
 | `ErrorState.PR_CREATION_FAILED` | `ErrorState.PR_CONTENT_GENERATION_FAILED` |
 | `PolicyGateway.create_draft_pr()` | `PolicyGateway.prepare_pr_content()` |
 | `_stage_draft_pr` | `_stage_pr_content` |
-| `draft-pr-url.txt` | `pr-content.json` + `pr-content.md` + `pr-content.sha256` |
+
+所有新代码、状态、测试和文档只使用 `render-pr-content` / `prepare_pr_content` /
+`PR_CONTENT_READY`。旧 `create-draft-pr` 保留为 deprecated wrapper（见 §3.6）。
 
 ### 3.2 PR 内容包 schema
 
-**`pr-content.json`**（确定性顺序，便于 diff 与幂等）:
+**`pr-content.json`**（确定性 key 顺序，UTF-8，LF，末尾换行；不含 `generated_at`，
+不含 `rendered_sha256`）:
 
 ```jsonc
 {
   "schema_version": 1,
   "task_id": "...",
-  "title": "[Draft] <task-id>",
+  "title": "<task-id>",
   "base_branch": "main",
   "head_branch": "agent/<task-id>",
+  "workflow_state": "PR_CONTENT_READY",
   "candidate_sha": "...",
   "tested_sha": "...",
   "reviewed_sha": "...",
@@ -78,60 +82,82 @@ gate 实际只是硬编码 `True`（`windows_sync.py:84` + `policy_gateway.py:27
   "codex_call_count": 0,
   "codex_budget": {...},
   "known_risks": [...],
-  "artifact_paths": ["plan.json", "..."],
-  "generated_at": "<ISO8601 UTC>",
-  "rendered_sha256": "<sha256 of pr-content.md>"
+  "artifact_paths": ["plan.json", "..."]
 }
 ```
 
-**`pr-content.md`**: 人类可读 Markdown body（即 PR Body），含上述字段的表格化呈现
-+ 完整 changed files 列表 + plan summary + verification 结果 + review findings + risks
-+ artifact manifest 与各 artifact 的 SHA-256。
+字段说明:
+- `workflow_state`: 恒为 `"PR_CONTENT_READY"`（生成时任务处于此态）。**不得**写
+  `"READY_FOR_HUMAN_REVIEW"`——该终态只由 Windows sync 成功后产生。
+- `title`: 不强制包含 `[Draft]`。是否创建 Draft PR 由用户在代码托管平台界面决定。
+- 无 `generated_at`、无 `rendered_sha256`。时间戳/attempt/operator 信息由 StageStore、
+  事件日志和 acceptance evidence 记录。
 
-**`pr-content.sha256`**: `pr-content.md` 的 SHA-256 hex（单行），用于幂等校验。
+**`pr-content.md`**: 人类可读 Markdown body（即 PR Body），UTF-8，LF，末尾换行。含上述
+字段的表格化呈现 + 完整 changed files 列表 + plan summary + verification 结果 +
+review findings + risks + artifact manifest 与各 artifact 的 SHA-256。
 
-**stdout 契约**（`scripts/render-pr-content`）:
+**`pr-content.sha256`**（同时绑定 JSON 和 Markdown，固定两行格式）:
 
+```text
+<json-sha256>  pr-content.json
+<markdown-sha256>  pr-content.md
 ```
-PR Title:
-<title>
 
-Base:
-<base>
-
-Head:
-<head>
-
-PR Body:
-<markdown body>
-```
+统一使用 UTF-8、LF、固定 JSON key 顺序和末尾换行，确保幂等。
 
 ### 3.3 校验门禁（生成前）
 
-`scripts/render-pr-content` 在生成前必须通过（与现 `create-draft-pr` L171-208 一致并加强）:
+`scripts/render-pr-content` 在生成前必须通过:
 
 1. 5 个 artifact 全部存在并可 JSON 解析: `plan.json` / `implementation.json` /
    `verification.json` / `review.json` / `codex-budget-summary.json`。
 2. `candidate_sha == tested_sha == reviewed_sha`（任一缺失或不等 → exit 1）。
 3. `review.decision == "APPROVED"`。
-4. candidate 已 push 到 task branch（通过 `git rev-parse origin/<task_branch>` 校验，
-   **不要求 origin 是 GitHub**；任何能 `git rev-parse` 的 remote 均可）。
+4. **push evidence**: 读取 `<run-dir>/push.json`，校验:
+   - `push_succeeded == true`
+   - `pushed_sha == candidate_sha`
+   - `branch == 配置的 task branch`
+   - 缺失或不一致 → exit 1
+
+`scripts/render-pr-content` **不访问网络**，不执行 forge API，不调用 `gh`，不查询远端，
+不要求 origin 是 GitHub。只做本地 artifact + `push.json` 校验。
 
 PolicyGateway.`prepare_pr_content()` 在调用脚本前再做一次状态层校验:
 `rec.state == APPROVED` 且 `reviewed_sha == candidate_sha`。
 
 ### 3.4 幂等性
 
-- 相同 candidate 重复调用 `render-pr-content` 必须产出**字节相同**的 `pr-content.{json,md}`。
-  - `generated_at` 字段会造成字节差异 → **从 `pr-content.json` 与 `pr-content.md` 中
-    移除时间戳**；时间戳只写一个独立的 `pr-content.meta.json`（非内容包组成部分，
-    不参与 sha256，不参与幂等校验）。这样内容包本身是 pure function of (artifacts, task_id)。
-  - 或：保留 `generated_at` 但用 candidate_sha 派生（确定性）。**决策：移除时间戳**，
-    更干净，幂等校验直接 `cmp` 文件即可。
-- 重复调用不产生副作用（脚本只读 artifact + git rev-parse，无网络、无写 DB、无 push）。
+- 相同 candidate 重复调用 `render-pr-content` 必须产出**字节相同**的
+  `pr-content.{json,md,sha256}`。内容包是 pure function of (artifacts, task_id,
+  base/head branch)。
+- 不含时间戳，不依赖运行时环境。
+- 重复调用不产生副作用（脚本只读 artifact + push.json，无网络、无写 DB、无 push）。
 - StageStore 的 `begin_stage` 幂等检查（COMPLETED + 同 candidate_sha → skip）继续生效。
 
-### 3.5 状态机迁移
+### 3.5 Push evidence
+
+`git rev-parse origin/<branch>` 不能可靠证明本次候选已经成功 push，也不应由 renderer
+查询远端。改为持久化确定性 evidence。
+
+**`push.json`**（Executor 成功 push candidate 后由平台写入 `<run-dir>/push.json`）:
+
+```json
+{
+  "schema_version": 1,
+  "remote": "origin",
+  "branch": "agent/<task-id>",
+  "pushed_sha": "...",
+  "push_succeeded": true
+}
+```
+
+- 写入时机: Executor stage 完成真实 `git push` 成功后，立即写 `push.json`。
+  push 失败 → `push_succeeded: false` 或不写文件（后续 gate 视为未 push）。
+- renderer 只进行本地校验（见 §3.3 第 4 点）。
+- Windows sync 也会校验 `push.json`（见 §3.8）。
+
+### 3.6 状态机迁移与 Legacy 兼容
 
 新转移表（`machine.py`）:
 
@@ -141,43 +167,77 @@ TaskState.PR_CONTENT_READY: {TaskState.WINDOWS_SYNCED, TaskState.FAILED},  # 移
 TaskState.WINDOWS_SYNCED: {TaskState.READY_FOR_HUMAN_REVIEW, TaskState.FAILED},
 ```
 
+- 新增 `TaskState.PR_CONTENT_READY`。
+- 新增 `ErrorState.PR_CONTENT_GENERATION_FAILED`。
+- 旧 `DRAFT_PR_CREATED` 枚举值**保留**（可解码），但从 `TRANSITIONS` 中移除其正向出口，
+  使其成为"历史遗留态"（无新入口、无新出口）。
 - 移除 `PR_CONTENT_READY -> READY_FOR_HUMAN_REVIEW` 直跳（旧 `DRAFT_PR_CREATED` 有此
-  直跳，允许跳过 windows sync，是漏洞）。
-- Windows sync 是强制门禁（除非项目未配置 `windows_repo`，此时 `_stage_windows_sync`
-  保持现有 skip 逻辑，但记录 event 说明跳过原因）。
+  直跳，允许跳过 windows sync，是漏洞）。Windows sync 是强制门禁（除非项目未配置
+  `windows_repo`，此时 `_stage_windows_sync` 保持现有 skip 逻辑，但记录 event 说明跳过原因）。
 
-### 3.6 Legacy 兼容
+**Legacy 迁移策略（惰性，且只发生在 `resume_task` / `advance_task` / 专用 migration 操作）**:
 
-- `TaskState.DRAFT_PR_CREATED` 枚举值**保留**（不删除），但从 `TRANSITIONS` 中移除其
-  正向出口，使其成为"历史遗留终态"。
-- StateStore 读取到 `DRAFT_PR_CREATED` 时，提供 `migrate_legacy_state()`:
-  - 若 `pr-content.json` 已存在 → 迁移为 `PR_CONTENT_READY`，记录 event
-    `legacy_migration: DRAFT_PR_CREATED -> PR_CONTENT_READY`。
-  - 若不存在 → 迁移为 `APPROVED`（回退一态，允许重新生成内容包），记录 event。
-- 新任务**永远不能进入** `DRAFT_PR_CREATED`（转移表无入口）。
-- 旧 `create_draft_pr` 公共方法保留为 **deprecated wrapper**:
-  ```python
-  def create_draft_pr(self, task_id, project):
-      """DEPRECATED: use prepare_pr_content. Does NOT access network."""
-      import warnings; warnings.warn("use prepare_pr_content", DeprecationWarning, stacklevel=2)
-      return self.prepare_pr_content(task_id, project)
-  ```
-  绝不调用网络。
+- 普通 `get_task` 读取**不得修改数据库**。
+- 仅 `resume_task`、`advance_task`（即 `run_next_stage`）、或专用 `migrate_legacy_state()`
+  操作会触发迁移。
+- 旧 `DRAFT_PR_CREATED` 任务被 resume/advance 时:
+  - **artifact 完整**（5 artifact + push.json 齐全且校验通过）: 在**单一事务**中生成内容包
+    并迁移到 `PR_CONTENT_READY`，记录 `LEGACY_STATE_MIGRATED` 事件。
+  - **artifact 不完整**: **不得静默退回 `APPROVED`**，也**不得伪造成功**。保持原状态
+    `DRAFT_PR_CREATED`，返回明确 migration error（列出缺失项），或进入 `NEEDS_HUMAN`
+    并记录缺失项。
+- `DRAFT_PR_CREATED` 不作为永久成功终态。
 
-### 3.7 Windows sync 门禁改造
+**旧 `create_draft_pr` 公共方法 + `scripts/create-draft-pr`**: 保留为 deprecated wrapper:
+- 只调用 `render-pr-content` / `prepare_pr_content`。
+- 输出弃用提示（stderr）。
+- **不调用 `gh`**，不访问任何 forge API，不要求 GitHub owner/repo，不创建/更新/关闭真实 PR。
+- 所有新代码、状态、测试和文档只使用 `render-pr-content` / `prepare_pr_content` /
+  `PR_CONTENT_READY`。
+
+### 3.7 PolicyGateway 与 MCP 接口
+
+- `PolicyGateway.create_draft_pr()` → 改名为 `prepare_pr_content()`。旧名保留为
+  deprecated wrapper 调 `prepare_pr_content`，输出 DeprecationWarning，绝不访问网络。
+- `_stage_draft_pr` → `_stage_pr_content`: 调用 `scripts/render-pr-content`（不再调
+  `create-draft-pr` 的 `gh` 路径）。
+- `_stage_windows_sync`: 调用 `win_sync` 前**重新加载并验证** `pr-content` artifact（见 §3.8）。
+- 新增 `StateStore.inject_candidate(task_id, new_sha, from_state)`: 审计入口，仅供
+  acceptance helper 调用（review-fix 受控 candidate 注入）。走合法 transition 路径，
+  记录 `controlled_candidate_injection` 事件，清空 tested/reviewed_sha。生产
+  PolicyGateway 不调用它。
+- MCP server (`mcp/server.py`): 若暴露新 tool 需同步更新注册 + profile frontmatter +
+  docs。当前 `prepare_pr_content`/`sync_windows` 仍为内部方法（非 MCP tool），除非需要
+  Supervisor 直接调用。
+
+### 3.8 Windows sync gate 改造
 
 `SyncGates.draft_pr_created: bool` → `SyncGates.pr_content_ready: bool`。
 
-`check_gates()` 不再接受 bool 入参，改为**实际校验** `pr-content.json`:
-- 读取 `<run-dir>/pr-content.json`，校验存在 + 可解析 + `candidate_sha` 字段 == 当前
-  candidate_sha + `pr-content.sha256` 与 `pr-content.md` 实际 sha256 一致。
-- 任一失败 → `pr_content_ready=False`。
+`pr_content_ready` **不能是 bool 常量**。`check_gates()` 改为**实际校验** `pr-content`
+artifact 包（不接受 bool 入参）:
+
+- 读取 `<run-dir>/pr-content.sha256`、`pr-content.json`、`pr-content.md`。
+- 重新计算 JSON/Markdown 的 SHA-256，与 `pr-content.sha256` 两行比对。
+- 校验:
+  - `pr-content.sha256` 存在且格式正确（两行）
+  - JSON hash 一致
+  - Markdown hash 一致
+  - `schema_version` 正确
+  - `task_id` == 当前 task
+  - `workflow_state == "PR_CONTENT_READY"`
+  - `base_branch` / `head_branch` 与配置一致
+  - `candidate_sha` / `tested_sha` / `reviewed_sha` 与状态机记录一致且三相等
+  - `review_decision == "APPROVED"`
+  - `push.json` 中 `pushed_sha == candidate_sha` 且 `branch == 配置 task branch` 且
+    `push_succeeded == true`
+- 任一不一致 → `pr_content_ready=False` → `all_pass=False` → 拒绝 sync。
 
 `PolicyGateway.sync_windows` / `_stage_windows_sync`:
-- 调用 `win_sync` 前**重新加载并验证** `pr-content.json`（不传常量 True）。
-- 校验失败 → `PolicyError("WINDOWS_SYNC_BLOCKED: pr-content artifact invalid")`。
+- 调用 `win_sync` 前重新加载并验证上述全部字段（不传常量 True）。
+- 校验失败 → `PolicyError("WINDOWS_SYNC_BLOCKED: pr-content artifact invalid: <detail>")`。
 
-### 3.8 Acceptance 三场景重做
+### 3.9 Acceptance 三场景重做
 
 #### direct
 
@@ -187,57 +247,63 @@ TaskState.WINDOWS_SYNCED: {TaskState.READY_FOR_HUMAN_REVIEW, TaskState.FAILED},
 - `pr-content.json` 有效（存在 + 可解析 + schema 字段齐全 + sha256 一致）
 - `pr-content.md` 有效
 - `pr-content.sha256` 有效
-- **未执行任何 forge API**（脚本进程内无 `gh`/`requests`/`urllib` 调用；通过
-  `subprocess` 检查或代码审查断言。实现上：`render-pr-content` 不 import
-  `requests`/`urllib`/`gh`，测试用 monkeypatch 断言无网络调用）
+- **未执行任何 forge API**（`render-pr-content` 进程内无 `gh`/`requests`/`urllib` 调用；
+  测试用 monkeypatch 断言无网络调用）
 
 移除 `test_mode=False` 的 `gh pr create` 路径与 `is_real_pr` 断言。
 
 #### review-fix
 
-PASS 条件（全部满足）:
-- `protocol_passed == true`（保留: had_changes_requested and had_fix and
-  had_incremental_review）
-- `task_approved == true`（终态 == `READY_FOR_HUMAN_REVIEW`）
-- `final_state == READY_FOR_HUMAN_REVIEW`
-- PR 内容包有效（同 direct 校验）
+**主场景 PASS 必须同时满足**:
 
-Judge 正确进入 `NEEDS_HUMAN` → 记录为 `safety_behavior_evidence`，但 `task_approved=False`
-→ 不冒充 PASS。
+```text
+protocol_passed == true
+task_approved == true
+final_state == READY_FOR_HUMAN_REVIEW
+pr_content_valid == true
+```
+
+- `protocol_passed`: had_changes_requested and had_fix and had_incremental_review（保留）。
+- `task_approved`: 终态 == `READY_FOR_HUMAN_REVIEW`。
+- `pr_content_valid`: 同 direct 校验。
+
+**Judge 正确进入 `NEEDS_HUMAN`**: 可作为**独立 safety 子场景**通过（记录为
+`safety_behavior_evidence`），但**不能让主 review-fix 场景返回 PASS**（`task_approved=False`
+→ 主场景 FAIL）。
 
 **受控 candidate 注入**: 现有 `sqlite3 UPDATE tasks` 直写 (L451-456) 违反"不绕过状态机"。
-改为通过 `StateStore.inject_candidate(task_id, new_sha, from_state=LOCAL_VERIFYING)` 方法:
-- 内部走 `transition()` 合法路径或显式审计入口
-- 记录 event `controlled_candidate_injection: sha=..., reason=acceptance_review_fix`
-- 清空 tested/reviewed_sha（新候选未测未审）
+改为通过 `StateStore.inject_candidate(task_id, new_sha, from_state=LOCAL_VERIFYING)`:
+- 走合法 transition / 显式审计入口
+- 记录 `controlled_candidate_injection` 事件
+- 清空 tested/reviewed_sha
 - acceptance helper 调用它而非裸 SQL
 
 #### resume
 
-完全重做，删除现有宽松断言。
+完全重做，删除现有宽松断言。**不把 STALLED 作为 controller restart 后 reattach 的必要条件**。
 
-**真实 mid-stage 中断恢复流程**:
+**正确 mid-stage 中断恢复流程**:
 
-1. 在独立 controller 进程中启动真实 Planner 或 Executor（通过 `cao-server` 真实 Worker，
-   选一个运行时间足够长的任务，使 stage 真正处于 RUNNING 足够久）。
-2. 轮询 `StageStore` 直到 `status == RUNNING` 且 `WorkerHandle` 已持久化
-   （`worker_id`/`terminal_id`/`owner_id`/`lease_until` 非空）且观察到真实进展
-   （`last_progress_at` 更新过）。
-3. 记录中断前快照:
-   - `stage_attempts_before`: 每个 stage 的 attempt 数
-   - `codex_calls_before`: 每个角色的 call_index / total_used
-   - `candidate_before`
-   - `worker_handle_before` / `resume_state_before`
-4. **终止 controller 进程**（`terminate`，不主动杀 Worker —— 让 Worker 成为孤儿，
-   由 WorkerMonitor 后续检测 STALLED）。controller 进程退出即模拟崩溃。
-5. 新建 `PolicyGateway` + `WorkerMonitor`，复用原 SQLite（同一 `state_dir`）。
-6. 调用 `resume_task()`。
-7. 驱动到终态。
+1. Worker 已真实处于 RUNNING/PROCESSING。
+2. Worker handle、stage attempt、owner lease 和 resume state 已写入 SQLite。
+3. 终止 controller 进程（`terminate`，**不杀 Worker**）——模拟 controller crash。
+4. 启动新的 PolicyGateway / WorkerMonitor，复用原 SQLite。
+5. 等旧 owner lease 过期，**或**通过明确的安全接管协议获得 ownership。
+6. 原 Worker 仍运行时直接 reattach。
+7. 原 Worker 已完成时采集结果并完成原 attempt。
+8. 只有 Worker 死亡、失联或长期无进展时才进入 STALLED/restart。
+
+**至少测试 5 个子场景**:
+- controller crash + Worker 仍运行 → reattach 成功
+- controller crash + Worker 已完成 → 采集结果完成 attempt
+- controller crash + Worker 已死亡 → STALLED/restart
+- lease 未过期时不能抢占
+- lease 过期后只能有一个新 owner 接管
 
 **精确断言**（全部满足才 PASS）:
 - `final_state == READY_FOR_HUMAN_REVIEW`
-- 中断前 COMPLETED 的 stage，其 `attempt` 数**完全不增加**
-- 已消费的 Codex `call_index`/`total_used` **完全不增加**（用 `==` 而非 `>=`）
+- 中断前 COMPLETED 的 stage，其 `attempt` 数**完全不增加**（`==`）
+- 已消费的 Codex `call_index`/`total_used` **完全不增加**（`==`，删除 `>=`）
 - 不产生重复 commit（candidate_sha 不回退；`git log origin/<task_branch>` 无重复）
 - 不重复生成 PR 内容包（`pr-content.sha256` 与首次生成一致；StageStore `pr_content`
   stage attempt 不增加）
@@ -247,7 +313,7 @@ Judge 正确进入 `NEEDS_HUMAN` → 记录为 `safety_behavior_evidence`，但 
 
 删除 `candidate_unchanged` tautology (L563-565) 与 `budget_not_respent` 的 `>=` (L548)。
 
-### 3.9 Acceptance evidence append-only
+### 3.10 Acceptance evidence append-only
 
 **目录结构**:
 
@@ -263,42 +329,33 @@ acceptance/evidence/<run-id>/<scenario>/
   pr-content.json
   pr-content.md
   pr-content.sha256
+  push.json
   artifact_manifest.json  # 各 artifact 路径 + sha256
 ```
 
-- `<run-id>` = 时间戳 + scenario（如 `20260731-120000-direct`），保证不覆盖。
+- `<run-id>` = 时间戳 + scenario（如 `20260731-120000-direct`），**不可复用**，保证不覆盖。
 - 每次 `run_scenario` 写入新 `<run-id>` 目录，**不覆盖**历史。
 - `meta.scenarios[name]` 仍记录最新 result 指针（`evidence_path` + `passed`），但不删除
   旧 evidence。
 
 **cleanup 改造**:
-- 默认 cleanup 只清理: `runtime/`、`worktrees/`、task-owned 进程、`acc/` 远程分支。
+- 默认 cleanup 只清理: runtime DB、临时 worktree、task-owned 进程、`acc/` 测试分支。
 - **保留** `acceptance/evidence/`。
-- 删除所有 `_cleanup_acceptance_prs`（`gh pr list/close`）逻辑。
+- **删除所有** `_cleanup_acceptance_prs`（`gh pr list/close`）逻辑——不再执行任何
+  PR list/close/label 操作。
 - 保留 `_cleanup_acceptance_branches`（只删 `acc/` 前缀远程分支，安全）。
-- 新增独立 `acceptance purge-evidence` 子命令（显式删除历史 evidence，需 `--force` 确认）。
-
-### 3.10 生产路径禁止 forge API
-
-在 `scripts/render-pr-content` 中:
-- 不 `import requests` / `urllib` / `subprocess`（除 `git rev-parse` 校验 push）。
-- 不调用 `gh`。
-- 不解析 `origin` 是否 GitHub（任何 remote 均可）。
-
-`PolicyGateway.prepare_pr_content()` 同样不调网络。
-
-测试用 monkeypatch 拦截 `subprocess.run` / `socket` 断言无 forge 调用。
+- 新增独立 `acceptance purge-evidence --force` 子命令（显式删除历史 evidence，需 `--force`）。
 
 ## 4. 涉及修改的文件
 
 | 文件 | 改动 |
 |------|------|
-| `src/supervisor_cao/state/machine.py` | 枚举改名 + 新增 `PR_CONTENT_READY`、`PR_CONTENT_GENERATION_FAILED`；转移表；`migrate_legacy_state()` |
-| `src/supervisor_cao/mcp/policy_gateway.py` | `create_draft_pr`→`prepare_pr_content` deprecated wrapper；`_stage_draft_pr`→`_stage_pr_content` 调用 `render-pr-content`；`sync_windows` 重新加载校验 pr-content；`inject_candidate()` 审计入口 |
-| `src/supervisor_cao/validation/windows_sync.py` | `SyncGates.draft_pr_created`→`pr_content_ready`；`check_gates` 实际校验 artifact |
-| `scripts/render-pr-content` | 新脚本（从 `create-draft-pr` 派生，移除所有 `gh` 调用，输出 PR 内容包 + stdout 契约） |
-| `scripts/create-draft-pr` | 保留为 deprecated wrapper 调用 `render-pr-content`（或删除，视测试） |
-| `src/supervisor_cao/cli/acceptance.py` | 三场景重写；evidence append-only；cleanup 改造；移除 PR 清理 |
+| `src/supervisor_cao/state/machine.py` | 新增 `PR_CONTENT_READY`、`PR_CONTENT_GENERATION_FAILED`；转移表；`migrate_legacy_state()`（惰性，非 get_task） |
+| `src/supervisor_cao/mcp/policy_gateway.py` | `create_draft_pr`→`prepare_pr_content` deprecated wrapper；`_stage_draft_pr`→`_stage_pr_content` 调 `render-pr-content`；`sync_windows` 重新加载校验 pr-content；`inject_candidate()` 审计入口；push.json 写入（Executor stage） |
+| `src/supervisor_cao/validation/windows_sync.py` | `SyncGates.draft_pr_created`→`pr_content_ready`；`check_gates` 实际校验 artifact 全字段 |
+| `scripts/render-pr-content` | 新脚本（从 `create-draft-pr` 派生，移除所有 `gh` 调用，输出 PR 内容包 + stdout 契约；校验 push.json） |
+| `scripts/create-draft-pr` | deprecated wrapper 调 `render-pr-content`，输出弃用提示，不调 gh/forge |
+| `src/supervisor_cao/cli/acceptance.py` | 三场景重写；evidence append-only；cleanup 改造；移除 PR 清理；`inject_candidate` 替代裸 SQL |
 | `src/supervisor_cao/cli/main.py` | 新增 `acceptance purge-evidence` 子命令 |
 | `docs/ACCEPTANCE.md` | 重写三场景通过条件 + 状态描述 |
 | `docs/WORKFLOW.md` | 状态机图更新 |
@@ -307,9 +364,10 @@ acceptance/evidence/<run-id>/<scenario>/
 | `AGENTS.md` | 移除 Draft PR 门禁描述 |
 | `tests/unit/test_state_machine.py` | 新转移、legacy 迁移、新任务不进 DRAFT_PR_CREATED |
 | `tests/unit/test_policy_mcp_protocol.py` | tool 名更新 |
-| `tests/unit/test_windows_sync.py` | `pr_content_ready` gate 校验 |
-| `tests/unit/test_pr_content.py` | **新增**: schema、校验、幂等、无网络、多 remote 类型 |
-| `tests/unit/test_acceptance_evidence.py` | **新增**: append-only、cleanup 保留 |
+| `tests/unit/test_windows_sync.py` | `pr_content_ready` gate 校验全字段 |
+| `tests/unit/test_pr_content.py` | **新增**: schema、校验、幂等、无网络、多 remote 类型、push.json 校验 |
+| `tests/unit/test_acceptance_evidence.py` | **新增**: append-only、cleanup 保留、purge-evidence |
+| `tests/unit/test_resume_reattach.py` | **新增**: 5 个 resume 子场景 |
 | `tests/integration/test_workflow.py` | happy path 终态改名 |
 | `tests/e2e/test_temp_repo_e2e.py` | PR 内容包生成 + stdout 契约 |
 
@@ -319,31 +377,47 @@ acceptance/evidence/<run-id>/<scenario>/
 |------|------|------|
 | APPROVED → PR_CONTENT_READY 合法 | unit | transition 成功 |
 | 新任务不进入 DRAFT_PR_CREATED | unit | 无转移入口 |
-| legacy DRAFT_PR_CREATED 可恢复 | unit | migrate 后进入 PR_CONTENT_READY 或 APPROVED |
+| legacy DRAFT_PR_CREATED artifact 完整可迁移 | unit | 单事务迁移到 PR_CONTENT_READY + LEGACY_STATE_MIGRATED 事件 |
+| legacy DRAFT_PR_CREATED artifact 不完整不静默回退 | unit | 保持原状态 + migration error 或 NEEDS_HUMAN |
+| get_task 不触发迁移 | unit | DB 状态不变 |
 | 缺任一 artifact 拒绝生成 | unit | exit 1 |
 | 三 SHA 不同拒绝 | unit | exit 1 |
 | review 非 APPROVED 拒绝 | unit | exit 1 |
+| push.json 缺失/不一致拒绝 | unit | exit 1 |
 | PR 内容生成不调网络 | unit | monkeypatch subprocess/socket 断言 |
-| GitHub/GitCode/SSH remote 都能生成 | unit | mock git rev-parse 三种 remote |
+| GitHub/GitCode/SSH remote 都能生成 | unit | 不依赖 remote 类型（只读 push.json） |
 | rerun 幂等 | unit | 二次输出字节相同 |
-| Windows sync 校验真实 PR artifact | unit | gate 随 artifact 有效性翻转 |
+| sha256 绑定 JSON+MD 两行格式 | unit | 格式正确 + hash 一致 |
+| pr-content.json 无 generated_at/rendered_sha256 | unit | 字段不存在 |
+| workflow_state == PR_CONTENT_READY | unit | 非 READY_FOR_HUMAN_REVIEW |
+| title 不强制 [Draft] | unit | 无 [Draft] 前缀 |
+| Windows sync 校验全字段 | unit | gate 随各字段有效性翻转 |
 | cleanup 保留 evidence | unit | evidence 目录存在 |
+| cleanup 不执行 PR list/close/label | unit | 无 gh 调用 |
 | acceptance history 不覆盖 | unit | 两次 run 两个目录 |
+| purge-evidence --force 删除 | unit | 删除后目录不存在 |
 | direct 新通过条件 | e2e | 无 forge API + pr-content 有效 |
 | review-fix 严格条件 | e2e | protocol+approved+final+pr-content |
-| 真实 controller restart/resume | e2e | attempt/budget/commit/PR-content/sync 不重复 |
+| review-fix safety 子场景（Judge NEEDS_HUMAN） | e2e | safety 通过但主场景不 PASS |
+| controller crash + Worker 仍运行 → reattach | e2e | 不重复 budget/stage/commit |
+| controller crash + Worker 已完成 → 采集 | e2e | 完成 attempt |
+| controller crash + Worker 已死亡 → STALLED | e2e | 正确进入 STALLED/restart |
+| lease 未过期不能抢占 | e2e | 抢占失败 |
+| lease 过期后单一新 owner | e2e | 只一个接管 |
 | 无重复 budget/stage/commit/PR-content/sync | e2e | 严格 `==` 断言 |
 
-## 6. 执行顺序（TDD）
+## 6. 实施顺序（TDD，分逻辑 commit）
 
-1. PR content schema 与 `scripts/render-pr-content` + 测试
-2. 状态机 + `PolicyGateway.prepare_pr_content` + legacy 迁移 + 测试
-3. Windows sync gate 改造 + 测试
-4. acceptance evidence append-only + cleanup 改造 + 测试
-5. direct 场景重写 + 测试
-6. review-fix 场景重写 + `inject_candidate` + 测试
-7. 真实 mid-stage resume 重写 + 测试
-8. 文档 + 全量回归 + secret scan + CLI smoke
+1. PR content schema、canonical renderer 和 checksum（`scripts/render-pr-content` + `test_pr_content.py`）
+2. push evidence（`push.json` 写入 + 校验）
+3. 状态机和 legacy migration（`machine.py` + `test_state_machine.py`）
+4. PolicyGateway 与 MCP 接口（`prepare_pr_content` + `_stage_pr_content` + `inject_candidate`）
+5. Windows sync gate（`windows_sync.py` + `test_windows_sync.py`）
+6. append-only acceptance evidence（`acceptance.py` evidence + cleanup 改造 + `purge-evidence`）
+7. direct 场景
+8. review-fix 场景（含 `inject_candidate` + safety 子场景）
+9. controller restart + Worker reattach 的真实 resume（5 子场景）
+10. 文档和完整回归
 
 每步: 先写测试（红）→ 实现（绿）→ lint/type → commit。
 
@@ -353,31 +427,31 @@ acceptance/evidence/<run-id>/<scenario>/
 - secret scan 无命中
 - CLI smoke (`supervisor-cao --help`, `acceptance --help`) 正常
 - live cao-server 运行 direct/review-fix/resume 三条，各产生 append-only evidence
-- 在证据完成前保持 `READY_WITH_KNOWN_LIMITATIONS`
-- 最终回复输出可复制的 PR Title / Base / Head / Body
+- 三条都真实通过前，整体状态保持 `READY_WITH_KNOWN_LIMITATIONS`
+- 最终回复输出可复制的 PR Title / Base / Head / Body + 三条 evidence 路径
 
-## 8. 风险与未决
+## 8. 约束（实现过程中）
 
-- **resume 真实中断**: 需要一个运行时间足够长的真实 stage 才能可靠观察 RUNNING + 进展。
-  风险: cao-server 上的 Worker 太快完成，无法在 RUNNING 窗口内终止 controller。
-  缓解: 选 Executor stage + 非平凡任务（多文件实现）；或在 acceptance helper 里用
-  一个故意慢的 worker profile（仍真实，只是 prompt 要求详细）。
-- **legacy 迁移破坏性**: `migrate_legacy_state` 改 DB 状态。已有测试覆盖，但生产库
-  若存在 `DRAFT_PR_CREATED` 任务需用户知晓。缓解: 迁移只在该任务被 `get`/`resume`
-  时触发（惰性），并在 event 中留痕。
-- **inject_candidate**: 引入新的 StateStore 审计入口，需确保只被 acceptance helper
-  调用，不被生产路径滥用。缓解: 方法名带 `inject_` 前缀 + docstring 标注 "acceptance
-  only" + 单测验证生产 PolicyGateway 不调用它。
+- 不自动创建任何平台 PR
+- 不调用 forge API
+- 不 merge
+- 可以 push feature branch
+- 不根据终端记忆补写验收成功
 
-## 9. 待用户确认的决策点
+## 9. 已确认决策记录（用户 2026-07-31 批复）
 
-以下是我做出的设计决策，请确认或修正:
-
-1. **时间戳移除**: `pr-content.{json,md}` 不含 `generated_at` 以保证幂等；时间戳放独立
-   `pr-content.meta.json`。可接受吗？
-2. **`create-draft-pr` 脚本处置**: 保留为 deprecated wrapper 调用 `render-pr-content`
-   （不删，避免破坏外部调用），还是直接删除？
-3. **resume 真实中断方式**: 终止 controller 进程（不杀 Worker，让 WorkerMonitor 检测
-   STALLED 后 reattach）—— 是否符合你对"真实 mid-stage resume"的预期？
-4. **legacy `DRAFT_PR_CREATED` 迁移策略**: 惰性迁移（读到时迁移）vs 主动批量迁移
-   （启动时扫库）。我倾向惰性。
+1. **时间戳/checksum**: 不新增 `pr-content.meta.json`；`pr-content.{json,md}` 不含
+   `generated_at`；`pr-content.sha256` 两行格式绑定 JSON+MD；删除 `rendered_sha256`；
+   统一 UTF-8/LF/固定 key 顺序/末尾换行。
+2. **状态/标题**: `workflow_state=PR_CONTENT_READY`；title 不强制 `[Draft]`。
+3. **create-draft-pr**: deprecated wrapper，只调 render-pr-content，输出弃用提示，不调
+   gh/forge，不要求 GitHub owner/repo。
+4. **push evidence**: 新增 `push.json`，renderer 只本地校验，不访问网络。
+5. **resume**: 不以 STALLED 为必要条件；8 步流程 + 5 子场景。
+6. **legacy**: 惰性迁移只在 resume/advance/migration；get_task 不改 DB；artifact 不完整
+   不静默回退。
+7. **Windows sync**: pr_content_ready 非常量；sync 前重新加载验证全字段。
+8. **review-fix**: 主场景四条件；Judge NEEDS_HUMAN 是独立 safety 子场景。
+9. **evidence**: append-only，run ID 不可复用；cleanup 保留 evidence，不执行 PR 清理；
+   purge-evidence --force。
+10. **实施顺序**: 10 步。
