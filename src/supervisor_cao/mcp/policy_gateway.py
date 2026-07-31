@@ -660,15 +660,6 @@ class PolicyGateway:
         run, done = self.stages.begin_stage(task_id, stage, "codex-reviewer",
                                             candidate_sha=rec.candidate_sha)
         if done:
-            # If the completed review was for a DIFFERENT candidate (re-review
-            # after fix), route to incremental review instead of re-applying
-            # the old decision (which would cause an illegal transition).
-            prior_sha = run.candidate_sha if run else None
-            if prior_sha and prior_sha != rec.candidate_sha:
-                self.store.transition(task_id, TaskState.INCREMENTAL_REVIEWING,
-                                      reviewed_sha=rec.tested_sha)
-                self._stage_incremental_review(task_id, rec, cfg, session_name, run_dir)
-                return
             review = self.get_artifact(task_id, "review") or {}
             self._apply_review_decision(task_id, rec, review)
             return
@@ -869,8 +860,9 @@ class PolicyGateway:
         """The review decision (parsed from real Worker output) drives state."""
         decision = review.get("decision")
         # Ensure we're in REVIEWING state before transitioning to the decision
-        # state (REMOTE_VERIFIED -> REVIEWING -> CHANGES_REQUESTED/APPROVED)
-        if rec.state == TaskState.REMOTE_VERIFIED.value:
+        # state. REMOTE_VERIFIED -> REVIEWING -> CHANGES_REQUESTED/APPROVED.
+        # Skip if already in REVIEWING (avoid REVIEWING -> REVIEWING).
+        if rec.state not in (TaskState.REVIEWING.value, TaskState.INCREMENTAL_REVIEWING.value):
             self.store.transition(task_id, TaskState.REVIEWING)
         if decision == "APPROVED":
             self.store.transition(task_id, TaskState.APPROVED)
