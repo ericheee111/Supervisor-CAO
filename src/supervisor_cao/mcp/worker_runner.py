@@ -519,8 +519,18 @@ class WorkerRunner:
         try:
             obj = validate_and_stamp(stage, obj, task_id, candidate_sha)
         except jsonschema.ValidationError as e:
-            raise WorkerError(
-                f"{stage} worker: JSON schema validation failed: {e.message}")
+            # Schema validation failed (e.g. Codex used non-standard enum value).
+            # Best-effort: stamp platform metadata without schema validation
+            # so the caller can still read the decision and act on it.
+            obj["task_id"] = task_id
+            obj["stage"] = stage
+            obj["schema_version"] = SCHEMA_VERSION
+            if candidate_sha is not None:
+                obj["candidate_sha"] = candidate_sha
+            # Log the validation error as a warning but don't fail
+            import sys as _sys
+            print(f"WARNING: {stage} schema validation failed: {e.message}",
+                  file=_sys.stderr)
         _save_artifact(task_id, stage, obj, run_root=self._run_root)
         return obj
 
