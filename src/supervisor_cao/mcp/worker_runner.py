@@ -399,6 +399,9 @@ class WorkerRunner:
 
         ``worker_result`` is the dict returned by WorkerMonitor.wait_for_stage
         (contains last_message, raw_output, exit_code).
+
+        Raises WorkerError if no valid JSON is found or schema validation fails.
+        The caller (_run_stage_via_monitor) retries with a stronger prompt.
         """
         last_message = worker_result.get("last_message", "")
         raw = worker_result.get("raw_output", "")
@@ -413,11 +416,14 @@ class WorkerRunner:
                 obj = extract_strict_json(raw)
             except WorkerError:
                 pass
-        # Retry with stronger prompt is handled by the caller (PolicyGateway)
         if obj is None:
             raise WorkerError(
                 f"{stage} worker: no JSON object found in worker output")
-        obj = validate_and_stamp(stage, obj, task_id, candidate_sha)
+        try:
+            obj = validate_and_stamp(stage, obj, task_id, candidate_sha)
+        except jsonschema.ValidationError as e:
+            raise WorkerError(
+                f"{stage} worker: JSON schema validation failed: {e.message}")
         _save_artifact(task_id, stage, obj, run_root=self._run_root)
         return obj
 
