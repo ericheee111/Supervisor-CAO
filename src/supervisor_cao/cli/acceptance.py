@@ -126,6 +126,47 @@ def _record_scenario(name: str, result: dict) -> None:
     _write_meta(meta)
 
 
+# --- append-only evidence ---
+
+def _evidence_dir(acceptance_root: Path, scenario: str, run_id: str) -> Path:
+    """Return a unique evidence directory for one scenario run (append-only)."""
+    d = acceptance_root / "evidence" / run_id / scenario
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _record_evidence(ev_dir: Path, result: dict, task_snapshot: dict,
+                     events: list, stage_attempts: list, budget_log: dict,
+                     worker_handles: list, sha_info: dict,
+                     pr_content_info: dict) -> None:
+    """Write all evidence files (append-only — never overwrites another run)."""
+    (ev_dir / "result.json").write_text(json.dumps(result, indent=2))
+    (ev_dir / "task_snapshot.json").write_text(json.dumps(task_snapshot, indent=2))
+    with open(ev_dir / "events.jsonl", "w", encoding="utf-8") as f:
+        for e in events:
+            f.write(json.dumps(e) + "\n")
+    (ev_dir / "stage_attempts.json").write_text(json.dumps(stage_attempts, indent=2))
+    (ev_dir / "budget_log.json").write_text(json.dumps(budget_log, indent=2))
+    (ev_dir / "worker_handles.json").write_text(json.dumps(worker_handles, indent=2))
+    (ev_dir / "sha_info.json").write_text(json.dumps(sha_info, indent=2))
+    (ev_dir / "pr_content_info.json").write_text(json.dumps(pr_content_info, indent=2))
+
+
+def purge_evidence(force: bool = False) -> int:
+    """Explicitly delete historical evidence. Requires --force."""
+    if not force:
+        print("Refusing to purge evidence without --force. "
+              "Use 'acceptance purge-evidence --force'.")
+        return 1
+    ev_root = ACCEPTANCE_ROOT / "evidence"
+    if ev_root.exists():
+        shutil.rmtree(ev_root)
+        print(f"Purged {ev_root}")
+    else:
+        print("No evidence to purge.")
+    return 0
+
+
 def run_scenario(scenario: str) -> int:
     """Run one acceptance scenario. Returns 0 on pass, non-zero on fail."""
     if scenario not in SCENARIOS:

@@ -742,6 +742,12 @@ class PolicyGateway:
         real_sha = current_sha(executor_wt)
         if not real_sha:
             raise PolicyError("FIXING: cannot read git HEAD from worktree")
+        # NO_PROGRESS check: fix must produce a new SHA (different from old candidate)
+        if real_sha == fix_base:
+            self.stages.fail_stage(task_id, stage, error="NO_PROGRESS: fix did not produce a new commit")
+            self.store.transition(task_id, TaskState.NEEDS_HUMAN,
+                                  error="NO_PROGRESS: fix did not produce a new commit")
+            raise PolicyError("FIXING: no progress (fix did not produce a new commit)")
         impl["candidate_sha"] = real_sha
         (run_dir / "implementation.json").write_text(json.dumps(impl, indent=2))
         task_branch = adapter.task_branch_for(task_id)
