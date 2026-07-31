@@ -463,9 +463,12 @@ class WorkerRunner:
         # Remove only UNTRACKED files matching the configured artifact patterns.
         # git clean -fd only removes untracked files; tracked files are not
         # affected. No unbounded `git clean -fd` without pathspecs.
+        # Use :(glob) pathspec so patterns match at any depth (e.g. *.egg-info
+        # in src/ subdirectories, not just the worktree root).
         if generated_artifact_patterns:
+            glob_patterns = [f":(glob)**/{p}" for p in generated_artifact_patterns]
             subprocess.run(["git", "-C", executor_worktree, "clean", "-fd",
-                            "--", *generated_artifact_patterns],
+                            "--", *glob_patterns],
                            capture_output=True, timeout=30)
         # Requirement: worktree must be clean after the run (strict check —
         # no ignoring of tracked __pycache__/*.pyc; they must be gitignored

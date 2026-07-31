@@ -200,9 +200,18 @@ def _make_project_config(repo_dir: str, dirs: dict[str, Path], *,
     needed = "__pycache__"
     current = gitignore.read_text() if gitignore.exists() else ""
     if needed not in current:
+        # Write patterns that match both files and directories recursively.
+        # Patterns with wildcards (*.pyc, *.egg-info) are written as-is (git
+        # treats them as globs matching at any depth). Directory-only patterns
+        # (__pycache__, build, dist, .eggs, .pytest_cache) get a trailing /.
+        lines = []
+        for p in python_patterns:
+            if "*" in p:
+                lines.append(p)       # glob: matches files and dirs at any depth
+            else:
+                lines.append(p + "/") # directory pattern
         with open(gitignore, "a") as f:
-            f.write("\n" + "\n".join(p + "/" if not p.startswith("*.") else p
-                                     for p in python_patterns) + "\n")
+            f.write("\n" + "\n".join(lines) + "\n")
         subprocess.run(["git", "-C", repo_dir, "add", ".gitignore"],
                        capture_output=True, timeout=30)
         subprocess.run(["git", "-C", repo_dir, "commit", "-m", "add gitignore for generated artifacts"],
