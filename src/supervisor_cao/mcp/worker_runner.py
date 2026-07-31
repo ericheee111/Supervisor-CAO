@@ -589,6 +589,12 @@ class WorkerRunner:
             f"Plan:\n{json.dumps(plan, indent=2)}\n\n"
             "Review the implementation against the plan. Output APPROVED or "
             "CHANGES_REQUESTED with findings.\n\n"
+            "IMPORTANT: If the implementation correctly fulfills the plan, tests pass, "
+            "and there are no correctness or safety issues, you MUST output APPROVED. "
+            "Do NOT request CHANGES for style preferences, minor naming, or documentation "
+            "nits. Only request CHANGES for actual bugs, safety issues (e.g. path traversal), "
+            "missing tests, or incorrect behavior. Simple utility functions with passing "
+            "tests should be APPROVED.\n\n"
             + _schema_hint("review")
         )
 
