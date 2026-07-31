@@ -299,8 +299,15 @@ class TestAcceptanceIsolation:
         from supervisor_cao.cli import acceptance as accmod
         root = tmp_path / "acc"
         monkeypatch.setattr(accmod, "ACCEPTANCE_ROOT", root)
+        monkeypatch.setattr(accmod, "_read_meta", lambda: {"repo_dir": ""})
         root.mkdir(parents=True)
         (root / "state").mkdir()
+        # evidence should be preserved
+        ev = root / "evidence" / "run-1" / "direct"
+        ev.mkdir(parents=True)
+        (ev / "result.json").write_text("{}")
         rc = accmod.cleanup()
         assert rc == 0
-        assert not root.exists()
+        # state is removed, but evidence is preserved
+        assert not (root / "state").exists()
+        assert ev.exists()

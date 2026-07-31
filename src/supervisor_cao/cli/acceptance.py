@@ -125,6 +125,47 @@ def _record_scenario(name: str, result: dict) -> None:
     _write_meta(meta)
 
 
+# --- append-only evidence ---
+
+def _evidence_dir(acceptance_root: Path, scenario: str, run_id: str) -> Path:
+    """Return a unique evidence directory for one scenario run (append-only)."""
+    d = acceptance_root / "evidence" / run_id / scenario
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _record_evidence(ev_dir: Path, result: dict, task_snapshot: dict,
+                     events: list, stage_attempts: list, budget_log: dict,
+                     worker_handles: list, sha_info: dict,
+                     pr_content_info: dict) -> None:
+    """Write all evidence files (append-only — never overwrites another run)."""
+    (ev_dir / "result.json").write_text(json.dumps(result, indent=2))
+    (ev_dir / "task_snapshot.json").write_text(json.dumps(task_snapshot, indent=2))
+    with open(ev_dir / "events.jsonl", "w", encoding="utf-8") as f:
+        for e in events:
+            f.write(json.dumps(e) + "\n")
+    (ev_dir / "stage_attempts.json").write_text(json.dumps(stage_attempts, indent=2))
+    (ev_dir / "budget_log.json").write_text(json.dumps(budget_log, indent=2))
+    (ev_dir / "worker_handles.json").write_text(json.dumps(worker_handles, indent=2))
+    (ev_dir / "sha_info.json").write_text(json.dumps(sha_info, indent=2))
+    (ev_dir / "pr_content_info.json").write_text(json.dumps(pr_content_info, indent=2))
+
+
+def purge_evidence(force: bool = False) -> int:
+    """Explicitly delete historical evidence. Requires --force."""
+    if not force:
+        print("Refusing to purge evidence without --force. "
+              "Use 'acceptance purge-evidence --force'.")
+        return 1
+    ev_root = ACCEPTANCE_ROOT / "evidence"
+    if ev_root.exists():
+        shutil.rmtree(ev_root)
+        print(f"Purged {ev_root}")
+    else:
+        print("No evidence to purge.")
+    return 0
+
+
 def run_scenario(scenario: str) -> int:
     """Run one acceptance scenario. Returns 0 on pass, non-zero on fail."""
     if scenario not in SCENARIOS:
@@ -599,50 +640,32 @@ def status() -> int:
 
 
 def cleanup() -> int:
-    """Remove the isolated acceptance environment.
+    """Remove the isolated acceptance environment (runtime, worktrees, acc branches).
 
-    Also closes acceptance PRs and deletes acc/ branches from the test repo
-    (identified by the acceptance-test label and acc/ branch prefix). This ONLY
-    touches acceptance PRs/branches — ordinary PRs and agent/ branches are never
-    affected.
+    Preserves acceptance/evidence/ (append-only history). Does NOT close PRs
+    or delete labels — forge operations are no longer performed.
     """
     meta = _read_meta()
     repo_dir = meta.get("repo_dir", "")
-    # Close acceptance PRs and delete acc/ branches (if a repo is configured).
-    # This is safe: only PRs labeled "acceptance-test" and branches starting
-    # with "acc/" are touched.
     if repo_dir and Path(repo_dir).exists():
-        _cleanup_acceptance_prs(repo_dir)
-        _cleanup_acceptance_branches(repo_dir)
+        _cleanup_acceptance_branches(repo_dir)  # only acc/ branches, safe
+    # Remove everything under ACCEPTANCE_ROOT except evidence/
+    ev_root = ACCEPTANCE_ROOT / "evidence"
     if ACCEPTANCE_ROOT.exists():
-        shutil.rmtree(ACCEPTANCE_ROOT)
-        print(f"Removed {ACCEPTANCE_ROOT}")
+        for item in ACCEPTANCE_ROOT.iterdir():
+            if item.name == "evidence":
+                continue
+            if item.is_dir():
+                shutil.rmtree(item, ignore_errors=True)
+            else:
+                try:
+                    item.unlink()
+                except Exception:
+                    pass
+        print(f"Cleaned runtime (evidence preserved at {ev_root})")
     else:
         print("Nothing to clean.")
     return 0
-
-
-def _cleanup_acceptance_prs(repo_dir: str):
-    """Close all open PRs labeled 'acceptance-test'. Safe: only touches
-    acceptance PRs, never ordinary PRs."""
-    try:
-        r = subprocess.run(
-            ["gh", "pr", "list", "--repo", _repo_full(repo_dir),
-             "--label", "acceptance-test", "--state", "open",
-             "--json", "number,url"],
-            capture_output=True, text=True, timeout=30)
-        if r.returncode != 0 or not r.stdout.strip():
-            return
-        prs = json.loads(r.stdout)
-        for pr in prs:
-            num = pr["number"]
-            subprocess.run(
-                ["gh", "pr", "close", str(num), "--repo", _repo_full(repo_dir),
-                 "--delete-branch"],
-                capture_output=True, text=True, timeout=30)
-            print(f"  closed acceptance PR #{num}: {pr['url']}")
-    except Exception as e:
-        print(f"  (PR cleanup skipped: {e})")
 
 
 def _cleanup_acceptance_branches(repo_dir: str):
@@ -661,16 +684,3 @@ def _cleanup_acceptance_branches(repo_dir: str):
             print(f"  deleted remote branch: {branch_name}")
     except Exception as e:
         print(f"  (branch cleanup skipped: {e})")
-
-
-def _repo_full(repo_dir: str) -> str:
-    """Extract owner/repo from a git remote URL."""
-    r = subprocess.run(["git", "-C", repo_dir, "remote", "get-url", "origin"],
-                       capture_output=True, text=True, timeout=15)
-    url = r.stdout.strip()
-    if "github.com" in url:
-        if url.startswith("https"):
-            return url.split("github.com/")[1].replace(".git", "")
-        if url.startswith("git@"):
-            return url.split(":")[1].replace(".git", "")
-    return ""

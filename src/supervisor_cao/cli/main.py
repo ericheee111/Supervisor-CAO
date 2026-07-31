@@ -337,9 +337,18 @@ def acceptance_status():
 
 @acceptance.command("cleanup")
 def acceptance_cleanup():
-    """Remove the isolated acceptance environment."""
+    """Remove the isolated acceptance environment (preserves evidence)."""
     from supervisor_cao.cli.acceptance import cleanup
     sys.exit(cleanup())
+
+
+@acceptance.command("purge-evidence")
+@click.option("--force", is_flag=True,
+              help="Required: actually delete historical evidence.")
+def acceptance_purge_evidence(force):
+    """Explicitly delete historical acceptance evidence. Requires --force."""
+    from supervisor_cao.cli.acceptance import purge_evidence
+    sys.exit(purge_evidence(force=force))
 
 
 if __name__ == "__main__":
