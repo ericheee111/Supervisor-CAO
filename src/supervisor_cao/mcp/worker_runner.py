@@ -97,11 +97,26 @@ def _lenient_json_extract(text: str) -> dict | None:
                 objects.append(obj)
         except (json.JSONDecodeError, Exception):
             pass
+        # Try json.loads with strict=False (allows control characters in strings)
+        try:
+            sanitized = _sanitize_json_control_chars(chunk)
+            obj = json.loads(sanitized, strict=False)
+            if isinstance(obj, dict):
+                objects.append(obj)
+        except (json.JSONDecodeError, Exception):
+            pass
         # Try removing all whitespace from key names (fixes Codex's
         # "finding\n  s" -> "findings")
         try:
             fixed2 = _fix_json_keys(chunk)
             obj = json.loads(fixed2)
+            if isinstance(obj, dict):
+                objects.append(obj)
+        except (json.JSONDecodeError, Exception):
+            pass
+        # Last resort: try raw chunk with strict=False
+        try:
+            obj = json.loads(chunk, strict=False)
             if isinstance(obj, dict):
                 objects.append(obj)
         except (json.JSONDecodeError, Exception):
