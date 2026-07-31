@@ -41,20 +41,28 @@ The three real acceptance scenarios (run via `supervisor-cao acceptance run`,
 each against a live `cao-server` with real Workers):
 
 - **direct**: a task taken straight through the pipeline with no fix cycle.
-  Uses **real `gh` PR creation** (`test_mode=False`): the Draft PR is a real
-  GitHub PR, not a simulated artifact. Validates the full
-  plan → implement → verify → review → APPROVED → Draft PR → Windows sync
-  path end-to-end.
+  Uses **forge-agnostic PR content generation** (no `gh`, no forge API):
+  generates `pr-content.{json,md,sha256}` for the user to copy-paste to any
+  forge. Validates the full
+  plan → implement → verify → review → APPROVED → PR_CONTENT_READY →
+  Windows sync → READY_FOR_HUMAN_REVIEW path end-to-end.
+  Pass requires: `READY_FOR_HUMAN_REVIEW` + `candidate == tested == reviewed`
+  + valid `pr-content` artifact + no forge API called.
 - **review-fix**: a task where the Reviewer returns
   `CHANGES_REQUESTED`, exercising the fix cycle. Distinguishes two
   outcomes: `protocol_passed` (the policy-layer cycle completed — fix →
   reverify → incremental review ran) vs `task_approved` (the post-fix
-  review actually returned `APPROVED`). A scenario may `protocol_passed`
-  without `task_approved` (e.g. Judge upheld findings → `NEEDS_HUMAN`);
-  only `task_approved` counts as a full pass.
+  review actually returned `APPROVED` and the task reached
+  `READY_FOR_HUMAN_REVIEW`). Main scenario PASS requires ALL four:
+  `protocol_passed + task_approved + final_state == READY_FOR_HUMAN_REVIEW
+  + pr_content_valid`. Judge correctly entering `NEEDS_HUMAN` is recorded as
+  safety sub-scenario evidence but does NOT make the main scenario pass.
+  Controlled candidate injection uses the audited
+  `StateStore.inject_candidate()` (not raw SQL).
 - **resume**: interrupts a running task mid-stage and resumes it. Verifies
-  that **budget is not re-spent**: a COMPLETED stage with the same
-  `candidate_sha` is not re-run, the Codex call log is not double-charged,
+  that **budget is not re-spent** (strict `==`, not `>=`): a COMPLETED stage
+  with the same `candidate_sha` is not re-run, the Codex call log is not
+  double-charged,
   and no duplicate commit/PR/Windows-sync occurs. Resume only re-runs
   stages whose `candidate_sha` differs (stale) or that were never
   COMPLETED.
@@ -87,7 +95,7 @@ Cover every deterministic enforcement path:
 - **State machine**: legal forward transitions only (no skipping);
   `tested_sha == candidate_sha`; `reviewed_sha == tested_sha`; new candidate
   invalidates tested/reviewed; gate checks before `LOCAL_VERIFIED`,
-  `REMOTE_VERIFIED`, `APPROVED`, `DRAFT_PR_CREATED`; error states reachable
+  `REMOTE_VERIFIED`, `APPROVED`, `PR_CONTENT_READY`; error states reachable
   from any non-terminal state; full audit log.
 - **Budget**: per-task per-role Codex cap; atomic spend via `BEGIN IMMEDIATE`
   (cross-process safe); `CODEX_BUDGET_EXHAUSTED` on overflow; persisted log.
@@ -133,7 +141,7 @@ no model IDs are hardcoded in the repo.
 `src/supervisor_cao/mcp/policy_gateway.py` — the Supervisor has no arbitrary
 bash. It can only call: `create_task`, `advance_task`, `call_planner`,
 `start_executor`, `run_verification`, `call_reviewer`, `call_judge`,
-`create_draft_pr`, `sync_windows`. Each enforces state machine, budget, SHA,
+`prepare_pr_content`, `sync_windows`. Each enforces state machine, budget, SHA,
 worktree, and gates in code.
 
 ## Remote verification pool
@@ -221,8 +229,8 @@ and are pending. Not `READY` until all three pass.
 `cao-server` 与真实 Worker）：
 
 - **direct**：任务直接走完整流水线，无修复回合。使用**真实 `gh` PR 创建**
-  （`test_mode=False`）：Draft PR 是真实的 GitHub PR，不是模拟产物。端到端验证
-  plan → implement → verify → review → APPROVED → Draft PR → Windows 同步路径。
+  （`test_mode=False`）：PR 内容是真实的 GitHub PR，不是模拟产物。端到端验证
+  plan → implement → verify → review → APPROVED → PR content → Windows 同步路径。
 - **review-fix**：Reviewer 返回 `CHANGES_REQUESTED` 的任务，演练修复回合。区分两个
   结果：`protocol_passed`（策略层周期完成 —— fix → 重新验证 → 增量 review 已跑）
   与 `task_approved`（修复后 review 实际返回 `APPROVED`）。一个场景可能
@@ -256,7 +264,7 @@ and are pending. Not `READY` until all three pass.
 
 覆盖每一条确定性强制执行路径：
 
-- **状态机**：仅允许合法的前向转换（不可跳过）；`tested_sha == candidate_sha`；`reviewed_sha == tested_sha`；新候选使 tested/reviewed 失效；在 `LOCAL_VERIFIED`、`REMOTE_VERIFIED`、`APPROVED`、`DRAFT_PR_CREATED` 之前进行门禁检查；错误状态可从任何非终止状态到达；完整审计日志。
+- **状态机**：仅允许合法的前向转换（不可跳过）；`tested_sha == candidate_sha`；`reviewed_sha == tested_sha`；新候选使 tested/reviewed 失效；在 `LOCAL_VERIFIED`、`REMOTE_VERIFIED`、`APPROVED`、`PR_CONTENT_READY` 之前进行门禁检查；错误状态可从任何非终止状态到达；完整审计日志。
 - **预算**：每任务每角色的 Codex 上限；通过 `BEGIN IMMEDIATE` 原子化消费（跨进程安全）；溢出时 `CODEX_BUDGET_EXHAUSTED`；持久化调用日志。
 - **配置安全**：任务覆盖只允许触碰 test/benchmark/acceptance 字段；repo 路径、SSH、containers、base_branch、codex_budget、executor_limits 在任务覆盖中被禁止。
 - **Schema**：`task`/`plan`/`implementation`/`verification`/`review`/`decision`。
@@ -290,7 +298,7 @@ SHA 保真、门禁感知）。Provider/model ID 来自 `~/.config/supervisor-ca
 
 `src/supervisor_cao/mcp/policy_gateway.py` — Supervisor 没有任意 bash。它只能调用：
 `create_task`、`advance_task`、`call_planner`、`start_executor`、`run_verification`、
-`call_reviewer`、`call_judge`、`create_draft_pr`、`sync_windows`。每一项都在代码中强制执行
+`call_reviewer`、`call_judge`、`prepare_pr_content`、`sync_windows`。每一项都在代码中强制执行
 状态机、预算、SHA、worktree 与门禁。
 
 ## 远程验证池

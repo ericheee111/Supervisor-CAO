@@ -51,7 +51,7 @@ Research (GLM/Qwen, read-only)
   -> WSL2 quick verify -> Qwen Verify (remote pool)
   -> Codex full Review (1 call)
   -> [CHANGES_REQUESTED] GLM Fix -> reverify -> Codex incremental Review (1 call)
-  -> APPROVED -> Draft PR -> protected Windows sync (ff-only, 7 gates)
+  -> APPROVED -> PR content -> protected Windows sync (ff-only, 7 gates)
   -> READY_FOR_HUMAN_REVIEW   (terminal — NO auto-merge)
 ```
 
@@ -61,7 +61,7 @@ pushes. It stops at `READY_FOR_HUMAN_REVIEW`.
 States: `CREATED -> RESEARCHING -> PLANNING -> PLAN_READY -> IMPLEMENTING ->
 IMPLEMENTED -> LOCAL_VERIFYING -> LOCAL_VERIFIED -> REMOTE_QUEUED ->
 REMOTE_VERIFYING -> REMOTE_VERIFIED -> REVIEWING -> (CHANGES_REQUESTED -> FIXING
--> ... -> INCREMENTAL_REVIEWING) -> APPROVED -> DRAFT_PR_CREATED ->
+-> ... -> INCREMENTAL_REVIEWING) -> APPROVED -> PR_CONTENT_READY ->
 WINDOWS_SYNCED -> READY_FOR_HUMAN_REVIEW`. Terminal failures: `FAILED`,
 `NEEDS_HUMAN`, plus error states reachable from any non-terminal state.
 
@@ -173,7 +173,7 @@ Research（GLM/Qwen，只读）
   -> WSL2 快速验证 -> Qwen Verify（远程池）
   -> Codex 完整 Review (1 次调用)
   -> [CHANGES_REQUESTED] GLM Fix -> 重新验证 -> Codex 增量 Review (1 次调用)
-  -> APPROVED -> Draft PR -> 受保护的 Windows 同步（ff-only，7 道门禁）
+  -> APPROVED -> PR content -> 受保护的 Windows 同步（ff-only，7 道门禁）
   -> READY_FOR_HUMAN_REVIEW   （终态 — 不自动合并）
 ```
 
@@ -183,7 +183,7 @@ Research（GLM/Qwen，只读）
 状态：`CREATED -> RESEARCHING -> PLANNING -> PLAN_READY -> IMPLEMENTING ->
 IMPLEMENTED -> LOCAL_VERIFYING -> LOCAL_VERIFIED -> REMOTE_QUEUED ->
 REMOTE_VERIFYING -> REMOTE_VERIFIED -> REVIEWING -> (CHANGES_REQUESTED -> FIXING
--> ... -> INCREMENTAL_REVIEWING) -> APPROVED -> DRAFT_PR_CREATED ->
+-> ... -> INCREMENTAL_REVIEWING) -> APPROVED -> PR_CONTENT_READY ->
 WINDOWS_SYNCED -> READY_FOR_HUMAN_REVIEW`。终态失败：`FAILED`、
 `NEEDS_HUMAN`，以及从任何非终态可达的错误状态。
 

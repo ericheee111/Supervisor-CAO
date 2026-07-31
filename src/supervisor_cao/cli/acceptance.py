@@ -285,8 +285,8 @@ def _inject_config(monkeypatch_target, cfg):
 def _build_gateway(dirs: dict[str, Path], cfg, *, test_mode: bool = True):
     """Build a PolicyGateway with isolated state/budget/stores and a real CaoClient.
 
-    test_mode=True writes a test PR URL (no gh). test_mode=False requires a real
-    gh pr create (used by the direct scenario for real Draft PR creation)."""
+    test_mode=True is the default; no gh or forge API is ever called.
+    PR content is generated via render-pr-content (forge-agnostic)."""
     from supervisor_cao.state.machine import StateStore
     from supervisor_cao.budget.codex import CodexBudget
     from supervisor_cao.mcp.stage_store import StageStore
