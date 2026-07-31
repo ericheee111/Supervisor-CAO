@@ -22,11 +22,29 @@ from pathlib import Path
 RUN_ROOT = Path.home() / "cao-runs"
 
 
-def _run(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess:
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-    if check and r.returncode != 0:
-        raise RuntimeError(f"cmd failed ({r.returncode}): {' '.join(cmd[:3])}: {r.stderr.strip()}")
-    return r
+def _run(cmd: list[str], check: bool = True, retries: int = 2) -> subprocess.CompletedProcess:
+    """Run a command with retry on network errors (TLS timeout etc)."""
+    last_r = None
+    for attempt in range(retries + 1):
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        last_r = r
+        if r.returncode == 0:
+            return r
+        # Retry on network/TLS errors; fail fast on auth/validation errors
+        err = (r.stderr + r.stdout).lower()
+        is_network = any(x in err for x in
+                         ["tls handshake", "timeout", "connection reset", "eof",
+                          "dial tcp", "network", "unreachable", "broken pipe"])
+        if not is_network or attempt == retries:
+            if check:
+                raise RuntimeError(f"cmd failed ({r.returncode}): {' '.join(cmd[:3])}: {r.stderr.strip()}")
+            return r
+        # wait before retry
+        import time as _t
+        _t.sleep(5 * (attempt + 1))
+    if check and last_r and last_r.returncode != 0:
+        raise RuntimeError(f"cmd failed ({last_r.returncode}): {' '.join(cmd[:3])}: {last_r.stderr.strip()}")
+    return last_r
 
 
 def build_pr_body(task_id: str, plan_summary: str, baseline_sha: str, candidate_sha: str,

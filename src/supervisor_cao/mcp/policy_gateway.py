@@ -695,7 +695,7 @@ class PolicyGateway:
         acceptance_run_id = cfg.extra.get("acceptance_run_id")
         if acceptance_run_id:
             cmd += ["--acceptance-run-id", str(acceptance_run_id)]
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         if r.returncode != 0:
             self.stages.fail_stage(task_id, stage)
             raise PolicyError(f"PR_CREATION_FAILED: {r.stderr.strip() or r.stdout.strip()}")
