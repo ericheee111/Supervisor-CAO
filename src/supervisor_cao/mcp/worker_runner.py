@@ -414,7 +414,10 @@ class WorkerRunner:
                     kwargs.get("base_sha")),
                 "working_directory": kwargs["working_directory"],
                 "session_name": kwargs.get("session_name"),
-                "candidate_sha": kwargs.get("base_sha"),
+                # candidate_sha=None: let the executor's JSON keep its own
+                # candidate_sha (the real commit SHA). validate_and_stamp
+                # will NOT overwrite it when candidate_sha is None.
+                "candidate_sha": None,
                 "expected_branch": kwargs.get("expected_branch"),
             }
         elif stage == "review":
