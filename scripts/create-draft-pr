@@ -1,241 +1,36 @@
 #!/usr/bin/env python3
-"""create-draft-pr: create or update a Draft PR (spec §16).
+"""DEPRECATED: create-draft-pr is replaced by render-pr-content.
 
-After APPROVED:
-  1. push agent/<task-id>
-  2. create/update Draft PR (base = project base branch)
-  3. write PR body: task summary, plan summary, baseline/candidate SHA,
-     changed files, local test results, remote test results, Codex review,
-     known risks, Codex call count, artifact paths, READY_FOR_HUMAN_REVIEW.
-  4. do NOT mark Ready, do NOT squash, do NOT merge, do NOT delete branch.
+This wrapper exists for backward compatibility only. It:
+  - prints a deprecation warning to stderr
+  - calls render-pr-content (which does NOT access any forge API)
+  - does NOT call gh, does NOT create/update/close real PRs
+  - does NOT require a GitHub remote
 
-Requires gh CLI authenticated. Never force-pushes.
+All new code, states, tests, and docs must use render-pr-content /
+prepare_pr_content / PR_CONTENT_READY.
+
+This wrapper accepts render-pr-content's flags (--task-id, --base-branch,
+--head-branch, --run-dir). It does NOT accept the old --repo/--task-branch
+flags; callers must update to the new interface.
 """
 from __future__ import annotations
 
-import argparse
-import json
-import subprocess
 import sys
 from pathlib import Path
 
-RUN_ROOT = Path.home() / "cao-runs"
-
-
-def _run(cmd: list[str], check: bool = True, retries: int = 2) -> subprocess.CompletedProcess:
-    """Run a command with retry on network errors (TLS timeout etc)."""
-    last_r = None
-    for attempt in range(retries + 1):
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        last_r = r
-        if r.returncode == 0:
-            return r
-        # Retry on network/TLS errors; fail fast on auth/validation errors
-        err = (r.stderr + r.stdout).lower()
-        is_network = any(x in err for x in
-                         ["tls handshake", "timeout", "connection reset", "eof",
-                          "dial tcp", "network", "unreachable", "broken pipe"])
-        if not is_network or attempt == retries:
-            if check:
-                raise RuntimeError(f"cmd failed ({r.returncode}): {' '.join(cmd[:3])}: {r.stderr.strip()}")
-            return r
-        # wait before retry
-        import time as _t
-        _t.sleep(5 * (attempt + 1))
-    if check and last_r and last_r.returncode != 0:
-        raise RuntimeError(f"cmd failed ({last_r.returncode}): {' '.join(cmd[:3])}: {last_r.stderr.strip()}")
-    return last_r
-
-
-def build_pr_body(task_id: str, plan_summary: str, baseline_sha: str, candidate_sha: str,
-                  changed_files: list[str], wsl_tests: dict, remote_tests: dict,
-                  codex_review: dict, codex_call_count: int, artifact_paths: list[str],
-                  known_risks: list[str]) -> str:
-    lines = [
-        f"## Task: {task_id}",
-        "",
-        f"**Status:** `READY_FOR_HUMAN_REVIEW`",
-        "",
-        "### Plan summary",
-        plan_summary,
-        "",
-        "### SHAs",
-        f"- baseline: `{baseline_sha}`",
-        f"- candidate: `{candidate_sha}`",
-        "",
-        "### Changed files",
-        *[f"- {f}" for f in changed_files],
-        "",
-        "### Local test results",
-        "```json",
-        json.dumps(wsl_tests, indent=2, default=str),
-        "```",
-        "",
-        "### Remote test results",
-        "```json",
-        json.dumps(remote_tests, indent=2, default=str),
-        "```",
-        "",
-        "### Codex review",
-        "```json",
-        json.dumps(codex_review, indent=2, default=str),
-        "```",
-        "",
-        f"**Codex calls used:** {codex_call_count} / 4",
-        "",
-        "### Artifacts",
-        *[f"- `{p}`" for p in artifact_paths],
-        "",
-        "### Known risks",
-        *([f"- {r}" for r in known_risks] if known_risks else ["- (none identified)"]),
-        "",
-        "---",
-        "_This is a Draft PR. Not marked Ready for Review. Do not auto-merge._",
-    ]
-    return "\n".join(lines)
-
-
-def create_or_update_draft(repo: str, task_branch: str, base_branch: str, title: str,
-                           body: str, label: str | None = None) -> str:
-    """Create or update a draft PR via gh. Returns the PR URL."""
-    # check existing
-    r = _run(["gh", "pr", "list", "--repo", _repo_full(repo), "--head", task_branch,
-              "--json", "number,url", "--state", "open"], check=False)
-    existing = []
-    if r.returncode == 0 and r.stdout.strip():
-        try:
-            existing = json.loads(r.stdout)
-        except Exception:
-            pass
-    if existing:
-        pr_num = existing[0]["number"]
-        _run(["gh", "pr", "edit", str(pr_num), "--repo", _repo_full(repo),
-              "--body", body, "--title", title])
-        return existing[0]["url"]
-    create_cmd = ["gh", "pr", "create", "--repo", _repo_full(repo), "--head", task_branch,
-                  "--base", base_branch, "--title", title, "--body", body, "--draft"]
-    if label:
-        create_cmd += ["--label", label]
-    r = _run(create_cmd)
-    return r.stdout.strip()
-
-
-def _repo_full(repo: str) -> str:
-    """Extract owner/repo from a git remote URL. Raises if cannot resolve GitHub remote."""
-    r = _run(["git", "-C", repo, "remote", "get-url", "origin"], check=False)
-    url = r.stdout.strip()
-    if not url:
-        raise RuntimeError(f"PR_CREATION_FAILED: no origin remote for {repo}")
-    if "github.com" in url:
-        if url.startswith("https"):
-            return url.split("github.com/")[1].replace(".git", "")
-        if url.startswith("git@"):
-            return url.split(":")[1].replace(".git", "")
-    raise RuntimeError(f"PR_CREATION_FAILED: origin is not a GitHub remote: {url}")
-
-
-def _load_json_required(path: Path) -> dict:
-    """Load a JSON artifact. Raises (exit 1) if missing or unparseable.
-
-    Requirement 6: missing any of the 5 artifacts forbids PR creation.
-    No warn-and-continue.
-    """
-    if not path.exists():
-        print(f"PR_CREATION_FAILED: missing artifact {path.name}", file=sys.stderr)
-        sys.exit(1)
-    try:
-        return json.loads(path.read_text())
-    except Exception as e:
-        print(f"PR_CREATION_FAILED: cannot parse {path.name}: {e}", file=sys.stderr)
-        sys.exit(1)
-
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Create or update a Draft PR")
-    ap.add_argument("--repo", required=True, help="git repo path")
-    ap.add_argument("--task-id", required=True)
-    ap.add_argument("--task-branch", required=True)
-    ap.add_argument("--base-branch", default="main")
-    ap.add_argument("--run-dir", required=True, help="artifact dir for this task")
-    ap.add_argument("--test-mode", action="store_true",
-                    help="write a test PR URL without calling gh (temp repos only). "
-                         "Production mode requires real gh pr create/edit success.")
-    ap.add_argument("--label", default=None,
-                    help="optional PR label (e.g. acceptance-test for acceptance PRs)")
-    ap.add_argument("--acceptance-run-id", default=None,
-                    help="acceptance run id; sets the PR title prefix and label")
-    args = ap.parse_args()
-
-    run_dir = Path(args.run_dir)
-
-    # Requirement 6: ALL 5 artifacts must exist and parse. Missing any -> exit 1.
-    plan = _load_json_required(run_dir / "plan.json")
-    impl = _load_json_required(run_dir / "implementation.json")
-    verification = _load_json_required(run_dir / "verification.json")
-    review = _load_json_required(run_dir / "review.json")
-    budget_summary = _load_json_required(run_dir / "codex-budget-summary.json")
-
-    # Extract real data from artifacts
-    candidate_sha = impl.get("candidate_sha", "")
-    if not candidate_sha:
-        # try verification.json
-        candidate_sha = verification.get("candidate_sha", "")
-    if not candidate_sha:
-        print("ERROR: cannot determine candidate_sha from artifacts", file=sys.stderr)
-        return 1
-
-    changed_files = impl.get("changed_files", [])
-    wsl_tests = verification.get("wsl_results", {})
-    remote_tests = verification.get("remote_results", {})
-    codex_review = review
-    codex_call_count = budget_summary.get("total_used", 0)
-    plan_summary = plan.get("steps", plan.get("description", "see plan.json"))
-    if isinstance(plan_summary, list):
-        plan_summary = "; ".join(str(s.get("description", s)) if isinstance(s, dict) else str(s) for s in plan_summary[:5])
-
-    # Validate SHA consistency
-    tested_sha = verification.get("tested_sha", "")
-    reviewed_sha = review.get("reviewed_sha", "")
-    if tested_sha and tested_sha != candidate_sha:
-        print(f"ERROR: SHA mismatch: tested_sha={tested_sha} != candidate_sha={candidate_sha}", file=sys.stderr)
-        return 1
-    if reviewed_sha and reviewed_sha != candidate_sha:
-        print(f"ERROR: SHA mismatch: reviewed_sha={reviewed_sha} != candidate_sha={candidate_sha}", file=sys.stderr)
-        return 1
-
-    # Validate review decision
-    if review.get("decision") and review["decision"] != "APPROVED":
-        print(f"ERROR: review not APPROVED: {review.get('decision')}", file=sys.stderr)
-        return 1
-
-    artifacts = [str(run_dir / n) for n in ["plan.json", "implementation.json",
-                 "verification.json", "review.json", "codex-budget-summary.json"]
-                 if (run_dir / n).exists()]
-
-    title = f"[Draft] {args.task_id}"
-    label = args.label
-    if args.acceptance_run_id:
-        title = f"[Acceptance/{args.acceptance_run_id}] {args.task_id}"
-        label = label or "acceptance-test"
-    body = build_pr_body(args.task_id, plan_summary, "", candidate_sha, changed_files,
-                         wsl_tests, remote_tests, codex_review, codex_call_count, artifacts, [])
-    # Requirement 7: test-mode writes a test PR URL without calling gh.
-    # Production mode requires real gh pr create/edit success (real PR URL).
-    if args.test_mode:
-        url = f"test://pr/{args.task_id}"
-        print(f"Draft PR (test-mode): {url}")
-        (run_dir / "draft-pr-url.txt").write_text(url)
-        return 0
-    try:
-        url = create_or_update_draft(args.repo, args.task_branch, args.base_branch,
-                                     title, body, label=label)
-        print(f"Draft PR: {url}")
-        (run_dir / "draft-pr-url.txt").write_text(url)
-        return 0
-    except Exception as e:
-        print(f"PR_CREATION_FAILED: {e}", file=sys.stderr)
-        (run_dir / "draft-pr-error.txt").write_text(str(e))
-        return 1
+    print("DEPRECATED: create-draft-pr is replaced by render-pr-content. "
+          "This wrapper does NOT create a real PR and does NOT call gh. "
+          "Use 'render-pr-content' or PolicyGateway.prepare_pr_content() instead.",
+          file=sys.stderr)
+    script = Path(__file__).resolve().parent / "render-pr-content"
+    import subprocess
+    # Pass through all argv except argv[0]; render-pr-content uses the same flags.
+    r = subprocess.run([sys.executable, str(script)] + sys.argv[1:],
+                       timeout=120)
+    return r.returncode
 
 
 if __name__ == "__main__":

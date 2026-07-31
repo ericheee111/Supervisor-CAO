@@ -80,10 +80,14 @@ class TestDirtyOnStart:
 
 
 class TestDraftPrArtifactGate:
-    """Requirement 6: missing any of the 5 artifacts forbids PR creation."""
+    """Requirement 6: missing any of the 5 artifacts forbids PR content generation.
+
+    The deprecated create-draft-pr wrapper now delegates to render-pr-content,
+    which validates artifacts locally without any forge API call.
+    """
 
     def test_missing_artifact_exits_nonzero(self):
-        """create-draft-pr must exit 1 when an artifact is missing."""
+        """render-pr-content must exit 1 when an artifact is missing."""
         with tempfile.TemporaryDirectory() as d:
             run_dir = Path(d)
             # create only 4 of 5 artifacts
@@ -91,20 +95,18 @@ class TestDraftPrArtifactGate:
                 (run_dir / name).write_text("{}")
             # missing codex-budget-summary.json
             r = subprocess.run(
-                ["python", str(REPO_ROOT / "scripts" / "create-draft-pr"),
-                 "--repo", d, "--task-id", "T1", "--task-branch", "agent/T1",
-                 "--base-branch", "dev", "--run-dir", d, "--test-mode"],
+                ["python", str(REPO_ROOT / "scripts" / "render-pr-content"),
+                 "--task-id", "T1", "--base-branch", "dev",
+                 "--head-branch", "agent/T1", "--run-dir", d],
                 capture_output=True, text=True, timeout=30,
             )
             assert r.returncode != 0, "must fail when an artifact is missing"
-            assert "missing artifact" in r.stderr.lower() or "PR_CREATION_FAILED" in r.stderr
+            assert "missing" in r.stderr.lower() or "PR_CONTENT_GENERATION_FAILED" in r.stderr
 
-    def test_all_artifacts_present_test_mode_succeeds(self):
-        """With all 5 artifacts present and --test-mode, PR creation succeeds
-        with a test:// URL (no gh call)."""
+    def test_all_artifacts_present_succeeds(self):
+        """With all 5 artifacts + push.json present, render-pr-content succeeds."""
         with tempfile.TemporaryDirectory() as d:
             run_dir = Path(d)
-            # minimal valid artifacts
             (run_dir / "plan.json").write_text(json.dumps({"steps": [{"description": "x"}]}))
             (run_dir / "implementation.json").write_text(json.dumps({
                 "candidate_sha": "abc", "changed_files": ["a.py"]}))
@@ -114,19 +116,23 @@ class TestDraftPrArtifactGate:
             (run_dir / "review.json").write_text(json.dumps({
                 "decision": "APPROVED", "reviewed_sha": "abc", "findings": []}))
             (run_dir / "codex-budget-summary.json").write_text(json.dumps({"total_used": 2}))
+            (run_dir / "push.json").write_text(json.dumps({
+                "schema_version": 1, "remote": "origin", "branch": "agent/T1",
+                "pushed_sha": "abc", "push_succeeded": True}))
             r = subprocess.run(
-                ["python", str(REPO_ROOT / "scripts" / "create-draft-pr"),
-                 "--repo", d, "--task-id", "T1", "--task-branch", "agent/T1",
-                 "--base-branch", "dev", "--run-dir", d, "--test-mode"],
+                ["python", str(REPO_ROOT / "scripts" / "render-pr-content"),
+                 "--task-id", "T1", "--base-branch", "dev",
+                 "--head-branch", "agent/T1", "--run-dir", d],
                 capture_output=True, text=True, timeout=30,
             )
             assert r.returncode == 0, f"should succeed: {r.stderr}"
-            url = (run_dir / "draft-pr-url.txt").read_text()
-            assert url.startswith("test://pr/"), f"test-mode URL: {url}"
+            assert (run_dir / "pr-content.json").exists()
+            assert (run_dir / "pr-content.md").exists()
+            assert (run_dir / "pr-content.sha256").exists()
+            assert "PR Title:" in r.stdout
 
-    def test_production_mode_requires_gh(self):
-        """Without --test-mode, production mode calls gh (which fails without
-        a real GitHub remote, proving test-mode does not leak into production)."""
+    def test_deprecated_wrapper_does_not_call_gh(self):
+        """The deprecated create-draft-pr wrapper must NOT call gh or forge APIs."""
         with tempfile.TemporaryDirectory() as d:
             run_dir = Path(d)
             for name, content in [("plan.json", {"steps": [{"description": "x"}]}),
@@ -135,12 +141,18 @@ class TestDraftPrArtifactGate:
                                   ("review.json", {"decision": "APPROVED", "reviewed_sha": "abc", "findings": []}),
                                   ("codex-budget-summary.json", {"total_used": 2})]:
                 (run_dir / name).write_text(json.dumps(content))
-            # no --test-mode: production path tries gh, which fails (no remote)
+            (run_dir / "push.json").write_text(json.dumps({
+                "schema_version": 1, "remote": "origin", "branch": "agent/T1",
+                "pushed_sha": "abc", "push_succeeded": True}))
             r = subprocess.run(
                 ["python", str(REPO_ROOT / "scripts" / "create-draft-pr"),
-                 "--repo", d, "--task-id", "T1", "--task-branch", "agent/T1",
-                 "--base-branch", "dev", "--run-dir", d],
+                 "--task-id", "T1", "--base-branch", "dev",
+                 "--head-branch", "agent/T1", "--run-dir", d],
                 capture_output=True, text=True, timeout=30,
             )
-            assert r.returncode != 0, "production mode must fail without a real gh remote"
-            assert "PR_CREATION_FAILED" in r.stderr or "gh" in r.stderr.lower()
+            assert r.returncode == 0, f"wrapper should succeed: {r.stderr}"
+            assert "DEPRECATED" in r.stderr
+            # must NOT produce old draft-pr-url.txt
+            assert not (run_dir / "draft-pr-url.txt").exists()
+            # must produce pr-content files
+            assert (run_dir / "pr-content.json").exists()

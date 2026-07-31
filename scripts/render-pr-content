@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+"""render-pr-content: generate a forge-agnostic PR content package.
+
+Reads local artifacts (plan/implementation/verification/review/budget) and
+push.json from --run-dir, validates all preconditions, and writes:
+  - pr-content.json  (canonical, deterministic)
+  - pr-content.md    (human-readable PR body)
+  - pr-content.sha256 (two-line checksum binding JSON + MD)
+
+Prints to stdout:
+  PR Title:
+  <title>
+
+  Base:
+  <base>
+
+  Head:
+  <head>
+
+  PR Body:
+  <markdown body>
+
+NEVER accesses the network, forge APIs, or gh. Does not require origin to be
+GitHub. Idempotent: same inputs -> byte-identical outputs.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+# Add src to path for direct execution
+_SRC = Path(__file__).resolve().parent.parent / "src"
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
+
+from supervisor_cao.pr_content.renderer import render_pr_content
+
+
+def _load_json(path: Path) -> dict:
+    if not path.exists():
+        print(f"PR_CONTENT_GENERATION_FAILED: missing {path.name}", file=sys.stderr)
+        sys.exit(1)
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"PR_CONTENT_GENERATION_FAILED: cannot parse {path.name}: {e}",
+              file=sys.stderr)
+        sys.exit(1)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Render forge-agnostic PR content package")
+    ap.add_argument("--task-id", required=True)
+    ap.add_argument("--base-branch", default="main")
+    ap.add_argument("--head-branch", required=True)
+    ap.add_argument("--run-dir", required=True, help="artifact dir for this task")
+    args = ap.parse_args()
+
+    run_dir = Path(args.run_dir)
+    artifacts = {
+        "plan": _load_json(run_dir / "plan.json"),
+        "implementation": _load_json(run_dir / "implementation.json"),
+        "verification": _load_json(run_dir / "verification.json"),
+        "review": _load_json(run_dir / "review.json"),
+        "budget": _load_json(run_dir / "codex-budget-summary.json"),
+    }
+    push_path = run_dir / "push.json"
+    if not push_path.exists():
+        print("PR_CONTENT_GENERATION_FAILED: missing push.json (push evidence required)",
+              file=sys.stderr)
+        return 1
+    try:
+        push_evidence = json.loads(push_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"PR_CONTENT_GENERATION_FAILED: cannot parse push.json: {e}",
+              file=sys.stderr)
+        return 1
+
+    try:
+        json_text, md_text, sha_text = render_pr_content(
+            artifacts, args.task_id, args.base_branch, args.head_branch, push_evidence)
+    except ValueError as e:
+        print(f"PR_CONTENT_GENERATION_FAILED: {e}", file=sys.stderr)
+        return 1
+
+    (run_dir / "pr-content.json").write_text(json_text, encoding="utf-8")
+    (run_dir / "pr-content.md").write_text(md_text, encoding="utf-8")
+    (run_dir / "pr-content.sha256").write_text(sha_text, encoding="utf-8")
+
+    j = json.loads(json_text)
+    print("PR Title:")
+    print(j["title"])
+    print()
+    print("Base:")
+    print(j["base_branch"])
+    print()
+    print("Head:")
+    print(j["head_branch"])
+    print()
+    print("PR Body:")
+    print(md_text, end="")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

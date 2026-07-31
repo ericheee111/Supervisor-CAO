@@ -151,3 +151,105 @@ def test_renderer_source_has_no_network_imports():
     assert "import requests" not in src
     assert "import urllib" not in src
     assert "subprocess" not in src
+
+
+# --- CLI script tests ---
+
+def _write_artifacts(run_dir: Path, arts: dict, push: dict | None = None,
+                     task_id: str = "T1", head_branch: str = "agent/T1"):
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "plan.json").write_text(json.dumps(arts["plan"]))
+    (run_dir / "implementation.json").write_text(json.dumps(arts["implementation"]))
+    (run_dir / "verification.json").write_text(json.dumps(arts["verification"]))
+    (run_dir / "review.json").write_text(json.dumps(arts["review"]))
+    (run_dir / "codex-budget-summary.json").write_text(json.dumps(arts["budget"]))
+    if push:
+        # ensure push branch matches the head_branch used in the test
+        p = dict(push)
+        p["branch"] = head_branch
+        (run_dir / "push.json").write_text(json.dumps(p))
+
+
+def _script_path() -> Path:
+    return Path(__file__).resolve().parents[2] / "scripts" / "render-pr-content"
+
+
+def test_cli_produces_files_and_stdout(tmp_path):
+    run_dir = tmp_path / "T1"
+    _write_artifacts(run_dir, _sample_artifacts(), _sample_push(),
+                     task_id="T1", head_branch="agent/T1")
+    r = subprocess.run(
+        [sys.executable, str(_script_path()), "--task-id", "T1",
+         "--base-branch", "main", "--head-branch", "agent/T1",
+         "--run-dir", str(run_dir)],
+        capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0, r.stderr
+    assert (run_dir / "pr-content.json").exists()
+    assert (run_dir / "pr-content.md").exists()
+    assert (run_dir / "pr-content.sha256").exists()
+    assert "PR Title:" in r.stdout
+    assert "Base:" in r.stdout
+    assert "Head:" in r.stdout
+    assert "PR Body:" in r.stdout
+
+
+def test_cli_rejects_missing_push_json(tmp_path):
+    run_dir = tmp_path / "T2"
+    _write_artifacts(run_dir, _sample_artifacts())  # no push.json
+    r = subprocess.run(
+        [sys.executable, str(_script_path()), "--task-id", "T2",
+         "--base-branch", "main", "--head-branch", "agent/T2",
+         "--run-dir", str(run_dir)],
+        capture_output=True, text=True, timeout=30)
+    assert r.returncode != 0
+    assert "push" in r.stderr.lower()
+
+
+def test_cli_idempotent_rerun(tmp_path):
+    run_dir = tmp_path / "T3"
+    _write_artifacts(run_dir, _sample_artifacts(), _sample_push(),
+                     task_id="T3", head_branch="agent/T3")
+    cmd = [sys.executable, str(_script_path()), "--task-id", "T3",
+           "--base-branch", "main", "--head-branch", "agent/T3",
+           "--run-dir", str(run_dir)]
+    r1 = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    sha1 = (run_dir / "pr-content.sha256").read_text()
+    json1 = (run_dir / "pr-content.json").read_text()
+    r2 = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    sha2 = (run_dir / "pr-content.sha256").read_text()
+    json2 = (run_dir / "pr-content.json").read_text()
+    assert r1.returncode == 0 and r2.returncode == 0
+    assert sha1 == sha2
+    assert json1 == json2
+
+
+def test_cli_does_not_force_draft_title(tmp_path):
+    run_dir = tmp_path / "T5"
+    _write_artifacts(run_dir, _sample_artifacts(), _sample_push(),
+                     task_id="T5", head_branch="agent/T5")
+    r = subprocess.run(
+        [sys.executable, str(_script_path()), "--task-id", "T5",
+         "--base-branch", "main", "--head-branch", "agent/T5",
+         "--run-dir", str(run_dir)],
+        capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0
+    j = json.loads((run_dir / "pr-content.json").read_text())
+    assert not j["title"].startswith("[Draft]")
+
+
+def test_create_draft_pr_wrapper_is_deprecated(tmp_path):
+    """create-draft-pr wrapper should print deprecation and call render-pr-content."""
+    run_dir = tmp_path / "T6"
+    _write_artifacts(run_dir, _sample_artifacts(), _sample_push(),
+                     task_id="T6", head_branch="agent/T6")
+    wrapper = Path(__file__).resolve().parents[2] / "scripts" / "create-draft-pr"
+    r = subprocess.run(
+        [sys.executable, str(wrapper), "--task-id", "T6",
+         "--base-branch", "main", "--head-branch", "agent/T6",
+         "--run-dir", str(run_dir)],
+        capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0
+    assert "DEPRECATED" in r.stderr
+    # should have produced pr-content files, not draft-pr-url.txt
+    assert (run_dir / "pr-content.json").exists()
+    assert not (run_dir / "draft-pr-url.txt").exists()
