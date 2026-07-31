@@ -273,10 +273,16 @@ def task_show(task_id):
 
 @task.command("logs")
 @click.argument("task_id")
-def task_logs(task_id):
+@click.option("--follow", is_flag=True, help="Continuously tail new output (read-only)")
+def task_logs(task_id, follow):
+    """Show task logs (read-only)."""
     run_dir = Path.home() / "cao-runs" / task_id
     if not run_dir.exists():
         click.echo(f"no run dir for {task_id}")
+        return
+    if follow:
+        from supervisor_cao.cli.task_runner import task_watch
+        task_watch(task_id, follow=True, json_output=False)
         return
     for f in sorted(run_dir.iterdir()):
         click.echo(f"--- {f.name} ---")
@@ -284,6 +290,52 @@ def task_logs(task_id):
             click.echo(f.read_text()[:2000])
         except Exception:
             click.echo("(binary)")
+
+
+@task.command("start")
+@click.option("--repo", required=True, help="path to the git repo")
+@click.option("--base-branch", default="main", help="base branch")
+@click.option("--description-file", required=True, help="path to task description markdown")
+@click.option("--project", default=None, help="project name (loads config); if omitted, temp repo mode")
+@click.option("--verify-command", default=None, help="verification command (required in temp repo mode)")
+@click.option("--stall-timeout", default=1800, type=int, help="stall timeout in seconds")
+def task_start(repo, base_branch, description_file, project, verify_command, stall_timeout):
+    """Start a new task and drive it to APPROVED (or FAILED/NEEDS_HUMAN).
+
+    Ctrl+C releases the Controller lease without killing the Worker.
+    Resume with: supervisor-cao task resume <task-id>
+    """
+    from supervisor_cao.cli.task_runner import task_start as _start
+    sys.exit(_start(repo, base_branch, description_file, project, verify_command, stall_timeout))
+
+
+@task.command("watch")
+@click.argument("task_id")
+@click.option("--json", "json_output", is_flag=True, help="output JSON per poll")
+@click.option("--follow", is_flag=True, help="continuously poll until terminal")
+@click.option("--poll-interval", default=5, type=int, help="poll interval in seconds")
+@click.option("--stall-timeout", default=1800, type=int, help="stall timeout in seconds")
+def task_watch(task_id, json_output, follow, poll_interval, stall_timeout):
+    """Watch a task (read-only, no lease acquisition)."""
+    from supervisor_cao.cli.task_runner import task_watch as _watch
+    sys.exit(_watch(task_id, json_output, follow, poll_interval, stall_timeout))
+
+
+@task.command("resume")
+@click.argument("task_id")
+@click.option("--stall-timeout", default=1800, type=int, help="stall timeout in seconds")
+def task_resume(task_id, stall_timeout):
+    """Resume an interrupted task (reads config snapshot + Worker handle)."""
+    from supervisor_cao.cli.task_runner import task_resume as _resume
+    sys.exit(_resume(task_id, stall_timeout))
+
+
+@task.command("status")
+@click.argument("task_id")
+def task_status(task_id):
+    """Print a one-shot status snapshot."""
+    from supervisor_cao.cli.task_runner import task_status as _status
+    sys.exit(_status(task_id))
 
 
 @cli.command()
