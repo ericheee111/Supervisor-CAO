@@ -312,7 +312,12 @@ def _build_gateway(dirs: dict[str, Path], cfg, *, test_mode: bool = True):
     # real CaoClient (no fake); test_mode for draft-PR test URL.
     # NO local_fixture — remote verification uses the "local" ssh_host mode
     # which runs the real verification command (real exit code, not simulated).
+    from supervisor_cao.mcp.worker_monitor import WorkerMonitor
+    cao = CaoClient(run_root=dirs["runs"])
+    wm = WorkerMonitor(cao_client=cao, run_root=dirs["runs"],
+                       db_path=dirs["state"] / "workers.db")
     gw = PolicyGateway(state_store=store, budget=budget, stage_store=stages,
+                       cao_client=cao, worker_monitor=wm,
                        test_mode=test_mode, run_root=dirs["runs"])
     # inject the acceptance config so run_next_stage uses it
     _inject_config(None, cfg)
