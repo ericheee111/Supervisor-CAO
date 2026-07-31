@@ -174,12 +174,25 @@ def _write_result(args, exit_code: int, stdout_path: str | None = None):
 
 
 def _extract_last_message(output: str) -> str | None:
-    """Extract the last assistant message from OpenCode NDJSON output."""
+    """Extract the last assistant text message from OpenCode NDJSON output.
+
+    OpenCode emits NDJSON lines with types: step_start, tool_use, text,
+    step_finish. The assistant's text output is in type="text" lines.
+    Also handles type="assistant" (other providers) and plain text.
+    """
     lines = [l for l in output.strip().split("\n") if l.strip()]
     for line in reversed(lines):
         try:
             obj = json.loads(line)
-            if obj.get("type") == "assistant" or obj.get("role") == "assistant":
+            msg_type = obj.get("type", "")
+            # OpenCode text message
+            if msg_type == "text":
+                part = obj.get("part", {})
+                text = part.get("text", "") if isinstance(part, dict) else ""
+                if text and text.strip():
+                    return text
+            # Standard assistant message
+            if msg_type == "assistant" or obj.get("role") == "assistant":
                 content = obj.get("content", "")
                 if isinstance(content, list):
                     for part in reversed(content):
@@ -189,8 +202,12 @@ def _extract_last_message(output: str) -> str | None:
                     return content
         except (json.JSONDecodeError, KeyError, TypeError):
             continue
-    # Fallback: return last non-empty line
-    return lines[-1] if lines else None
+    # Fallback: return last non-empty line that looks like text (not JSON)
+    for line in reversed(lines):
+        stripped = line.strip()
+        if stripped and not stripped.startswith("{"):
+            return stripped
+    return None
 
 
 if __name__ == "__main__":

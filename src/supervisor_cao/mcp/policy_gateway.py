@@ -437,52 +437,32 @@ class PolicyGateway:
         point — this is the single path for both production and tests.
         Tests inject a mock WorkerMonitor that returns canned results.
         Returns the parsed artifact dict. Raises PolicyError on failure.
-
-        Includes JSON retry: if the Worker output has no parseable JSON,
-        retry up to 3 times with a stronger JSON-only prompt (via WorkerMonitor).
         """
-        # Try up to 4 times (1 initial + 3 retries with stronger prompt)
-        current_request = request
-        for attempt in range(4):
-            worker_id = self.worker_monitor.start_worker(
-                task_id=task_id, stage=stage, profile=current_request["profile"],
-                prompt=current_request["prompt"],
-                working_directory=current_request["working_directory"],
-                session_name=current_request.get("session_name"),
-                model=current_request.get("model"),
-                timeout=current_request.get("timeout"),
-                stall_timeout=stall_timeout,
-                resume_state=current_request.get("resume_state"),
-            )
-            self.stages.set_handle_status(
-                task_id, stage, handle_status="RUNNING",
-                resume_state=current_request.get("resume_state"),
-                worker_id=worker_id)
-            result = self.worker_monitor.wait_for_stage(task_id, stall_timeout=stall_timeout)
-            if result.get("status") != "COMPLETED":
-                error = result.get("error", "worker failed")
-                self.stages.fail_stage(task_id, stage, error=error)
-                raise PolicyError(f"{stage}: {error}")
-            # Try to finalize
-            try:
-                artifact = self.runner.finalize_result(
-                    request["stage"], task_id, result,
-                    candidate_sha=request.get("candidate_sha"))
-                return artifact
-            except WorkerError:
-                if attempt < 3:
-                    # Retry with stronger JSON-only prompt
-                    retry_prompt = (
-                        f"CRITICAL (attempt {attempt+2}): Your previous response did not "
-                        "contain a valid JSON object. You MUST output ONLY a raw JSON "
-                        "object now. No prose, no markdown, no explanation, no code "
-                        "fences. Start with { and end with }. Nothing before or after.\n\n"
-                        + current_request["prompt"])
-                    current_request = dict(current_request)
-                    current_request["prompt"] = retry_prompt
-                    continue
-                raise
-        raise PolicyError(f"{stage}: no JSON after retries")
+        worker_id = self.worker_monitor.start_worker(
+            task_id=task_id, stage=stage, profile=request["profile"],
+            prompt=request["prompt"], working_directory=request["working_directory"],
+            session_name=request.get("session_name"),
+            model=request.get("model"),
+            timeout=request.get("timeout"),
+            stall_timeout=stall_timeout,
+            resume_state=request.get("resume_state"),
+        )
+        # Persist handle status to StageStore
+        self.stages.set_handle_status(
+            task_id, stage, handle_status="RUNNING",
+            resume_state=request.get("resume_state"),
+            worker_id=worker_id)
+        # Wait for completion (blocks until COMPLETED/FAILED/STALLED)
+        result = self.worker_monitor.wait_for_stage(task_id, stall_timeout=stall_timeout)
+        if result.get("status") != "COMPLETED":
+            error = result.get("error", "worker failed")
+            self.stages.fail_stage(task_id, stage, error=error)
+            raise PolicyError(f"{stage}: {error}")
+        # Finalize: parse + validate + stamp + save artifact
+        artifact = self.runner.finalize_result(
+            request["stage"], task_id, result,
+            candidate_sha=request.get("candidate_sha"))
+        return artifact
 
     def _stage_research(self, task_id, rec, cfg, session_name, run_dir):
         stage = "research"
