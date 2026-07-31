@@ -550,9 +550,11 @@ class PolicyGateway:
             expected_branch=adapter.task_branch_for(task_id))
         impl = self._run_stage_via_monitor(task_id, stage, request,
                                            stall_timeout=cfg.stall_timeout)
-        # Read the REAL git HEAD SHA from the worktree (not the LLM claim)
+        # Use the candidate_sha from the Worker's artifact (the executor
+        # commits and reports the real SHA). Fall back to reading git HEAD
+        # if the artifact doesn't have it.
         from supervisor_cao.workers.worktrees import current_sha
-        real_sha = current_sha(executor_wt)
+        real_sha = impl.get("candidate_sha") or current_sha(executor_wt)
         if not real_sha:
             raise PolicyError("IMPLEMENTING: cannot read git HEAD from worktree")
         impl["candidate_sha"] = real_sha  # stamp the real SHA
@@ -739,7 +741,9 @@ class PolicyGateway:
         impl = self._run_stage_via_monitor(task_id, stage, request,
                                            stall_timeout=cfg.stall_timeout)
         from supervisor_cao.workers.worktrees import current_sha
-        real_sha = current_sha(executor_wt)
+        # Use the candidate_sha from the Worker's artifact first (the executor
+        # commits and reports the real SHA). Fall back to git HEAD.
+        real_sha = impl.get("candidate_sha") or current_sha(executor_wt)
         if not real_sha:
             raise PolicyError("FIXING: cannot read git HEAD from worktree")
         # NO_PROGRESS check: fix must produce a new SHA (different from old candidate)
