@@ -859,10 +859,13 @@ class PolicyGateway:
     def _apply_review_decision(self, task_id, rec, review: dict):
         """The review decision (parsed from real Worker output) drives state."""
         decision = review.get("decision")
+        # Re-read the current state (may have changed since rec was captured)
+        cur = self.store.get(task_id)
+        cur_state = cur.state if cur else rec.state
         # Ensure we're in REVIEWING state before transitioning to the decision
         # state. REMOTE_VERIFIED -> REVIEWING -> CHANGES_REQUESTED/APPROVED.
         # Skip if already in REVIEWING (avoid REVIEWING -> REVIEWING).
-        if rec.state not in (TaskState.REVIEWING.value, TaskState.INCREMENTAL_REVIEWING.value):
+        if cur_state not in (TaskState.REVIEWING.value, TaskState.INCREMENTAL_REVIEWING.value):
             self.store.transition(task_id, TaskState.REVIEWING)
         if decision == "APPROVED":
             self.store.transition(task_id, TaskState.APPROVED)
