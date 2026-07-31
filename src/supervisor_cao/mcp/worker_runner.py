@@ -650,6 +650,189 @@ class WorkerRunner:
         return self._run(task_id, "decision", "codex-judge", prompt,
                          working_directory, session_name, candidate_sha=candidate_sha)
 
+    # ------------------------------------------------------------------
+    # Four-phase interface (build → start → wait → finalize)
+    # Production path: only WorkerMonitor starts Workers.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def build_request(stage: str, task_id: str, **kwargs) -> dict:
+        """Build a stage request (prompt + params) WITHOUT launching a Worker.
+
+        Returns a dict with: profile, prompt, working_directory, session_name,
+        model, timeout, candidate_sha, stage.
+        """
+        if stage == "research":
+            return {
+                "stage": "research", "profile": "researcher",
+                "prompt": WorkerRunner._research_prompt(
+                    task_id, kwargs.get("description", ""),
+                    kwargs.get("baseline_sha")),
+                "working_directory": kwargs["working_directory"],
+                "session_name": kwargs.get("session_name"),
+                "candidate_sha": kwargs.get("baseline_sha"),
+            }
+        elif stage == "plan":
+            return {
+                "stage": "plan", "profile": "codex-planner",
+                "prompt": WorkerRunner._plan_prompt(
+                    task_id, kwargs.get("description", ""),
+                    kwargs.get("baseline_sha"),
+                    kwargs.get("research", {})),
+                "working_directory": kwargs["working_directory"],
+                "session_name": kwargs.get("session_name"),
+                "candidate_sha": kwargs.get("baseline_sha"),
+            }
+        elif stage == "implementation":
+            return {
+                "stage": "implementation", "profile": "glm-executor",
+                "prompt": WorkerRunner._executor_prompt(
+                    task_id, kwargs.get("plan", {}),
+                    kwargs.get("base_sha")),
+                "working_directory": kwargs["working_directory"],
+                "session_name": kwargs.get("session_name"),
+                "candidate_sha": kwargs.get("base_sha"),
+                "expected_branch": kwargs.get("expected_branch"),
+            }
+        elif stage == "review":
+            return {
+                "stage": "review", "profile": "codex-reviewer",
+                "prompt": WorkerRunner._reviewer_prompt(
+                    task_id, kwargs.get("candidate_sha", ""),
+                    kwargs.get("tested_sha", ""),
+                    kwargs.get("plan", {})),
+                "working_directory": kwargs["working_directory"],
+                "session_name": kwargs.get("session_name"),
+                "candidate_sha": kwargs.get("candidate_sha"),
+            }
+        elif stage == "incremental_review":
+            return {
+                "stage": "incremental_review", "profile": "codex-reviewer",
+                "prompt": WorkerRunner._incremental_review_prompt(
+                    task_id, kwargs.get("candidate_sha", ""),
+                    kwargs.get("findings", []),
+                    kwargs.get("executor_response", "")),
+                "working_directory": kwargs["working_directory"],
+                "session_name": kwargs.get("session_name"),
+                "candidate_sha": kwargs.get("candidate_sha"),
+            }
+        elif stage == "decision":
+            return {
+                "stage": "decision", "profile": "codex-judge",
+                "prompt": WorkerRunner._judge_prompt(
+                    task_id, kwargs.get("candidate_sha", ""),
+                    kwargs.get("findings", []),
+                    kwargs.get("executor_response", ""),
+                    kwargs.get("reviewer_rebuttal", "")),
+                "working_directory": kwargs["working_directory"],
+                "session_name": kwargs.get("session_name"),
+                "candidate_sha": kwargs.get("candidate_sha"),
+            }
+        else:
+            raise WorkerError(f"unknown stage: {stage}")
+
+    def finalize_result(self, stage: str, task_id: str, worker_result: dict,
+                        candidate_sha: str | None = None) -> dict:
+        """Parse + validate + stamp + save artifact from a Worker result.
+
+        ``worker_result`` is the dict returned by WorkerMonitor.wait_for_stage
+        (contains last_message, raw_output, exit_code).
+        """
+        last_message = worker_result.get("last_message", "")
+        raw = worker_result.get("raw_output", "")
+        obj = None
+        if last_message:
+            try:
+                obj = extract_strict_json(last_message)
+            except WorkerError:
+                pass
+        if obj is None and raw:
+            try:
+                obj = extract_strict_json(raw)
+            except WorkerError:
+                pass
+        # Retry with stronger prompt is handled by the caller (PolicyGateway)
+        if obj is None:
+            raise WorkerError(
+                f"{stage} worker: no JSON object found in worker output")
+        obj = validate_and_stamp(stage, obj, task_id, candidate_sha)
+        _save_artifact(task_id, stage, obj, run_root=self._run_root)
+        return obj
+
+    # --- prompt builders (extracted from run_* methods) ---
+
+    @staticmethod
+    def _research_prompt(task_id, description, baseline_sha):
+        return (
+            f"You are the Researcher. Read the repository.\n"
+            f"Task: {description}\n"
+            f"Baseline SHA: {baseline_sha or 'unknown'}\n\n"
+            "Investigate the codebase: find the relevant files, call paths, tests, "
+            "and benchmarks. Produce a structured research report.\n\n"
+            + _schema_hint("research")
+        )
+
+    @staticmethod
+    def _plan_prompt(task_id, description, baseline_sha, research):
+        return (
+            f"You are the Codex Planner. Read the repository.\n"
+            f"Task: {description}\n"
+            f"Baseline SHA: {baseline_sha or 'unknown'}\n"
+            f"Research report:\n{json.dumps(research, indent=2)}\n\n"
+            "Verify the research conclusions and produce a structured plan: target "
+            "files, ordered steps, test matrix, rollback conditions, completion "
+            "criteria, risks, prerequisites_verified.\n\n"
+            + _schema_hint("plan")
+        )
+
+    @staticmethod
+    def _executor_prompt(task_id, plan, base_sha):
+        steps = plan.get("steps", [])
+        steps_text = json.dumps(steps, indent=2) if steps else str(plan)
+        return (
+            f"You are the GLM Executor. Implement the plan in your worktree.\n"
+            f"Base SHA: {base_sha or 'unknown'}\n"
+            f"Plan:\n{steps_text}\n\n"
+            "Edit the necessary files, run tests, commit, and push your task branch. "
+            "Then output your result as JSON.\n\n"
+            + _schema_hint("implementation")
+        )
+
+    @staticmethod
+    def _reviewer_prompt(task_id, candidate_sha, tested_sha, plan):
+        return (
+            f"You are the Codex Reviewer. Review the candidate.\n"
+            f"Candidate SHA: {candidate_sha}\n"
+            f"Tested SHA: {tested_sha}\n"
+            f"Plan:\n{json.dumps(plan, indent=2)}\n\n"
+            "Review the implementation against the plan. Output APPROVED or "
+            "CHANGES_REQUESTED with findings.\n\n"
+            + _schema_hint("review")
+        )
+
+    @staticmethod
+    def _incremental_review_prompt(task_id, candidate_sha, findings, executor_response):
+        return (
+            f"You are the Codex Incremental Reviewer.\n"
+            f"Candidate SHA: {candidate_sha}\n"
+            f"Findings from initial review:\n{json.dumps(findings, indent=2)}\n"
+            f"Executor response:\n{executor_response}\n\n"
+            "Review the fix. Output APPROVED or CHANGES_REQUESTED.\n\n"
+            + _schema_hint("review")
+        )
+
+    @staticmethod
+    def _judge_prompt(task_id, candidate_sha, findings, executor_response, reviewer_rebuttal):
+        return (
+            f"You are the Codex Judge. Arbitrate the dispute.\n"
+            f"Candidate SHA: {candidate_sha}\n"
+            f"Findings:\n{json.dumps(findings, indent=2)}\n"
+            f"Executor response:\n{executor_response}\n"
+            f"Reviewer rebuttal:\n{reviewer_rebuttal}\n\n"
+            "Output OVERTURN, UPHOLD, MIXED, or UNRESOLVED.\n\n"
+            + _schema_hint("decision")
+        )
+
 
 # ---------------------------------------------------------------------------
 # Deterministic test runner (requirement 3): NOT the LLM

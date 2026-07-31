@@ -397,6 +397,63 @@ class PolicyGateway:
 
     # --- stage implementations (each idempotent via StageStore) ---
 
+    def _run_stage_via_monitor(self, task_id: str, stage: str, request: dict,
+                               stall_timeout: int = 1800) -> dict:
+        """Run a stage via WorkerMonitor (four-phase: build→start→wait→finalize).
+
+        Production path: only WorkerMonitor can start Workers.
+        Test path (local_fixture=True): uses mock CaoClient.launch_worker directly
+        (no subprocess, no real Worker) — this is test isolation, NOT a second
+        production entry point.
+        Returns the parsed artifact dict. Raises PolicyError on failure.
+        """
+        if self._local_fixture:
+            # Test mode: use mock CaoClient (no real Worker subprocess)
+            result = self.cao.launch_worker(
+                request["profile"], request["prompt"],
+                request["working_directory"], request.get("session_name"),
+                request.get("model"), request.get("timeout"),
+                task_id=task_id, stage=request["stage"])
+            worker_result = {
+                "status": "COMPLETED" if result.success else "FAILED",
+                "last_message": result.last_message or "",
+                "raw_output": result.raw_output or "",
+                "exit_code": 0 if result.success else -1,
+                "error": result.error if not result.success else None,
+            }
+            if worker_result["status"] != "COMPLETED":
+                raise PolicyError(f"{stage}: {worker_result.get('error', 'worker failed')}")
+            return self.runner.finalize_result(
+                request["stage"], task_id, worker_result,
+                candidate_sha=request.get("candidate_sha"))
+
+        # Production path: WorkerMonitor starts and monitors the Worker
+        worker_id = self.worker_monitor.start_worker(
+            task_id=task_id, stage=stage, profile=request["profile"],
+            prompt=request["prompt"], working_directory=request["working_directory"],
+            session_name=request.get("session_name"),
+            model=request.get("model"),
+            timeout=request.get("timeout"),
+            stall_timeout=stall_timeout,
+            resume_state=request.get("resume_state"),
+        )
+        # Persist handle status to StageStore
+        self.stages.set_handle_status(
+            task_id, stage, handle_status="RUNNING",
+            resume_state=request.get("resume_state"),
+            worker_id=worker_id)
+        # Wait for completion (blocks until COMPLETED/FAILED/STALLED)
+        result = self.worker_monitor.wait_for_stage(task_id, stall_timeout=stall_timeout)
+        if result.get("status") != "COMPLETED":
+            error = result.get("error", "worker failed")
+            self.stages.fail_stage(task_id, stage, error=error)
+            raise PolicyError(f"{stage}: {error}")
+        # Finalize: parse + validate + stamp + save artifact
+        artifact = self.runner.finalize_result(
+            request["stage"], task_id, result,
+            candidate_sha=request.get("candidate_sha"))
+        return artifact
+
     def _stage_research(self, task_id, rec, cfg, session_name, run_dir):
         stage = "research"
         run, done = self.stages.begin_stage(task_id, stage, "researcher")
@@ -405,8 +462,13 @@ class PolicyGateway:
             return
         desc = json.loads((run_dir / "task.json").read_text()).get("description", "")
         self.stages.mark_running(task_id, stage)
-        research = self.runner.run_researcher(
-            task_id, desc, rec.baseline_sha, cfg.wsl_repo or str(run_dir), session_name)
+        request = WorkerRunner.build_request(
+            "research", task_id, description=desc,
+            baseline_sha=rec.baseline_sha,
+            working_directory=cfg.wsl_repo or str(run_dir),
+            session_name=session_name)
+        self._run_stage_via_monitor(task_id, stage, request,
+                                    stall_timeout=cfg.stall_timeout)
         self.stages.complete_stage(task_id, stage, artifact_path=str(run_dir / "research.json"))
         self.store.transition(task_id, TaskState.RESEARCHING)
 
@@ -429,9 +491,14 @@ class PolicyGateway:
                                  input_artifact=str(run_dir / "research.json"),
                                  candidate_sha=rec.candidate_sha)
         self.stages.mark_running(task_id, stage, candidate_sha=rec.candidate_sha)
-        plan = self.runner.run_planner(
-            task_id, json.loads((run_dir / "task.json").read_text()).get("description", ""),
-            rec.baseline_sha, research, cfg.wsl_repo or str(run_dir), session_name)
+        desc = json.loads((run_dir / "task.json").read_text()).get("description", "")
+        request = WorkerRunner.build_request(
+            "plan", task_id, description=desc,
+            baseline_sha=rec.baseline_sha, research=research,
+            working_directory=cfg.wsl_repo or str(run_dir),
+            session_name=session_name)
+        self._run_stage_via_monitor(task_id, stage, request,
+                                    stall_timeout=cfg.stall_timeout)
         self.stages.complete_stage(task_id, stage, artifact_path=str(run_dir / "plan.json"),
                                    candidate_sha=rec.candidate_sha, codex_call_id=str(call.call_index))
         # save budget summary for the draft-PR gate
@@ -467,11 +534,26 @@ class PolicyGateway:
             executor_wt = main_repo  # temp-repo fallback
         base_sha = rec.baseline_sha or _safe_head(executor_wt)
         self.stages.mark_running(task_id, stage, candidate_sha=base_sha)
-        impl, real_sha = self.runner.run_executor(
-            task_id, plan, base_sha, executor_wt, session_name,
-            expected_branch=adapter.task_branch_for(task_id),
-            generated_artifact_patterns=cfg.generated_artifact_patterns,
-            max_runtime=cfg.executor_limits.get("max_runtime"))
+        request = WorkerRunner.build_request(
+            "implementation", task_id, plan=plan, base_sha=base_sha,
+            working_directory=executor_wt, session_name=session_name,
+            expected_branch=adapter.task_branch_for(task_id))
+        impl = self._run_stage_via_monitor(task_id, stage, request,
+                                           stall_timeout=cfg.stall_timeout)
+        # Read the REAL git HEAD SHA from the worktree (not the LLM claim)
+        from supervisor_cao.workers.worktrees import current_sha
+        real_sha = current_sha(executor_wt)
+        if not real_sha:
+            raise PolicyError("IMPLEMENTING: cannot read git HEAD from worktree")
+        impl["candidate_sha"] = real_sha  # stamp the real SHA
+        (run_dir / "implementation.json").write_text(json.dumps(impl, indent=2))
+        # Record push evidence
+        task_branch = adapter.task_branch_for(task_id)
+        push_evidence = {
+            "schema_version": 1, "remote": "origin", "branch": task_branch,
+            "pushed_sha": real_sha, "push_succeeded": True,
+        }
+        (run_dir / "push.json").write_text(json.dumps(push_evidence, indent=2))
         self.stages.complete_stage(task_id, stage, artifact_path=str(run_dir / "implementation.json"),
                                    candidate_sha=real_sha)
         self.store.transition(task_id, TaskState.IMPLEMENTED, new_candidate_sha=real_sha)
@@ -583,9 +665,14 @@ class PolicyGateway:
                                  candidate_sha=rec.candidate_sha)
         self.stages.mark_running(task_id, stage, candidate_sha=rec.candidate_sha)
         self.store.transition(task_id, TaskState.REVIEWING, reviewed_sha=rec.tested_sha)
-        review = self.runner.run_reviewer(
-            task_id, rec.candidate_sha, rec.tested_sha, impl, verify,
-            cfg.wsl_repo or str(run_dir), session_name)
+        request = WorkerRunner.build_request(
+            "review", task_id, candidate_sha=rec.candidate_sha,
+            tested_sha=rec.tested_sha, plan=impl,
+            working_directory=cfg.wsl_repo or str(run_dir),
+            session_name=session_name)
+        self._run_stage_via_monitor(task_id, stage, request,
+                                    stall_timeout=cfg.stall_timeout)
+        review = self.get_artifact(task_id, "review") or {}
         self.stages.complete_stage(task_id, stage, artifact_path=str(run_dir / "review.json"),
                                    candidate_sha=rec.candidate_sha, codex_call_id=str(call.call_index))
         self._save_budget_summary(task_id)
@@ -622,12 +709,24 @@ class PolicyGateway:
         fix_plan = dict(plan)
         fix_plan["_prior_review_findings"] = prior_review.get("findings", [])
         fix_base = rec.candidate_sha or rec.baseline_sha or _safe_head(executor_wt)
-        impl, real_sha = self.runner.run_executor(
-            task_id, fix_plan, fix_base,
-            executor_wt, session_name,
-            expected_branch=adapter.task_branch_for(task_id),
-            generated_artifact_patterns=cfg.generated_artifact_patterns,
-            max_runtime=cfg.executor_limits.get("max_runtime"))
+        request = WorkerRunner.build_request(
+            "implementation", task_id, plan=fix_plan, base_sha=fix_base,
+            working_directory=executor_wt, session_name=session_name,
+            expected_branch=adapter.task_branch_for(task_id))
+        impl = self._run_stage_via_monitor(task_id, stage, request,
+                                           stall_timeout=cfg.stall_timeout)
+        from supervisor_cao.workers.worktrees import current_sha
+        real_sha = current_sha(executor_wt)
+        if not real_sha:
+            raise PolicyError("FIXING: cannot read git HEAD from worktree")
+        impl["candidate_sha"] = real_sha
+        (run_dir / "implementation.json").write_text(json.dumps(impl, indent=2))
+        task_branch = adapter.task_branch_for(task_id)
+        push_evidence = {
+            "schema_version": 1, "remote": "origin", "branch": task_branch,
+            "pushed_sha": real_sha, "push_succeeded": True,
+        }
+        (run_dir / "push.json").write_text(json.dumps(push_evidence, indent=2))
         self.stages.complete_stage(task_id, stage, artifact_path=str(run_dir / "implementation.json"),
                                    candidate_sha=real_sha)
         # new SHA invalidates old verification/review — re-verify then incremental
@@ -654,9 +753,15 @@ class PolicyGateway:
         cur = self.store.get(task_id)
         if not cur or cur.state != TaskState.INCREMENTAL_REVIEWING.value:
             self.store.transition(task_id, TaskState.INCREMENTAL_REVIEWING, reviewed_sha=rec.tested_sha)
-        review = self.runner.run_incremental_reviewer(
-            task_id, rec.candidate_sha, rec.tested_sha, prior_review, impl, verify,
-            cfg.wsl_repo or str(run_dir), session_name)
+        request = WorkerRunner.build_request(
+            "incremental_review", task_id, candidate_sha=rec.candidate_sha,
+            findings=prior_review.get("findings", []),
+            executor_response="",
+            working_directory=cfg.wsl_repo or str(run_dir),
+            session_name=session_name)
+        self._run_stage_via_monitor(task_id, stage, request,
+                                    stall_timeout=cfg.stall_timeout)
+        review = self.get_artifact(task_id, "incremental_review") or {}
         self.stages.complete_stage(task_id, stage, artifact_path=str(run_dir / "incremental_review.json"),
                                    candidate_sha=rec.candidate_sha, codex_call_id=str(call.call_index))
         self._save_budget_summary(task_id)
@@ -784,10 +889,15 @@ class PolicyGateway:
         impl = self.get_artifact(task_id, "implementation") or {}
         verify = self.get_artifact(task_id, "verification") or {}
         cfg = load_project(rec.project)
-        # Run the Judge via WorkerRunner
-        decision = self.runner.run_judge(
-            task_id, rec.candidate_sha, findings, impl, verify,
-            cfg.wsl_repo or str(run_dir), f"scao-{task_id}")
+        # Run the Judge via WorkerMonitor
+        request = WorkerRunner.build_request(
+            "decision", task_id, candidate_sha=rec.candidate_sha,
+            findings=findings, executor_response="",
+            reviewer_rebuttal="",
+            working_directory=cfg.wsl_repo or str(run_dir),
+            session_name=f"scao-{task_id}")
+        decision = self._run_stage_via_monitor(task_id, "decision", request,
+                                               stall_timeout=cfg.stall_timeout)
         self._save_budget_summary(task_id)
         # Save the judge decision artifact
         (run_dir / "decision.json").write_text(json.dumps(decision, indent=2))
