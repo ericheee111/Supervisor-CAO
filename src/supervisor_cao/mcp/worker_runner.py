@@ -470,6 +470,13 @@ class WorkerRunner:
             subprocess.run(["git", "-C", executor_worktree, "clean", "-fd",
                             "--", *glob_patterns],
                            capture_output=True, timeout=30)
+        # Restore .gitignore to HEAD if it was modified post-commit by tool
+        # side-effects (e.g. pip install -e . appending egg-info entries).
+        # This is scoped: only .gitignore, not all tracked files — the executor's
+        # intentional source changes are already committed.
+        subprocess.run(["git", "-C", executor_worktree, "checkout", "--",
+                        ".gitignore"],
+                       capture_output=True, timeout=30)
         # Requirement: worktree must be clean after the run (strict check —
         # no ignoring of tracked __pycache__/*.pyc; they must be gitignored
         # or not committed in the first place).
