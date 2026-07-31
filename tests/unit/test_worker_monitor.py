@@ -86,24 +86,18 @@ class TestHandleDataclasses:
 
 class TestStartWorker:
     def test_start_cao_worker_persists_handle(self, monitor, tmp_run_root):
-        """start_worker for a Codex profile persists a handle with handle_type=cao_terminal."""
-        # The CAO launch_worker is called in a background thread; we make it
-        # write a result file quickly so the handle is created.
-        def fake_launch(profile, prompt, wd, sn, model, timeout, task_id, stage):
-            # write a result file so the monitor sees COMPLETED
-            run_dir = tmp_run_root / task_id
-            run_dir.mkdir(parents=True, exist_ok=True)
-            (run_dir / f"{stage}-cao-result.json").write_text(json.dumps({
-                "done": True, "success": True, "last_message": '{"plan_id":"p1"}',
-                "raw_output": "", "terminal_id": "fake-t1"}))
-            from supervisor_cao.mcp.cao_client import WorkerResult
-            return WorkerResult(True, '{"plan_id":"p1"}', "fake-t1", sn, "")
-        monitor.cao.launch_worker = fake_launch
-        monitor.cao.get_terminal_status = lambda tid: {"status": "completed"}
-        monitor.cao.get_terminal_output = lambda tid, mode="full": ""
+        """start_worker for a Codex profile persists a handle with handle_type=cao_terminal.
 
-        wid = monitor.start_worker("t1", "plan", "codex-planner", "prompt",
-                                   "/tmp", session_name="s1")
+        With worker-shim, _start_cao_worker launches a shim subprocess. We mock
+        subprocess.Popen to avoid actually launching the shim, and verify the
+        handle is persisted correctly.
+        """
+        from unittest.mock import patch, MagicMock
+        mock_proc = MagicMock()
+        mock_proc.pid = 12345
+        with patch("subprocess.Popen", return_value=mock_proc):
+            wid = monitor.start_worker("t1", "plan", "codex-planner", "prompt",
+                                       str(tmp_run_root), session_name="s1")
         assert wid
         wh = monitor.get_handle(wid)
         assert wh is not None
@@ -111,6 +105,7 @@ class TestStartWorker:
         assert wh.status == H_RUNNING
         assert wh.cao_handle is not None
         assert wh.cao_handle["terminal_id"] is not None
+        assert wh.cao_handle["terminal_id"].startswith("shim-")
 
     def test_start_process_worker_persists_handle(self, monitor, tmp_run_root):
         """start_worker for an OpenCode profile persists a process handle."""
@@ -171,40 +166,26 @@ class TestStartWorker:
 
 class TestPollWorker:
     def test_poll_completed_cao(self, monitor, tmp_run_root):
-        """poll_worker returns COMPLETED when the result file shows success."""
+        """poll_worker returns COMPLETED when the result file shows success.
+
+        With worker-shim, the result file is <stage>-result.json (not cao-result.json).
+        We mock subprocess.Popen and pre-write the result file.
+        """
+        from unittest.mock import patch, MagicMock
         task_id = "t3"
         run_dir = tmp_run_root / task_id
         run_dir.mkdir(parents=True, exist_ok=True)
-        # Pre-write the result file so the monitor sees COMPLETED immediately
-        (run_dir / "plan-cao-result.json").write_text(json.dumps({
+        # Pre-write the result file (worker-shim writes <stage>-result.json)
+        (run_dir / "plan-result.json").write_text(json.dumps({
             "done": True, "success": True, "last_message": '{"x":1}',
             "raw_output": "", "terminal_id": "t3term"}))
-        # Make launch_worker return a successful result quickly (the thread
-        # calls it and writes the result file again)
-        from supervisor_cao.mcp.cao_client import WorkerResult
-
-        def fake_launch(profile, prompt, wd, sn, model, timeout, task_id=None, stage=None):
-            return WorkerResult(True, '{"x":1}', "t3term", sn, "")
-        monitor.cao.launch_worker = fake_launch
-        monitor.cao.get_terminal_status = lambda tid: {"status": "completed"}
-        monitor.cao.get_terminal_output = lambda tid, mode="full": ""
-        wid = monitor.start_worker(task_id, "plan", "codex-planner", "p",
-                                   str(run_dir), session_name="s3")
-        # The terminal_id may be "unknown-..." if the thread hasn't written yet;
-        # patch the handle to use the known terminal_id
-        wh = monitor.get_handle(wid)
-        if wh.cao_handle and wh.cao_handle["terminal_id"].startswith("unknown-"):
-            wh.cao_handle["terminal_id"] = "t3term"
-            with monitor._lock, monitor._conn() as c:
-                c.execute(
-                    "UPDATE workers SET cao_handle=? WHERE worker_id=?",
-                    (json.dumps(wh.cao_handle), wid),
-                )
-                c.commit()
-        # give the thread time
-        time.sleep(1)
+        mock_proc = MagicMock()
+        mock_proc.pid = 99999
+        with patch("subprocess.Popen", return_value=mock_proc):
+            wid = monitor.start_worker(task_id, "plan", "codex-planner", "p",
+                                       str(run_dir), session_name="s3")
         status = monitor.poll_worker(wid)
-        assert status.status in (H_COMPLETED, H_RUNNING)
+        assert status.status == H_COMPLETED
         if status.status == H_RUNNING:
             time.sleep(1)
             status = monitor.poll_worker(wid)

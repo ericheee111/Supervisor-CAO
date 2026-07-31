@@ -433,33 +433,11 @@ class PolicyGateway:
                                stall_timeout: int = 1800) -> dict:
         """Run a stage via WorkerMonitor (four-phase: build→start→wait→finalize).
 
-        Production path: only WorkerMonitor can start Workers.
-        Test path (local_fixture=True): uses mock CaoClient.launch_worker directly
-        (no subprocess, no real Worker) — this is test isolation, NOT a second
-        production entry point.
+        Production path: only WorkerMonitor can start Workers. No dual entry
+        point — this is the single path for both production and tests.
+        Tests inject a mock WorkerMonitor that returns canned results.
         Returns the parsed artifact dict. Raises PolicyError on failure.
         """
-        if self._local_fixture:
-            # Test mode: use mock CaoClient (no real Worker subprocess)
-            result = self.cao.launch_worker(
-                request["profile"], request["prompt"],
-                request["working_directory"], request.get("session_name"),
-                request.get("model"), request.get("timeout"),
-                task_id=task_id, stage=request["stage"])
-            worker_result = {
-                "status": "COMPLETED" if result.success else "FAILED",
-                "last_message": result.last_message or "",
-                "raw_output": result.raw_output or "",
-                "exit_code": 0 if result.success else -1,
-                "error": result.error if not result.success else None,
-            }
-            if worker_result["status"] != "COMPLETED":
-                raise PolicyError(f"{stage}: {worker_result.get('error', 'worker failed')}")
-            return self.runner.finalize_result(
-                request["stage"], task_id, worker_result,
-                candidate_sha=request.get("candidate_sha"))
-
-        # Production path: WorkerMonitor starts and monitors the Worker
         worker_id = self.worker_monitor.start_worker(
             task_id=task_id, stage=stage, profile=request["profile"],
             prompt=request["prompt"], working_directory=request["working_directory"],
@@ -614,17 +592,8 @@ class PolicyGateway:
             self.store.transition(task_id, TaskState.FAILED,
                                   error="local verification failed (exit code non-zero)")
             raise PolicyError("LOCAL_VERIFYING: tests failed (real exit code non-zero)")
-        # 2. Optional LLM summary only. The LLM CANNOT change passed/tested_sha.
-        try:
-            summary = self.runner.run_verifier_summary(
-                task_id, rec.candidate_sha, result.summary, session_name)
-            verify = self.get_artifact(task_id, "verification") or {}
-            verify["llm_summary"] = summary
-            verify["passed"] = result.passed  # authoritative, re-stamped
-            verify["tested_sha"] = rec.candidate_sha  # authoritative, re-stamped
-            (run_dir / "verification.json").write_text(json.dumps(verify, indent=2))
-        except Exception:
-            pass  # LLM summary is best-effort; the exit code already decided
+        # LLM summary removed — verification is deterministic (exit code only).
+        # The LLM CANNOT change passed/tested_sha.
         self.stages.complete_stage(task_id, stage, artifact_path=str(run_dir / "verification.json"),
                                    candidate_sha=rec.candidate_sha)
         self.store.transition(task_id, TaskState.LOCAL_VERIFIED, tested_sha=rec.candidate_sha)
@@ -944,6 +913,10 @@ class PolicyGateway:
         verify = self.get_artifact(task_id, "verification") or {}
         cfg = load_project(rec.project)
         # Run the Judge via WorkerMonitor
+        # Register the decision stage in StageStore so wait_for_stage can find it
+        self.stages.begin_stage(task_id, "decision", "codex-judge",
+                                candidate_sha=rec.candidate_sha)
+        self.stages.mark_running(task_id, "decision", candidate_sha=rec.candidate_sha)
         request = WorkerRunner.build_request(
             "decision", task_id, candidate_sha=rec.candidate_sha,
             findings=findings, executor_response="",
@@ -952,6 +925,10 @@ class PolicyGateway:
             session_name=f"scao-{task_id}")
         decision = self._run_stage_via_monitor(task_id, "decision", request,
                                                stall_timeout=cfg.stall_timeout)
+        self.stages.complete_stage(task_id, "decision",
+                                   artifact_path=str(run_dir / "decision.json"),
+                                   candidate_sha=rec.candidate_sha,
+                                   codex_call_id=str(call.call_index))
         self._save_budget_summary(task_id)
         # Save the judge decision artifact
         (run_dir / "decision.json").write_text(json.dumps(decision, indent=2))

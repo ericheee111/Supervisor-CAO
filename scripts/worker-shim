@@ -5,16 +5,25 @@ Wraps a Worker command (OpenCode CLI or Codex run-step) in an independent
 process that survives Controller exit. Writes result.json + exit-code to
 persistent files. Does NOT depend on a daemon reaper thread in the Controller.
 
-Usage:
-  worker-shim --stdout <path> --stderr <path> --result <path> --exit-code <path> \
-              -- <command> [args...]
+Two modes:
+
+  1. Process mode (default): wraps a CLI command.
+     worker-shim --stdout <p> --stderr <p> --result <p> --exit-code <p> \
+                 -- <command> [args...]
+
+  2. CAO mode: calls CaoClient.launch_worker (HTTP POST /terminals/run-step)
+     in-process, then writes result.json. Used for Codex workers.
+     worker-shim --mode cao --stdout <p> --stderr <p> --result <p> --exit-code <p> \
+                 --profile <profile> --prompt <prompt-file> --working-directory <dir> \
+                 --session-name <name> --model <model> --timeout <timeout> \
+                 --task-id <tid> --stage <stage>
 
 The shim:
-  1. Launches the Worker command as a child process (inheriting the new session).
-  2. Streams stdout/stderr to the log files.
-  3. Waits for the child to exit.
-  4. Writes the exit code to --exit-code file.
-  5. Writes a minimal result.json with exit_code + success flag.
+  1. Launches the Worker (subprocess for CLI, in-process HTTP for CAO).
+  2. Streams stdout/stderr to log files (process mode).
+  3. Waits for completion.
+  4. Writes exit code to --exit-code file.
+  5. Writes result.json with exit_code + success + last_message + raw_output.
   6. Exits with the child's exit code.
 
 The Controller (WorkerMonitor) launches the shim with start_new_session=True,
@@ -31,20 +40,24 @@ from pathlib import Path
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Persistent worker launcher shim")
+    ap.add_argument("--mode", default="process", choices=["process", "cao"],
+                    help="process: wrap CLI command; cao: call CaoClient.launch_worker")
     ap.add_argument("--stdout", required=True, help="path to stdout log file")
     ap.add_argument("--stderr", required=True, help="path to stderr log file")
     ap.add_argument("--result", required=True, help="path to result.json")
     ap.add_argument("--exit-code", required=True, help="path to exit code file")
-    ap.add_argument("command", nargs=argparse.REMAINDER, help="command to run (after --)")
+    # CAO mode args
+    ap.add_argument("--profile", default=None, help="worker profile (CAO mode)")
+    ap.add_argument("--prompt-file", default=None, help="path to prompt file (CAO mode)")
+    ap.add_argument("--working-directory", default=None, help="working directory (CAO mode)")
+    ap.add_argument("--session-name", default=None, help="session name (CAO mode)")
+    ap.add_argument("--model", default=None, help="model (CAO mode)")
+    ap.add_argument("--timeout", default=None, type=int, help="timeout (CAO mode)")
+    ap.add_argument("--task-id", default=None, help="task ID (CAO mode)")
+    ap.add_argument("--stage", default=None, help="stage name (CAO mode)")
+    ap.add_argument("--run-root", default=None, help="run root for CaoClient (CAO mode)")
+    ap.add_argument("command", nargs=argparse.REMAINDER, help="command to run (process mode, after --)")
     args = ap.parse_args()
-
-    # Remove leading -- if present
-    cmd = args.command
-    if cmd and cmd[0] == "--":
-        cmd = cmd[1:]
-    if not cmd:
-        print("ERROR: no command specified", file=sys.stderr)
-        return 2
 
     # Ensure log dirs exist
     for p in [args.stdout, args.stderr, args.result, args.exit_code]:
@@ -52,6 +65,21 @@ def main() -> int:
 
     # Write a partial result file immediately (signals "shim started")
     Path(args.result).write_text(json.dumps({"done": False, "started": True}))
+
+    if args.mode == "cao":
+        return _run_cao_mode(args)
+    else:
+        return _run_process_mode(args)
+
+
+def _run_process_mode(args) -> int:
+    """Process mode: wrap a CLI command."""
+    cmd = args.command
+    if cmd and cmd[0] == "--":
+        cmd = cmd[1:]
+    if not cmd:
+        print("ERROR: no command specified", file=sys.stderr)
+        return 2
 
     try:
         with open(args.stdout, "w", buffering=1) as stdout_f, \
@@ -62,29 +90,87 @@ def main() -> int:
         exit_code = -1
         Path(args.stderr).write_text(f"worker-shim error: {e}\n", encoding="utf-8")
 
-    # Write exit code file
+    _write_result(args, exit_code, stdout_path=args.stdout)
     Path(args.exit_code).write_text(str(exit_code))
+    return exit_code
 
-    # Write result.json (minimal — the Controller parses the stdout log for
-    # the actual agent message)
+
+def _run_cao_mode(args) -> int:
+    """CAO mode: call CaoClient.launch_worker in-process, write result.json."""
+    # Add src to path
+    _src = Path(__file__).resolve().parent.parent / "src"
+    if str(_src) not in sys.path:
+        sys.path.insert(0, str(_src))
+
+    try:
+        from supervisor_cao.mcp.cao_client import CaoClient
+
+        prompt = Path(args.prompt_file).read_text(encoding="utf-8") if args.prompt_file else ""
+        run_root = Path(args.run_root) if args.run_root else None
+        client = CaoClient(run_root=run_root)
+
+        # Write to stdout log as we go (best-effort)
+        with open(args.stdout, "w", buffering=1) as stdout_f, \
+             open(args.stderr, "w", buffering=1) as stderr_f:
+            try:
+                result = client.launch_worker(
+                    args.profile, prompt, args.working_directory,
+                    args.session_name, args.model, args.timeout,
+                    task_id=args.task_id, stage=args.stage)
+                # Write the result to result.json
+                data = result.to_dict()
+                data["last_message"] = result.last_message
+                data["raw_output"] = result.raw_output
+                data["success"] = result.success
+                data["terminal_id"] = result.terminal_id
+                data["done"] = True
+                data["exit_code"] = 0 if result.success else 1
+                # Write stdout for progress detection
+                if result.last_message:
+                    stdout_f.write(result.last_message + "\n")
+                    stdout_f.flush()
+                if result.raw_output:
+                    stdout_f.write(result.raw_output + "\n")
+                    stdout_f.flush()
+                Path(args.result).write_text(json.dumps(data, default=str, ensure_ascii=False))
+                exit_code = 0 if result.success else 1
+            except Exception as e:
+                stderr_f.write(f"CAO worker error: {e}\n")
+                stderr_f.flush()
+                error_data = {
+                    "done": True, "success": False, "exit_code": 1,
+                    "error": str(e), "terminal_id": None,
+                }
+                Path(args.result).write_text(json.dumps(error_data))
+                exit_code = 1
+    except Exception as e:
+        Path(args.stderr).write_text(f"worker-shim cao import error: {e}\n", encoding="utf-8")
+        error_data = {"done": True, "success": False, "exit_code": 1, "error": str(e)}
+        Path(args.result).write_text(json.dumps(error_data))
+        exit_code = 1
+
+    Path(args.exit_code).write_text(str(exit_code))
+    return exit_code
+
+
+def _write_result(args, exit_code: int, stdout_path: str | None = None):
+    """Write result.json for process mode."""
     result = {
         "done": True,
         "exit_code": exit_code,
         "success": exit_code == 0,
     }
     # Try to read stdout for last_message extraction (OpenCode NDJSON)
-    try:
-        stdout_content = Path(args.stdout).read_text(encoding="utf-8", errors="replace")
-        result["raw_output"] = stdout_content
-        # Extract last assistant message from OpenCode NDJSON
-        last_msg = _extract_last_message(stdout_content)
-        if last_msg:
-            result["last_message"] = last_msg
-    except Exception:
-        pass
-
+    if stdout_path:
+        try:
+            stdout_content = Path(stdout_path).read_text(encoding="utf-8", errors="replace")
+            result["raw_output"] = stdout_content
+            last_msg = _extract_last_message(stdout_content)
+            if last_msg:
+                result["last_message"] = last_msg
+        except Exception:
+            pass
     Path(args.result).write_text(json.dumps(result, ensure_ascii=False))
-    return exit_code
 
 
 def _extract_last_message(output: str) -> str | None:

@@ -81,6 +81,8 @@ def _fake_cao_client(responses: dict[str, str]):
     """Build a fake CaoClient whose launch_worker returns canned JSON per stage."""
     client = MagicMock()
     client.server_health.return_value = True
+    # Expose responses for mock WorkerMonitor to read
+    client._responses = responses
 
     def launch_worker(profile, prompt, working_directory, session_name=None,
                       model=None, timeout=None, task_id=None, stage=None):
@@ -101,11 +103,75 @@ def _cfg(main_repo: str, **kw) -> ProjectConfig:
 
 
 def _gateway(store, budget, stages, cao_client, *, local_fixture=True):
-    """Build a PolicyGateway with a local-fixture backend factory."""
+    """Build a PolicyGateway with a local-fixture backend factory and mock WorkerMonitor."""
+    from unittest.mock import MagicMock
+    from supervisor_cao.mcp.worker_monitor import WorkerMonitor
+
     def factory(cfg, *, local_fixture=False):
         return ValidationBackend(cfg, local_fixture=local_fixture)
+
+    # Create a mock WorkerMonitor that returns canned results from cao_client
+    mock_wm = MagicMock(spec=WorkerMonitor)
+    _wm_state = {"current_responses": {}, "default_responses": {}}
+
+    def _start_worker(task_id, stage, profile, prompt, working_directory,
+                      session_name=None, model=None, timeout=None,
+                      stall_timeout=1800, resume_state=None, **kw):
+        import uuid
+        wid = str(uuid.uuid4())
+        return wid
+
+    def _wait_for_stage(task_id, stall_timeout=1800, max_polls=None):
+        # Find the current stage by checking which stage was most recently
+        # mark_running'd (status=RUNNING). If none RUNNING, check PENDING.
+        running_stage = None
+        all_stages = stages.list_stages(task_id)
+        for s in all_stages:
+            if s.status == "RUNNING":
+                running_stage = s.stage
+                break
+        if not running_stage:
+            for s in all_stages:
+                if s.status == "PENDING":
+                    running_stage = s.stage
+                    break
+        if not running_stage:
+            # Infer from state
+            rec = store.get(task_id)
+            state = rec.state if rec else "CREATED"
+            stage_map = {
+                "CREATED": "research", "RESEARCHING": "plan",
+                "PLAN_READY": "implementation", "IMPLEMENTING": "implementation",
+                "LOCAL_VERIFYING": "verification", "LOCAL_VERIFIED": "remote_verification",
+                "REMOTE_VERIFIED": "review", "REVIEWING": "review",
+                "CHANGES_REQUESTED": "fix", "FIXING": "fix",
+                "INCREMENTAL_REVIEWING": "incremental_review",
+            }
+            running_stage = stage_map.get(state, "research")
+        # Map stage names to response keys
+        response_key = running_stage
+        if running_stage == "fix":
+            response_key = "implementation"
+        responses = getattr(cao_client, '_responses', {})
+        msg = responses.get(response_key, '{}')
+        return {
+            "status": "COMPLETED",
+            "last_message": msg if isinstance(msg, str) else '{}',
+            "raw_output": "",
+            "exit_code": 0,
+            "worker_id": "mock-wid",
+        }
+
+    mock_wm.start_worker = _start_worker
+    mock_wm.wait_for_stage = _wait_for_stage
+    mock_wm.find_for_task = MagicMock(return_value=None)
+    mock_wm.peek_worker = MagicMock(return_value=MagicMock(status="COMPLETED", raw_output=""))
+    mock_wm.release_ownership = MagicMock()
+    mock_wm.safe_takeover = MagicMock(return_value=True)
+
     return PolicyGateway(state_store=store, budget=budget, cao_client=cao_client,
-                         stage_store=stages, test_mode=True,
+                         stage_store=stages, worker_monitor=mock_wm,
+                         test_mode=True,
                          backend_factory=factory, local_fixture=local_fixture)
 
 

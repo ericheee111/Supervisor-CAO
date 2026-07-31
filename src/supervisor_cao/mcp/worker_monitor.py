@@ -502,79 +502,76 @@ class WorkerMonitor:
     def _start_cao_worker(self, worker_id, task_id, stage, profile, prompt,
                           working_directory, session_name, model, timeout,
                           run_dir) -> CaoTerminalHandle:
-        """Launch a Codex worker via CAO run-step (teardown=False, non-blocking).
+        """Launch a Codex worker via worker-shim (persistent, no daemon thread).
 
-        We send the run-step request with a long timeout but do NOT wait for
-        completion here — instead we save the terminal_id and let poll_worker
-        read the status. However, CAO's run-step is synchronous (it blocks
-        until the step completes), so we launch it in a background thread and
-        capture the terminal_id from the initial response.
+        The worker-shim runs as an independent process (start_new_session=True)
+        that calls CaoClient.launch_worker (HTTP POST /terminals/run-step)
+        in-process. The shim writes result.json + exit-code + stdout/stderr
+        to persistent files. Controller exit does NOT kill the shim or lose
+        results. No daemon thread is used.
 
-        For Codex, the run-step response includes terminal_id even on timeout,
-        so we use a short initial probe to get the terminal_id, then poll.
+        The terminal_id is read from the result.json file by poll_worker
+        (or from a partial result file written early by the shim).
         """
-        # CAO run-step is blocking; we launch it in a thread and use the
-        # terminal_id from the first response (or the error response which
-        # also includes terminal_id). The thread writes the final result to
-        # a file that poll_worker reads.
-        t = timeout  # may be None → use a very large int for the HTTP call
-        http_timeout = (t if t else 3600) + 180.0
-        result_file = run_dir / f"{stage}-cao-result.json"
-        thread = threading.Thread(
-            target=self._cao_worker_thread,
-            args=(worker_id, task_id, stage, profile, prompt,
-                  working_directory, session_name, model, t, result_file),
-            daemon=True,
-        )
-        thread.start()
-        # Wait briefly for the terminal_id to appear (CAO creates it quickly).
-        # The thread writes a partial result file with terminal_id before
-        # blocking on the HTTP call.
-        deadline = time.time() + 30
-        terminal_id = None
+        stdout_log = str(run_dir / f"{stage}-stdout.log")
+        stderr_log = str(run_dir / f"{stage}-stderr.log")
+        exit_code_file = str(run_dir / f"{stage}-exit.txt")
+        result_file = str(run_dir / f"{stage}-result.json")
+        prompt_file = str(run_dir / f"{stage}-prompt.txt")
+        # Write the prompt to a file (avoids shell escaping issues)
+        Path(prompt_file).write_text(prompt, encoding="utf-8")
+
+        shim = Path(__file__).resolve().parents[3] / "scripts" / "worker-shim"
+        shim_cmd = [
+            sys.executable, str(shim),
+            "--mode", "cao",
+            "--stdout", stdout_log, "--stderr", stderr_log,
+            "--result", result_file, "--exit-code", exit_code_file,
+            "--profile", profile,
+            "--prompt-file", prompt_file,
+            "--working-directory", working_directory,
+            "--session-name", session_name or f"scao-{task_id}",
+            "--task-id", task_id,
+            "--stage", stage,
+            "--run-root", str(self._run_root),
+        ]
+        if model:
+            shim_cmd += ["--model", model]
+        if timeout is not None:
+            shim_cmd += ["--timeout", str(timeout)]
+
+        kwargs: dict[str, Any] = {"cwd": working_directory}
+        if sys.platform == "win32":
+            kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            kwargs["start_new_session"] = True
+        proc = subprocess.Popen(shim_cmd, **kwargs)
+        pid = proc.pid
+        pgid = pid
+        if sys.platform != "win32":
+            try:
+                pgid = os.getpgid(pid)
+            except Exception:
+                pass
+
+        # Wait briefly for the shim to write a partial result file
+        # (signals the shim started; terminal_id will come later in result.json)
+        deadline = time.time() + 10
         while time.time() < deadline:
-            if result_file.exists():
-                try:
-                    partial = json.loads(result_file.read_text())
-                    terminal_id = partial.get("terminal_id")
-                    if terminal_id:
-                        break
-                except Exception:
-                    pass
+            if Path(result_file).exists():
+                break
             time.sleep(0.5)
-        if not terminal_id:
-            # The thread may have failed to start or CAO is slow. Record a
-            # placeholder; poll_worker will detect the failure.
-            terminal_id = f"unknown-{worker_id[:8]}"
+
+        self._log_event(worker_id, "CAO_SHIM_STARTED",
+                        {"pid": pid, "pgid": pgid, "result_file": result_file})
+        # terminal_id will be resolved by poll_worker from result.json.
+        # Use a placeholder that poll_worker knows to check.
+        terminal_id = f"shim-{worker_id[:8]}"
         return CaoTerminalHandle(
             terminal_id=terminal_id,
             session_name=session_name or f"scao-{task_id}",
             provider="codex",
         )
-
-    def _cao_worker_thread(self, worker_id, task_id, stage, profile, prompt,
-                            working_directory, session_name, model, timeout,
-                            result_file):
-        """Background thread that calls CAO run-step and writes the result."""
-        try:
-            # Write partial result with a marker so the launcher can read
-            # terminal_id early (we don't have it yet, so we'll rely on the
-            # error/partial response). For a true non-blocking design, CAO
-            # would need an async run-step; for now we use the blocking call
-            # and rely on terminal_id from the error response on timeout.
-            result = self.cao.launch_worker(
-                profile, prompt, working_directory, session_name, model,
-                timeout, task_id=task_id, stage=stage)
-            data = result.to_dict()
-            data["last_message"] = result.last_message
-            data["raw_output"] = result.raw_output
-            data["success"] = result.success
-            data["terminal_id"] = result.terminal_id
-            data["done"] = True
-            result_file.write_text(json.dumps(data, default=str))
-        except Exception as e:
-            result_file.write_text(json.dumps(
-                {"done": True, "success": False, "error": str(e), "terminal_id": None}))
 
     def _start_process_worker(self, worker_id, task_id, stage, profile, prompt,
                               working_directory, session_name, model, timeout,
@@ -638,31 +635,46 @@ class WorkerMonitor:
         return WorkerStatus(wh.worker_id, H_FAILED, error="unknown handle type")
 
     def _poll_cao(self, wh: WorkerHandle) -> WorkerStatus:
+        """Poll a CAO (Codex) worker launched via worker-shim.
+
+        The shim writes result.json + stdout/stderr to persistent files.
+        We read those files for progress and completion — no daemon thread.
+        """
         tid = wh.cao_handle["terminal_id"]
-        if tid.startswith("unknown-"):
-            # terminal_id not yet known; check result file
+        # shim- prefix: terminal_id not from CAO directly; check result file
+        if tid.startswith("shim-") or tid.startswith("unknown-"):
             return self._check_cao_result_file(wh)
-        ts = self.cao.get_terminal_status(tid)
-        status_str = ts.get("status", "unknown")
-        # Check for result file (the background thread writes it on completion)
+        # If we have a real terminal_id, also check CAO status for progress
         result_status = self._check_cao_result_file(wh)
         if result_status.status == H_COMPLETED:
             return result_status
-        # Read output for progress detection
-        output = self.cao.get_terminal_output(tid, mode="full")
-        output_grew = len(output) > wh.output_offset
-        new_hash = hashlib.md5(output[-2000:].encode()).hexdigest()
+        # Read output for progress detection (from stdout log written by shim)
+        run_dir = self._run_root / wh.task_id
+        stdout_log = run_dir / f"{wh.stage}-stdout.log"
+        output = ""
+        output_grew = False
+        try:
+            if stdout_log.exists():
+                content = stdout_log.read_bytes()
+                output = content.decode("utf-8", errors="replace")
+                output_grew = len(content) > wh.output_offset
+        except Exception:
+            pass
+        new_hash = hashlib.md5(output[-2000:].encode()).hexdigest() if output else ""
         hash_changed = new_hash != wh.output_hash
-        terminal_alive = status_str not in ("error", "unknown", None)
-        processing = status_str == "processing"
-        progress = output_grew or hash_changed or processing
-        if status_str in ("completed", "idle", "waiting_user_answer"):
-            # terminal done; try to extract last_message from result file
-            return self._check_cao_result_file(wh, force_complete=True)
-        if status_str == "error":
-            return WorkerStatus(wh.worker_id, H_FAILED,
-                                error=f"terminal error: {ts.get('error', '')}",
-                                terminal_alive=False)
+        # Also check CAO terminal status if we have a real terminal_id
+        terminal_alive = True  # assume alive until result.json says done
+        try:
+            ts = self.cao.get_terminal_status(tid)
+            status_str = ts.get("status", "unknown")
+            terminal_alive = status_str not in ("error", "unknown", None)
+            if status_str == "error":
+                return WorkerStatus(wh.worker_id, H_FAILED,
+                                    error=f"terminal error: {ts.get('error', '')}",
+                                    terminal_alive=False)
+        except Exception:
+            pass  # CAO may not be reachable; rely on result file
+        progress = output_grew or hash_changed
         return WorkerStatus(wh.worker_id, H_RUNNING,
                             progress_detected=progress,
                             output_grew=output_grew,
@@ -670,9 +682,12 @@ class WorkerMonitor:
 
     def _check_cao_result_file(self, wh: WorkerHandle,
                                force_complete: bool = False) -> WorkerStatus:
-        """Check if the background CAO thread has written the result file."""
+        """Check if the worker-shim has written the result file."""
         run_dir = self._run_root / wh.task_id
-        result_file = run_dir / f"{wh.stage}-cao-result.json"
+        # Support both old (cao-result.json) and new (result.json) naming
+        result_file = run_dir / f"{wh.stage}-result.json"
+        if not result_file.exists():
+            result_file = run_dir / f"{wh.stage}-cao-result.json"
         if not result_file.exists():
             return WorkerStatus(wh.worker_id, H_RUNNING,
                                 progress_detected=False)
