@@ -288,10 +288,13 @@ class TestAcceptanceIsolation:
         accmod._write_meta({"scenarios": {"direct": {"passed": True, "status": "PASS"}}})
         rc = accmod.status()
         assert rc == 1  # not all scenarios run
-        # all three pass -> returns 0
+        # all scenarios pass -> returns 0
         accmod._write_meta({"scenarios": {
             "direct": {"passed": True}, "review-fix": {"passed": True},
-            "resume": {"passed": True}}})
+            "resume": {"passed": True},
+            "runtime-direct": {"passed": True},
+            "runtime-review-fix": {"passed": True},
+            "runtime-resume": {"passed": True}}})
         rc2 = accmod.status()
         assert rc2 == 0
 

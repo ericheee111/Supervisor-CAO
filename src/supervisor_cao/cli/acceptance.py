@@ -29,7 +29,8 @@ from typing import Any
 
 ACCEPTANCE_ROOT = Path.home() / ".local" / "state" / "supervisor-cao" / "acceptance"
 
-SCENARIOS = ("direct", "review-fix", "resume")
+SCENARIOS = ("direct", "review-fix", "resume",
+             "runtime-direct", "runtime-review-fix", "runtime-resume")
 
 
 def _subdir(name: str) -> Path:
@@ -152,8 +153,16 @@ def run_scenario(scenario: str) -> int:
             ok, evidence = _run_direct(dirs, meta)
         elif scenario == "review-fix":
             ok, evidence = _run_review_fix(dirs, meta)
-        else:
+        elif scenario == "resume":
             ok, evidence = _run_resume(dirs, meta)
+        elif scenario == "runtime-direct":
+            ok, evidence = _run_runtime_direct(dirs, meta)
+        elif scenario == "runtime-review-fix":
+            ok, evidence = _run_runtime_review_fix(dirs, meta)
+        elif scenario == "runtime-resume":
+            ok, evidence = _run_runtime_resume(dirs, meta)
+        else:
+            raise ValueError(f"unknown scenario: {scenario}")
         result["status"] = "PASS" if ok else "FAIL"
         result["passed"] = ok
         result["evidence"] = evidence
@@ -674,3 +683,212 @@ def _repo_full(repo_dir: str) -> str:
         if url.startswith("git@"):
             return url.split(":")[1].replace(".git", "")
     return ""
+
+
+# ---------------------------------------------------------------------------
+# Runtime acceptance scenarios (real cao-server, no fake/mock)
+# repo path passed via --repo CLI param (not hardcoded)
+# ---------------------------------------------------------------------------
+
+def _run_runtime_direct(dirs: dict[str, Path], meta: dict) -> tuple[bool, dict]:
+    """runtime-direct: real task through the pipeline, APPROVED is success.
+
+    Uses real cao-server Workers (no fake CaoClient, no local_fixture).
+    Repo path from meta["repo_dir"] (passed via --repo CLI param).
+    """
+    if not _check_cao_server():
+        print("  SKIP: cao-server not running (start with 'supervisor-cao up')")
+        return False, {"error": "cao-server not running"}
+    repo_dir = meta["repo_dir"]
+    subprocess.run(["git", "-C", repo_dir, "reset", "--hard", "origin/main"],
+                   capture_output=True, timeout=30)
+    subprocess.run(["git", "-C", repo_dir, "clean", "-fd"], capture_output=True, timeout=30)
+    cfg = _make_project_config(repo_dir, dirs,
+                               acceptance_run_id=f"rt-direct/{int(time.time())}")
+    cfg.remote_verification_mode = "disabled"  # no remote pool in runtime test
+    gw, store, budget, stages = _build_gateway(dirs, cfg, test_mode=False)
+    task_id = f"rt-direct-{int(time.time())}"
+    print(f"  task: {task_id}")
+    gw.save_config_snapshot(task_id, cfg)
+    gw.create_task(task_id, "acceptance",
+                   "Implement a function parse_duration(s) in src/scao_live/duration.py "
+                   "that parses a duration string like '500ms', '2s', '3m', '1h' into "
+                   "milliseconds (int). Examples: parse_duration('500ms')==500, "
+                   "parse_duration('2s')==2000, parse_duration('3m')==180000, "
+                   "parse_duration('1h')==3600000. Add tests tests/test_duration.py.",
+                   baseline_sha=None)
+    # Runtime terminal: APPROVED is success
+    from supervisor_cao.state.machine import TaskState
+    terminal = {TaskState.APPROVED.value, TaskState.FAILED.value, TaskState.NEEDS_HUMAN.value}
+    rec = _drive_to_runtime_terminal(gw, task_id, store, terminal)
+    evidence = _collect_evidence(task_id, store, budget, stages, dirs)
+    evidence["final_state"] = rec["state"]
+    ok = rec["state"] == TaskState.APPROVED.value
+    # Write append-only evidence
+    run_id = f"{int(time.time())}-rt-direct"
+    ev_dir = _evidence_dir(ACCEPTANCE_ROOT, "runtime-direct", run_id)
+    _record_evidence(ev_dir, result={"passed": ok},
+                     task_snapshot=rec, events=store.events(task_id),
+                     stage_attempts=[s.to_dict() for s in stages.list_stages(task_id)],
+                     budget_log=budget.summary(task_id),
+                     worker_handles=[],
+                     sha_info={"candidate": rec.get("candidate_sha"),
+                               "tested": rec.get("tested_sha"),
+                               "reviewed": rec.get("reviewed_sha")},
+                     pr_content_info={})
+    evidence["evidence_path"] = str(ev_dir)
+    return ok, evidence
+
+
+def _run_runtime_review_fix(dirs: dict[str, Path], meta: dict) -> tuple[bool, dict]:
+    """runtime-review-fix: real defect → CHANGES_REQUESTED → fix → APPROVED."""
+    if not _check_cao_server():
+        print("  SKIP: cao-server not running")
+        return False, {"error": "cao-server not running"}
+    repo_dir = meta["repo_dir"]
+    subprocess.run(["git", "-C", repo_dir, "reset", "--hard", "origin/main"],
+                   capture_output=True, timeout=30)
+    subprocess.run(["git", "-C", repo_dir, "clean", "-fd"], capture_output=True, timeout=30)
+    # Inject a real defect: off-by-one in a simple function
+    src_dir = Path(repo_dir) / "src" / "scao_live"
+    src_dir.mkdir(parents=True, exist_ok=True)
+    (src_dir / "math_utils.py").write_text(
+        "def add_one(n):\n"
+        "    \"\"\"Add one to n. Has an off-by-one bug (returns n instead of n+1).\"\"\"\n"
+        "    return n  # BUG: should be n + 1\n"
+    )
+    (Path(repo_dir) / "tests" / "test_math_utils.py").write_text(
+        "from scao_live.math_utils import add_one\n\n"
+        "def test_add_one():\n"
+        "    assert add_one(5) == 6\n\n"
+        "def test_add_one_zero():\n"
+        "    assert add_one(0) == 1\n"
+    )
+    subprocess.run(["git", "-C", repo_dir, "add", "-A"], capture_output=True, timeout=30)
+    subprocess.run(["git", "-C", repo_dir, "commit", "-m", "add buggy add_one"],
+                   capture_output=True, timeout=30)
+    cfg = _make_project_config(repo_dir, dirs)
+    cfg.remote_verification_mode = "disabled"
+    gw, store, budget, stages = _build_gateway(dirs, cfg)
+    task_id = f"rt-rfix-{int(time.time())}"
+    print(f"  task: {task_id}")
+    gw.save_config_snapshot(task_id, cfg)
+    gw.create_task(task_id, "acceptance",
+                   "Fix the bug in src/scao_live/math_utils.py: add_one should return n+1, "
+                   "not n. Run tests to verify.",
+                   baseline_sha=None)
+    from supervisor_cao.state.machine import TaskState
+    terminal = {TaskState.APPROVED.value, TaskState.FAILED.value, TaskState.NEEDS_HUMAN.value}
+    rec = _drive_to_runtime_terminal(gw, task_id, store, terminal)
+    evidence = _collect_evidence(task_id, store, budget, stages, dirs)
+    events = store.events(task_id)
+    had_changes_requested = any(e.get("to_state") == "CHANGES_REQUESTED" for e in events)
+    had_fix = any(e.get("to_state") == "FIXING" for e in events)
+    had_incremental = any(e.get("to_state") == "INCREMENTAL_REVIEWING" for e in events)
+    protocol_passed = had_changes_requested and had_fix and had_incremental
+    task_approved = rec["state"] == TaskState.APPROVED.value
+    evidence["protocol_passed"] = protocol_passed
+    evidence["task_approved"] = task_approved
+    evidence["final_state"] = rec["state"]
+    ok = protocol_passed and task_approved
+    run_id = f"{int(time.time())}-rt-rfix"
+    ev_dir = _evidence_dir(ACCEPTANCE_ROOT, "runtime-review-fix", run_id)
+    _record_evidence(ev_dir, result={"passed": ok},
+                     task_snapshot=rec, events=events,
+                     stage_attempts=[s.to_dict() for s in stages.list_stages(task_id)],
+                     budget_log=budget.summary(task_id),
+                     worker_handles=[],
+                     sha_info={"candidate": rec.get("candidate_sha")},
+                     pr_content_info={"protocol_passed": protocol_passed,
+                                      "task_approved": task_approved})
+    evidence["evidence_path"] = str(ev_dir)
+    return ok, evidence
+
+
+def _run_runtime_resume(dirs: dict[str, Path], meta: dict) -> tuple[bool, dict]:
+    """runtime-resume: real controller restart + Worker reattach."""
+    if not _check_cao_server():
+        print("  SKIP: cao-server not running")
+        return False, {"error": "cao-server not running"}
+    repo_dir = meta["repo_dir"]
+    subprocess.run(["git", "-C", repo_dir, "reset", "--hard", "origin/main"],
+                   capture_output=True, timeout=30)
+    subprocess.run(["git", "-C", repo_dir, "clean", "-fd"], capture_output=True, timeout=30)
+    cfg = _make_project_config(repo_dir, dirs)
+    cfg.remote_verification_mode = "disabled"
+    gw, store, budget, stages = _build_gateway(dirs, cfg)
+    task_id = f"rt-resume-{int(time.time())}"
+    print(f"  task: {task_id}")
+    gw.save_config_snapshot(task_id, cfg)
+    gw.create_task(task_id, "acceptance",
+                   "Implement a function capitalize_words(s) in src/scao_live/text.py "
+                   "that capitalizes the first letter of each word. Add a test.",
+                   baseline_sha=None)
+    from supervisor_cao.state.machine import TaskState
+    terminal = {TaskState.APPROVED.value, TaskState.FAILED.value, TaskState.NEEDS_HUMAN.value}
+    # Drive 2 stages, then "interrupt" (build new gateway = controller restart)
+    for i in range(1, 3):
+        rec = gw.get_task(task_id)
+        if rec["state"] in terminal:
+            break
+        print(f"  [pre-interrupt stage {i}] {rec['state']} -> run_next_stage ...")
+        rec = gw.run_next_stage(task_id)
+        print(f"    state={rec['state']}")
+    budget_before = budget.summary(task_id)
+    stages_before = [s.to_dict() for s in stages.list_stages(task_id)]
+    print(f"  === INTERRUPT (controller restart) === budget={budget_before}")
+    # Build new gateway (simulates controller restart, reuses same SQLite)
+    gw2, store2, budget2, stages2 = _build_gateway(dirs, cfg)
+    # Safe takeover
+    wh = gw2.worker_monitor.find_for_task(task_id)
+    if wh:
+        gw2.worker_monitor.safe_takeover(wh.worker_id)
+    rec = _drive_to_runtime_terminal(gw2, task_id, store2, terminal)
+    budget_after = budget2.summary(task_id)
+    stages_after = [s.to_dict() for s in stages2.list_stages(task_id)]
+    evidence = _collect_evidence(task_id, store2, budget2, stages2, dirs)
+    # Strict assertions: budget ==, stage attempt ==, no duplicate
+    budget_before_used = budget_before.get("total_used", 0)
+    budget_after_used = budget_after.get("total_used", 0)
+    budget_ok = budget_after_used == budget_before_used
+    # completed stages before should still be completed after (not re-run)
+    before_map = {s["stage"]: s for s in stages_before if s.get("status") == "COMPLETED"}
+    after_map = {s["stage"]: s for s in stages_after if s.get("status") == "COMPLETED"}
+    stages_ok = True
+    for stage_name, before_s in before_map.items():
+        if stage_name in after_map:
+            after_s = after_map[stage_name]
+            if after_s.get("attempt", 0) > before_s.get("attempt", 0):
+                stages_ok = False
+    evidence["budget_before"] = budget_before
+    evidence["budget_after"] = budget_after
+    evidence["budget_ok"] = budget_ok
+    evidence["stages_ok"] = stages_ok
+    evidence["final_state"] = rec["state"]
+    ok = (rec["state"] == TaskState.APPROVED.value and budget_ok and stages_ok)
+    run_id = f"{int(time.time())}-rt-resume"
+    ev_dir = _evidence_dir(ACCEPTANCE_ROOT, "runtime-resume", run_id)
+    _record_evidence(ev_dir, result={"passed": ok},
+                     task_snapshot=rec, events=store2.events(task_id),
+                     stage_attempts=stages_after,
+                     budget_log=budget_after,
+                     worker_handles=[],
+                     sha_info={"candidate": rec.get("candidate_sha")},
+                     pr_content_info={"budget_ok": budget_ok, "stages_ok": stages_ok})
+    evidence["evidence_path"] = str(ev_dir)
+    return ok, evidence
+
+
+def _drive_to_runtime_terminal(gw, task_id: str, store, terminal: set,
+                               max_stages: int = 40) -> dict:
+    """Drive run_next_stage until runtime terminal (APPROVED/FAILED/NEEDS_HUMAN)."""
+    for i in range(1, max_stages + 1):
+        rec = gw.get_task(task_id)
+        if rec["state"] in terminal:
+            break
+        print(f"  [stage {i}] {rec['state']} -> run_next_stage ...")
+        rec = gw.run_next_stage(task_id)
+        print(f"    state={rec['state']} cand={rec.get('candidate_sha') or '-'}")
+        if rec["state"] in terminal:
+            break
+    return gw.get_task(task_id)

@@ -373,10 +373,17 @@ def acceptance_prepare(repo_path, repo_url):
 
 @acceptance.command("run")
 @click.option("--scenario", required=True,
-              type=click.Choice(["direct", "review-fix", "resume"]))
-def acceptance_run(scenario):
+              type=click.Choice(["direct", "review-fix", "resume",
+                                 "runtime-direct", "runtime-review-fix", "runtime-resume"]))
+@click.option("--repo", default=None, help="path to the live test repo (for runtime-* scenarios)")
+def acceptance_run(scenario, repo):
     """Run one acceptance scenario."""
-    from supervisor_cao.cli.acceptance import run_scenario
+    from supervisor_cao.cli.acceptance import run_scenario, _read_meta, _write_meta
+    # For runtime-* scenarios, --repo sets the repo_dir in meta
+    if scenario.startswith("runtime-") and repo:
+        meta = _read_meta() or {}
+        meta["repo_dir"] = repo
+        _write_meta(meta)
     sys.exit(run_scenario(scenario))
 
 
