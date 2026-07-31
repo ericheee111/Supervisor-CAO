@@ -637,9 +637,15 @@ class PolicyGateway:
         self._save_budget_summary(task_id)
         # Override reviewed_sha with the authoritative tested_sha (the LLM
         # may output an incorrect reviewed_sha; the platform stamps the
-        # correct one from the state machine).
+        # correct one from the state machine). Update BOTH the incremental
+        # review artifact AND the main review.json (create-draft-pr reads
+        # review.json).
         review["reviewed_sha"] = rec.tested_sha
         (run_dir / "incremental_review.json").write_text(json.dumps(review, indent=2))
+        # Also update review.json with the authoritative reviewed_sha
+        review_main = self.get_artifact(task_id, "review") or {}
+        review_main["reviewed_sha"] = rec.tested_sha
+        (run_dir / "review.json").write_text(json.dumps(review_main, indent=2))
         self._apply_incremental_decision(task_id, rec, review)
 
     def _stage_draft_pr(self, task_id, rec, cfg, run_dir):
