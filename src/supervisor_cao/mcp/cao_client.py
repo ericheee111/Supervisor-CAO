@@ -355,11 +355,13 @@ class CaoClient:
                                 initial_message: str,
                                 max_wait: int = 300,
                                 poll_interval: int = 5) -> str:
-        """Poll terminal status until it's no longer 'processing'.
+        """Poll terminal status until it's no longer 'processing' AND output
+        contains a JSON object (or max_wait elapsed).
 
         CAO's run-step may return 200 early (on Codex's first step-finish
-        with reason="tool-calls") while Codex is still running. This method
-        polls GET /terminals/{id} until status is not 'processing', then
+        with reason="tool-calls") while Codex is still running. CAO may also
+        mark the terminal as 'completed' prematurely. This method waits until
+        the output contains a '{' followed by '}' (indicating JSON), then
         uses _fallback_extract to get the clean agent output.
         """
         import time as _time
@@ -369,13 +371,17 @@ class CaoClient:
             try:
                 ts = self.get_terminal_status(terminal_id)
                 status = ts.get("status", "unknown")
-                if status in ("completed", "idle", "waiting_user_answer", "error", "unknown"):
-                    # Terminal is done — use fallback to extract clean agent output
-                    fb = self._fallback_extract(terminal_id)
-                    if fb and len(fb) > 0:
-                        last_output = fb
+                # Even if 'completed', check if output has JSON yet
+                fb = self._fallback_extract(terminal_id)
+                if fb and len(fb) > len(last_output):
+                    last_output = fb
+                # Check if we have a JSON object in the output
+                if "{" in last_output and "}" in last_output:
                     break
-                # Still processing — keep waiting
+                # If terminal is truly done (error/unknown) and no JSON, stop
+                if status in ("error", "unknown"):
+                    break
+                # Still processing or completed-but-no-JSON: keep waiting
             except Exception:
                 pass
             _time.sleep(poll_interval)
