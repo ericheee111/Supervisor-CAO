@@ -44,7 +44,8 @@ class TaskState(str, Enum):
     FIXING = "FIXING"
     INCREMENTAL_REVIEWING = "INCREMENTAL_REVIEWING"
     APPROVED = "APPROVED"
-    DRAFT_PR_CREATED = "DRAFT_PR_CREATED"
+    PR_CONTENT_READY = "PR_CONTENT_READY"
+    DRAFT_PR_CREATED = "DRAFT_PR_CREATED"  # legacy, retained for decode only
     WINDOWS_SYNCED = "WINDOWS_SYNCED"
     READY_FOR_HUMAN_REVIEW = "READY_FOR_HUMAN_REVIEW"
     # Terminal / paused
@@ -62,6 +63,7 @@ class ErrorState(str, Enum):
     NO_PROGRESS = "NO_PROGRESS"
     WINDOWS_SYNC_BLOCKED = "WINDOWS_SYNC_BLOCKED"
     PR_CREATION_FAILED = "PR_CREATION_FAILED"
+    PR_CONTENT_GENERATION_FAILED = "PR_CONTENT_GENERATION_FAILED"
     MODEL_CONFIG_INVALID = "MODEL_CONFIG_INVALID"
     CAO_PROVIDER_INCOMPATIBLE = "CAO_PROVIDER_INCOMPATIBLE"
 
@@ -86,8 +88,10 @@ TRANSITIONS: dict[TaskState, set[TaskState]] = {
     # FIXING returns to LOCAL_VERIFYING for mandatory re-verification (spec §9).
     TaskState.FIXING: {TaskState.LOCAL_VERIFYING, TaskState.FAILED, TaskState.NEEDS_HUMAN},
     TaskState.INCREMENTAL_REVIEWING: {TaskState.APPROVED, TaskState.CHANGES_REQUESTED, TaskState.FAILED, TaskState.NEEDS_HUMAN},
-    TaskState.APPROVED: {TaskState.DRAFT_PR_CREATED, TaskState.FAILED},
-    TaskState.DRAFT_PR_CREATED: {TaskState.WINDOWS_SYNCED, TaskState.FAILED, TaskState.READY_FOR_HUMAN_REVIEW},
+    TaskState.APPROVED: {TaskState.PR_CONTENT_READY, TaskState.FAILED},
+    # DRAFT_PR_CREATED retained as legacy terminal-paused (no inbound, no forward).
+    TaskState.DRAFT_PR_CREATED: set(),
+    TaskState.PR_CONTENT_READY: {TaskState.WINDOWS_SYNCED, TaskState.FAILED},
     TaskState.WINDOWS_SYNCED: {TaskState.READY_FOR_HUMAN_REVIEW, TaskState.FAILED},
     TaskState.READY_FOR_HUMAN_REVIEW: set(),  # terminal success
     TaskState.FAILED: {TaskState.NEEDS_HUMAN},  # failed -> human
@@ -127,6 +131,11 @@ class IllegalTransition(Exception):
 
 
 class ShaMismatch(Exception):
+    pass
+
+
+class MigrationError(Exception):
+    """Raised when a legacy state migration cannot complete (e.g. missing artifacts)."""
     pass
 
 
@@ -283,9 +292,9 @@ class StateStore:
             if to_str in (TaskState.APPROVED.value, TaskState.INCREMENTAL_REVIEWING.value) and check_sha:
                 if rec.reviewed_sha is None or rec.reviewed_sha != rec.tested_sha:
                     raise ShaMismatch(f"{to_str} requires reviewed_sha == tested_sha")
-            if to_str == TaskState.DRAFT_PR_CREATED.value and check_sha:
+            if to_str == TaskState.PR_CONTENT_READY.value and check_sha:
                 if rec.reviewed_sha is None or rec.reviewed_sha != rec.candidate_sha:
-                    raise ShaMismatch("DRAFT_PR_CREATED requires reviewed_sha == candidate_sha")
+                    raise ShaMismatch("PR_CONTENT_READY requires reviewed_sha == candidate_sha")
 
             rec.state = to_str
             rec.error = error
@@ -336,3 +345,72 @@ class StateStore:
         with self._lock, self._conn() as c:
             rows = c.execute("SELECT * FROM events WHERE task_id=? ORDER BY id", (task_id,)).fetchall()
         return [dict(r) for r in rows]
+
+    def migrate_legacy_state(self, task_id: str, run_dir: Path,
+                             base_branch: str, head_branch: str) -> TaskRecord:
+        """Lazily migrate a legacy DRAFT_PR_CREATED task to PR_CONTENT_READY.
+
+        Only called from resume_task/advance_task/dedicated migration — NEVER
+        from get_task. If artifacts are incomplete, raises MigrationError (does
+        NOT silently roll back to APPROVED, does NOT fake success).
+        """
+        rec = self.get(task_id)
+        if not rec:
+            raise KeyError(f"task not found: {task_id}")
+        if rec.state != TaskState.DRAFT_PR_CREATED.value:
+            return rec  # not legacy, nothing to do
+        run_dir = Path(run_dir)
+        required = ["plan.json", "implementation.json", "verification.json",
+                    "review.json", "codex-budget-summary.json", "push.json"]
+        missing = [f for f in required if not (run_dir / f).exists()]
+        if missing:
+            detail = {"missing": missing, "reason": "legacy_migration_artifacts_incomplete"}
+            self.transition(task_id, TaskState.NEEDS_HUMAN,
+                            error="LEGACY_MIGRATION_INCOMPLETE", detail=detail)
+            raise MigrationError(f"legacy migration incomplete: missing {missing}")
+        # Single transaction: generate content package + transition
+        from supervisor_cao.pr_content.renderer import render_pr_content
+        artifacts = {n: json.loads((run_dir / f).read_text(encoding="utf-8"))
+                     for n, f in [("plan", "plan.json"),
+                                  ("implementation", "implementation.json"),
+                                  ("verification", "verification.json"),
+                                  ("review", "review.json"),
+                                  ("budget", "codex-budget-summary.json")]}
+        push = json.loads((run_dir / "push.json").read_text(encoding="utf-8"))
+        json_text, md_text, sha_text = render_pr_content(
+            artifacts, task_id, base_branch, head_branch, push)
+        (run_dir / "pr-content.json").write_text(json_text, encoding="utf-8")
+        (run_dir / "pr-content.md").write_text(md_text, encoding="utf-8")
+        (run_dir / "pr-content.sha256").write_text(sha_text, encoding="utf-8")
+        with self._lock, self._conn() as c:
+            c.execute("UPDATE tasks SET state=?, updated_at=? WHERE task_id=?",
+                      (TaskState.PR_CONTENT_READY.value, time.time(), task_id))
+            self._log_event(c, task_id, "LEGACY_STATE_MIGRATED",
+                            TaskState.DRAFT_PR_CREATED.value,
+                            TaskState.PR_CONTENT_READY.value,
+                            {"task_id": task_id})
+            c.commit()
+        return self.get(task_id)
+
+    def inject_candidate(self, task_id: str, new_sha: str,
+                         from_state: TaskState) -> TaskRecord:
+        """ACCEPTANCE ONLY: inject a controlled candidate for review-fix testing.
+
+        This is an audited entry point — NOT for production use. It records a
+        controlled_candidate_injection event and clears tested/reviewed SHAs
+        (the new candidate has not been tested or reviewed yet).
+        """
+        with self._lock, self._conn() as c:
+            row = c.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+            if not row:
+                raise KeyError(f"task not found: {task_id}")
+            from_str = row["state"]
+            c.execute(
+                "UPDATE tasks SET candidate_sha=?, tested_sha=NULL, reviewed_sha=NULL, "
+                "state=?, updated_at=? WHERE task_id=?",
+                (new_sha, from_state.value, time.time(), task_id))
+            self._log_event(c, task_id, "CONTROLLED_CANDIDATE_INJECTION",
+                            from_str, from_state.value,
+                            {"new_sha": new_sha, "reason": "acceptance_review_fix"})
+            c.commit()
+        return self.get(task_id)

@@ -189,7 +189,7 @@ def test_full_happy_path_with_budget(store, budget, task):
     # full review (codex 2/4)
     b.spend("T1", "full_review", input_artifact="verification.json", candidate_sha="c1")
     s.transition("T1", TaskState.APPROVED)
-    s.transition("T1", TaskState.DRAFT_PR_CREATED)
+    s.transition("T1", TaskState.PR_CONTENT_READY)
     s.transition("T1", TaskState.WINDOWS_SYNCED)
     r = s.transition("T1", TaskState.READY_FOR_HUMAN_REVIEW)
     assert r.state == TaskState.READY_FOR_HUMAN_REVIEW.value

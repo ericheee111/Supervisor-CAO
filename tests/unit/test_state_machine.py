@@ -131,10 +131,111 @@ def test_full_happy_path_with_sha(store, task):
     s.transition("T1", TaskState.REMOTE_VERIFIED)
     s.transition("T1", TaskState.REVIEWING, reviewed_sha="c1")
     s.transition("T1", TaskState.APPROVED)
-    s.transition("T1", TaskState.DRAFT_PR_CREATED)
+    s.transition("T1", TaskState.PR_CONTENT_READY)
     s.transition("T1", TaskState.WINDOWS_SYNCED)
     r = s.transition("T1", TaskState.READY_FOR_HUMAN_REVIEW)
     assert r.state == TaskState.READY_FOR_HUMAN_REVIEW.value
+
+
+# --- PR_CONTENT_READY (forge-agnostic handoff) ---
+
+def _drive_to_approved(store, task_id="T1", sha="aaa111"):
+    """Helper: drive a task through the happy path to APPROVED with SHAs set."""
+    s = store
+    for st in [TaskState.RESEARCHING, TaskState.PLANNING, TaskState.PLAN_READY,
+               TaskState.IMPLEMENTING]:
+        s.transition(task_id, st)
+    s.transition(task_id, TaskState.IMPLEMENTED, new_candidate_sha=sha)
+    s.transition(task_id, TaskState.LOCAL_VERIFYING)
+    s.transition(task_id, TaskState.LOCAL_VERIFIED, tested_sha=sha)
+    s.transition(task_id, TaskState.REMOTE_QUEUED)
+    s.transition(task_id, TaskState.REMOTE_VERIFYING)
+    s.transition(task_id, TaskState.REMOTE_VERIFIED)
+    s.transition(task_id, TaskState.REVIEWING, reviewed_sha=sha)
+    return s.transition(task_id, TaskState.APPROVED)
+
+
+def test_approved_to_pr_content_ready_legal(store, task):
+    """APPROVED -> PR_CONTENT_READY is a legal transition."""
+    _drive_to_approved(store)
+    r = store.transition("T1", TaskState.PR_CONTENT_READY)
+    assert r.state == TaskState.PR_CONTENT_READY.value
+
+
+def test_pr_content_ready_to_windows_synced_legal(store, task):
+    _drive_to_approved(store)
+    store.transition("T1", TaskState.PR_CONTENT_READY)
+    r = store.transition("T1", TaskState.WINDOWS_SYNCED)
+    assert r.state == TaskState.WINDOWS_SYNCED.value
+
+
+def test_pr_content_ready_cannot_skip_windows_sync(store, task):
+    """PR_CONTENT_READY -> READY_FOR_HUMAN_REVIEW is illegal (must sync first)."""
+    _drive_to_approved(store)
+    store.transition("T1", TaskState.PR_CONTENT_READY)
+    with pytest.raises(IllegalTransition):
+        store.transition("T1", TaskState.READY_FOR_HUMAN_REVIEW)
+
+
+def test_new_task_cannot_enter_draft_pr_created(store, task):
+    """DRAFT_PR_CREATED has no inbound transitions for new tasks."""
+    _drive_to_approved(store)
+    with pytest.raises(IllegalTransition):
+        store.transition("T1", TaskState.DRAFT_PR_CREATED)
+
+
+def test_draft_pr_created_is_legacy_terminal(store, task, tmp_path):
+    """DRAFT_PR_CREATED has no outbound transitions (legacy terminal)."""
+    import sqlite3
+    with sqlite3.connect(str(tmp_path / "tasks.db")) as c:
+        c.execute("UPDATE tasks SET state='DRAFT_PR_CREATED' WHERE task_id='T1'")
+        c.commit()
+    with pytest.raises(IllegalTransition):
+        store.transition("T1", TaskState.WINDOWS_SYNCED)
+    with pytest.raises(IllegalTransition):
+        store.transition("T1", TaskState.READY_FOR_HUMAN_REVIEW)
+
+
+def test_get_task_does_not_migrate_legacy(store, task, tmp_path):
+    """get_task must NOT modify DB state (no lazy migration on read)."""
+    import sqlite3
+    with sqlite3.connect(str(tmp_path / "tasks.db")) as c:
+        c.execute("UPDATE tasks SET state='DRAFT_PR_CREATED' WHERE task_id='T1'")
+        c.commit()
+    rec = store.get("T1")
+    assert rec.state == "DRAFT_PR_CREATED"  # unchanged
+
+
+def test_pr_content_ready_requires_reviewed_eq_candidate(store, task):
+    """PR_CONTENT_READY requires reviewed_sha == candidate_sha."""
+    _drive_to_approved(store, sha="c1")
+    # manually break the SHA equality
+    import sqlite3
+    with sqlite3.connect(str(store._db)) as c:
+        c.execute("UPDATE tasks SET state='APPROVED', candidate_sha='c2', "
+                  "reviewed_sha='c1' WHERE task_id='T1'")
+        c.commit()
+    with pytest.raises(ShaMismatch):
+        store.transition("T1", TaskState.PR_CONTENT_READY)
+
+
+def test_inject_candidate_clears_tested_reviewed(store, task):
+    """inject_candidate sets new SHA and clears tested/reviewed (audited)."""
+    s = store
+    s.transition("T1", TaskState.RESEARCHING)
+    s.transition("T1", TaskState.PLANNING)
+    s.transition("T1", TaskState.PLAN_READY)
+    s.transition("T1", TaskState.IMPLEMENTING)
+    s.transition("T1", TaskState.IMPLEMENTED, new_candidate_sha="c1")
+    s.transition("T1", TaskState.LOCAL_VERIFYING)
+    s.transition("T1", TaskState.LOCAL_VERIFIED, tested_sha="c1")
+    rec = store.inject_candidate("T1", "c2", TaskState.LOCAL_VERIFYING)
+    assert rec.candidate_sha == "c2"
+    assert rec.tested_sha is None
+    assert rec.reviewed_sha is None
+    assert rec.state == TaskState.LOCAL_VERIFYING.value
+    events = store.events("T1")
+    assert any(e["event"] == "CONTROLLED_CANDIDATE_INJECTION" for e in events)
 
 
 # --- fix loop requires re-verification ---
