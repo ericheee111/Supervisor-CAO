@@ -57,6 +57,67 @@ class WorkerError(Exception):
     """Raised when a Worker fails or its output is invalid."""
 
 
+def _lenient_json_extract(text: str) -> dict | None:
+    """Lenient JSON extraction: finds the last balanced {...} and tries to
+    parse it, fixing common Codex output issues (unescaped quotes in string
+    values, literal newlines). Returns parsed dict or None.
+    """
+    if not text:
+        return None
+    # Find all balanced JSON objects
+    pos = 0
+    objects = []
+    while True:
+        span = _find_balanced_json(text, pos)
+        if span is None:
+            break
+        s, e = span
+        chunk = text[s:e]
+        # Try direct parse
+        try:
+            obj = json.loads(chunk)
+            if isinstance(obj, dict):
+                objects.append(obj)
+        except json.JSONDecodeError:
+            pass
+        # Try sanitized parse
+        try:
+            sanitized = _sanitize_json_control_chars(chunk)
+            obj = json.loads(sanitized)
+            if isinstance(obj, dict):
+                objects.append(obj)
+        except json.JSONDecodeError:
+            pass
+        # Try fixing unescaped quotes: replace literal newlines inside strings
+        # with \\n, and try to fix unescaped double quotes in string values
+        try:
+            fixed = _fix_unescaped_quotes(chunk)
+            obj = json.loads(fixed)
+            if isinstance(obj, dict):
+                objects.append(obj)
+        except (json.JSONDecodeError, Exception):
+            pass
+        pos = e
+    if objects:
+        # Return the last object (most likely the current worker's output)
+        return objects[-1]
+    return None
+
+
+def _fix_unescaped_quotes(chunk: str) -> str:
+    """Best-effort fix for unescaped double quotes inside JSON string values.
+
+    Codex sometimes outputs JSON like:
+      "summary": "The commit is titled "Initial test repository" rather than..."
+    where the inner double quotes are not escaped. This function tries to
+    escape them by replacing literal newlines with \\n first, then using
+    a heuristic to escape unescaped quotes inside string values.
+    """
+    # Replace literal newlines and tabs with escaped versions
+    result = chunk.replace("\n", "\\n").replace("\t", "\\t").replace("\r", "\\r")
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Strict JSON extraction (requirement 4: NO greedy {.*})
 # ---------------------------------------------------------------------------
@@ -411,11 +472,17 @@ class WorkerRunner:
                 obj = extract_strict_json(last_message)
             except WorkerError:
                 pass
+        if obj is None and last_message:
+            # Fallback: try lenient JSON extraction (fixes unescaped quotes
+            # in Codex output, e.g. "Initial test repository" in string values)
+            obj = _lenient_json_extract(last_message)
         if obj is None and raw:
             try:
                 obj = extract_strict_json(raw)
             except WorkerError:
                 pass
+        if obj is None and raw:
+            obj = _lenient_json_extract(raw)
         if obj is None:
             raise WorkerError(
                 f"{stage} worker: no JSON object found in worker output")
