@@ -165,7 +165,9 @@ def test_windows_blocked_when_not_approved(tmp_path):
     subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
     subprocess.run(["git", "-C", str(repo), "commit", "-qm", "i"], check=True)
     with pytest.raises(WindowsSyncBlocked):
-        win_sync(str(repo), "agent/T1", "c1", "c1", "c1", False, True)
+        win_sync(str(repo), "agent/T1", "c1", "c1", "c1", False,
+                 run_dir=str(tmp_path), task_id="T1",
+                 base_branch="main", head_branch="agent/T1")
 
 
 # --- Full happy path with budget ---
