@@ -183,9 +183,17 @@ class CaoClient:
         Emits newline-delimited JSON events; the final assistant message event
         carries the model's text. Reliable for structured JSON output (no TUI
         capture corruption).
+
+        ``timeout=None`` means no total time limit (R4: progress-based monitoring).
+        A very large subprocess timeout is used as a safety upper bound so the
+        process is not killed prematurely; the WorkerMonitor handles stall
+        detection via progress indicators.
         """
         import subprocess
-        t = timeout or self.default_timeout
+        # timeout=None means no total limit; use a large safety bound (24h)
+        # so subprocess.run does not kill the worker prematurely. The
+        # WorkerMonitor handles stall detection via progress indicators.
+        t = timeout if timeout is not None else 86400
         model_arg = model or _profile_model(profile)
         cmd = ["opencode", "run", "--format", "json", "--agent", profile]
         if model_arg:
@@ -222,7 +230,10 @@ class CaoClient:
         completion, and returns the agent's last_message. On timeout, retries
         once (reusing the terminal) then falls back to raw-output parsing.
         """
-        t = timeout or self.default_timeout
+        # timeout=None means no total limit (R4). Use a large safety bound
+        # so the HTTP request does not time out prematurely. The WorkerMonitor
+        # handles stall detection via progress indicators.
+        t = timeout if timeout is not None else 86400
         provider = self.provider_for(profile)
         payload: dict[str, Any] = {
             "provider": provider,
