@@ -664,12 +664,15 @@ class PolicyGateway:
         # may output an incorrect reviewed_sha; the platform stamps the
         # correct one from the state machine). Update BOTH the incremental
         # review artifact AND the main review.json (create-draft-pr reads
-        # review.json).
+        # review.json). Also sync the decision so create-draft-pr sees the
+        # final incremental decision (APPROVED), not the stale original.
         review["reviewed_sha"] = rec.tested_sha
         (run_dir / "incremental_review.json").write_text(json.dumps(review, indent=2))
-        # Also update review.json with the authoritative reviewed_sha
+        # Also update review.json with the authoritative reviewed_sha + decision
         review_main = self.get_artifact(task_id, "review") or {}
         review_main["reviewed_sha"] = rec.tested_sha
+        review_main["decision"] = review.get("decision", review_main.get("decision"))
+        review_main["findings"] = review.get("findings", review_main.get("findings", []))
         (run_dir / "review.json").write_text(json.dumps(review_main, indent=2))
         self._apply_incremental_decision(task_id, rec, review)
 
