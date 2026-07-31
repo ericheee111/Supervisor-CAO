@@ -570,10 +570,21 @@ class WorkerRunner:
             cwd_hint += "Only read and modify files within this directory. "
             cwd_hint += "Do NOT explore or modify files outside this directory. "
             cwd_hint += "Use relative paths or paths within your working directory.\n\n"
+        findings_hint = ""
+        prior_findings = plan.get("_prior_review_findings", [])
+        if prior_findings:
+            findings_hint = "PRIOR REVIEW FINDINGS (you MUST fix ALL of these):\n"
+            for f in prior_findings:
+                findings_hint += f"  - {f.get('id', '?')}: {f.get('claim', '?')}\n"
+                findings_hint += f"    Evidence: {f.get('evidence', '?')}\n"
+                findings_hint += f"    Fix direction: {f.get('recommended_direction', '?')}\n"
+            findings_hint += "\nYou MUST modify the code to fix each finding above. "
+            findings_hint += "Do NOT just reformat or make cosmetic changes. "
+            findings_hint += "Address the actual correctness/safety issues identified.\n\n"
         return (
             f"You are the GLM Executor. Implement the plan in your worktree.\n"
             f"Base SHA: {base_sha or 'unknown'}\n"
-            + cwd_hint +
+            + cwd_hint + findings_hint +
             f"Plan:\n{steps_text}\n\n"
             "Edit the necessary files, run tests, commit, and push your task branch. "
             "Then output your result as JSON.\n\n"
