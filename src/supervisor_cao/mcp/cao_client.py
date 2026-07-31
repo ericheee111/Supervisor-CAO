@@ -241,7 +241,7 @@ class CaoClient:
         if working_directory.startswith("/mnt/"):
             parts = working_directory[5:].split("/", 1)
             if len(parts) >= 2:
-                win_wd = f"{parts[0].upper()}:\\{parts[1].replace('/', '\\\\')}"
+                win_wd = parts[0].upper() + ":\\" + parts[1].replace("/", "\\")
             elif len(parts) == 1:
                 win_wd = f"{parts[0].upper()}:\\"
         payload: dict[str, Any] = {
