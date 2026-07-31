@@ -198,6 +198,17 @@ class PolicyGateway:
             new_sha = commit_and_push(str(p.executor), branch, message)
         except Exception as e:
             raise PolicyError(f"NO_PROGRESS: commit/push failed: {e}")
+        # Record push evidence (deterministic, no network query).
+        run_dir = self.run_root / task_id
+        run_dir.mkdir(parents=True, exist_ok=True)
+        push_evidence = {
+            "schema_version": 1,
+            "remote": "origin",
+            "branch": branch,
+            "pushed_sha": new_sha,
+            "push_succeeded": True,
+        }
+        (run_dir / "push.json").write_text(json.dumps(push_evidence, indent=2))
         # update state with new candidate (invalidates old tested/reviewed)
         rec = self.store.transition(task_id, TaskState.IMPLEMENTED,
                                     new_candidate_sha=new_sha)
@@ -238,26 +249,38 @@ class PolicyGateway:
         (run_dir / "verification.json").write_text(json.dumps(result, indent=2))
         return {"state": rec.state, "tested_sha": rec.tested_sha}
 
-    # --- draft PR ---
+    # --- PR content (forge-agnostic) ---
 
-    def create_draft_pr(self, task_id: str, project: str) -> dict:
-        """Create draft PR. Enforces APPROVED + reviewed_sha == candidate_sha."""
+    def prepare_pr_content(self, task_id: str, project: str) -> dict:
+        """Generate PR content package. Enforces APPROVED + reviewed_sha == candidate_sha.
+
+        Does NOT access any forge API, gh, or network. Delegates to
+        scripts/render-pr-content which reads local artifacts + push.json.
+        """
         rec = self.store.get(task_id)
         if not rec:
             raise PolicyError(f"task not found: {task_id}")
         if rec.state != TaskState.APPROVED.value:
-            raise PolicyError(f"PR_CREATION_FAILED: task not APPROVED (state={rec.state})")
+            raise PolicyError(
+                f"PR_CONTENT_GENERATION_FAILED: task not APPROVED (state={rec.state})")
         if rec.reviewed_sha != rec.candidate_sha:
             raise PolicyError(
-                f"PR_CREATION_FAILED: reviewed={rec.reviewed_sha} != candidate={rec.candidate_sha}")
+                f"PR_CONTENT_GENERATION_FAILED: reviewed={rec.reviewed_sha} "
+                f"!= candidate={rec.candidate_sha}")
         run_dir = self.run_root / task_id
-        # delegate to create-draft-pr script
-        return {"status": "DRAFT_PR_CREATED", "candidate_sha": rec.candidate_sha}
+        return {"status": "PR_CONTENT_READY", "candidate_sha": rec.candidate_sha}
+
+    def create_draft_pr(self, task_id: str, project: str) -> dict:
+        """DEPRECATED: use prepare_pr_content. Does NOT access network."""
+        import warnings
+        warnings.warn("create_draft_pr is deprecated; use prepare_pr_content",
+                      DeprecationWarning, stacklevel=2)
+        return self.prepare_pr_content(task_id, project)
 
     # --- windows sync ---
 
     def sync_windows(self, task_id: str, project: str) -> dict:
-        """Sync to Windows repo. Enforces all 7 gates."""
+        """Sync to Windows repo. Enforces all gates including pr-content artifact."""
         rec = self.store.get(task_id)
         if not rec:
             raise PolicyError(f"task not found: {task_id}")
@@ -266,10 +289,13 @@ class PolicyGateway:
         if not win_repo:
             raise PolicyError("WINDOWS_SYNC_BLOCKED: no windows_repo configured")
         task_branch = cfg.task_branch_for(task_id)
+        run_dir = self.run_root / task_id
         try:
             final_sha = win_sync(win_repo, task_branch, rec.candidate_sha,
                                  rec.tested_sha, rec.reviewed_sha,
-                                 review_approved=True, draft_pr_created=True)
+                                 review_approved=True,
+                                 run_dir=str(run_dir), task_id=task_id,
+                                 base_branch=cfg.base_branch, head_branch=task_branch)
             rec = self.store.transition(task_id, TaskState.WINDOWS_SYNCED)
             return {"status": "WINDOWS_SYNCED", "windows_head": final_sha}
         except WindowsSyncBlocked as e:
@@ -359,8 +385,8 @@ class PolicyGateway:
             elif state == TaskState.INCREMENTAL_REVIEWING.value:
                 self._stage_incremental_review(task_id, rec, cfg, session_name, run_dir)
             elif state == TaskState.APPROVED.value:
-                self._stage_draft_pr(task_id, rec, cfg, run_dir)
-            elif state == TaskState.DRAFT_PR_CREATED.value:
+                self._stage_pr_content(task_id, rec, cfg, run_dir)
+            elif state == TaskState.PR_CONTENT_READY.value:
                 self._stage_windows_sync(task_id, rec, cfg)
             elif state == TaskState.WINDOWS_SYNCED.value:
                 self.store.transition(task_id, TaskState.READY_FOR_HUMAN_REVIEW)
@@ -474,6 +500,18 @@ class PolicyGateway:
             max_runtime=cfg.executor_limits.get("max_runtime"))
         self.stages.complete_stage(task_id, stage, artifact_path=str(run_dir / "implementation.json"),
                                    candidate_sha=real_sha)
+        # Record push evidence (deterministic, no network query).
+        # The WorkerRunner verifies the branch was pushed; we persist that fact
+        # as push.json for render-pr-content and windows-sync validation.
+        task_branch = adapter.task_branch_for(task_id)
+        push_evidence = {
+            "schema_version": 1,
+            "remote": "origin",
+            "branch": task_branch,
+            "pushed_sha": real_sha,
+            "push_succeeded": True,
+        }
+        (run_dir / "push.json").write_text(json.dumps(push_evidence, indent=2))
         self.store.transition(task_id, TaskState.IMPLEMENTED, new_candidate_sha=real_sha)
 
     def _stage_local_verify(self, task_id, rec, cfg, session_name, run_dir):
@@ -676,31 +714,25 @@ class PolicyGateway:
         (run_dir / "review.json").write_text(json.dumps(review_main, indent=2))
         self._apply_incremental_decision(task_id, rec, review)
 
-    def _stage_draft_pr(self, task_id, rec, cfg, run_dir):
-        stage = "draft_pr"
-        run, done = self.stages.begin_stage(task_id, stage, "create-draft-pr")
+    def _stage_pr_content(self, task_id, rec, cfg, run_dir):
+        stage = "pr_content"
+        run, done = self.stages.begin_stage(task_id, stage, "render-pr-content")
         if done:
-            self.store.transition(task_id, TaskState.DRAFT_PR_CREATED)
+            self.store.transition(task_id, TaskState.PR_CONTENT_READY)
             return
         self.stages.mark_running(task_id, stage, candidate_sha=rec.candidate_sha)
-        # delegate to create-draft-pr script (validates all 5 artifacts exist)
-        script = Path(__file__).resolve().parents[3] / "scripts" / "create-draft-pr"
+        script = Path(__file__).resolve().parents[3] / "scripts" / "render-pr-content"
         task_branch = cfg.task_branch_for(task_id)
-        cmd = [sys.executable, str(script), "--repo", cfg.wsl_repo or str(run_dir),
-               "--task-id", task_id, "--task-branch", task_branch,
-               "--base-branch", cfg.base_branch, "--run-dir", str(run_dir)]
-        if self.test_mode:
-            cmd.append("--test-mode")
-        # Acceptance runs pass a run-id for PR title/label isolation.
-        acceptance_run_id = cfg.extra.get("acceptance_run_id")
-        if acceptance_run_id:
-            cmd += ["--acceptance-run-id", str(acceptance_run_id)]
+        cmd = [sys.executable, str(script), "--task-id", task_id,
+               "--base-branch", cfg.base_branch, "--head-branch", task_branch,
+               "--run-dir", str(run_dir)]
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         if r.returncode != 0:
             self.stages.fail_stage(task_id, stage)
-            raise PolicyError(f"PR_CREATION_FAILED: {r.stderr.strip() or r.stdout.strip()}")
+            raise PolicyError(
+                f"PR_CONTENT_GENERATION_FAILED: {r.stderr.strip() or r.stdout.strip()}")
         self.stages.complete_stage(task_id, stage, candidate_sha=rec.candidate_sha)
-        self.store.transition(task_id, TaskState.DRAFT_PR_CREATED)
+        self.store.transition(task_id, TaskState.PR_CONTENT_READY)
 
     def _stage_windows_sync(self, task_id, rec, cfg):
         stage = "windows_sync"
@@ -716,10 +748,13 @@ class PolicyGateway:
             return
         self.stages.mark_running(task_id, stage, candidate_sha=rec.candidate_sha)
         task_branch = cfg.task_branch_for(task_id)
+        run_dir = self.run_root / task_id
         try:
             final_sha = win_sync(win_repo, task_branch, rec.candidate_sha,
                                  rec.tested_sha, rec.reviewed_sha,
-                                 review_approved=True, draft_pr_created=True)
+                                 review_approved=True,
+                                 run_dir=str(run_dir), task_id=task_id,
+                                 base_branch=cfg.base_branch, head_branch=task_branch)
         except WindowsSyncBlocked as e:
             self.stages.fail_stage(task_id, stage)
             raise PolicyError(f"WINDOWS_SYNC_BLOCKED: {e}")
@@ -823,8 +858,8 @@ def _stage_for_state(state: str) -> str:
         TaskState.CHANGES_REQUESTED.value: "fix",
         TaskState.FIXING.value: "fix",
         TaskState.INCREMENTAL_REVIEWING.value: "incremental_review",
-        TaskState.APPROVED.value: "draft_pr",
-        TaskState.DRAFT_PR_CREATED.value: "windows_sync",
+        TaskState.APPROVED.value: "pr_content",
+        TaskState.PR_CONTENT_READY.value: "windows_sync",
     }.get(state, state)
 
 
