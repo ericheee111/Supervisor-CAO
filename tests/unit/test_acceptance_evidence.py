@@ -149,3 +149,45 @@ def test_direct_fail_when_pr_content_invalid(tmp_path):
                               "direct", "agent/direct")
     assert ok is False
     assert "pr-content" in reason or "pr_content" in reason
+
+
+# --- review-fix scenario pass conditions ---
+
+def test_review_fix_pass_all_conditions(tmp_path):
+    """Main review-fix PASS requires all 4 conditions."""
+    from supervisor_cao.cli.acceptance import _review_fix_pass
+    ev_dir = tmp_path / "ev"
+    _write_valid_pr_content(ev_dir, candidate="c1", task_id="reviewfix",
+                           head_branch="agent/reviewfix")
+    ok, _ = _review_fix_pass(True, True, "READY_FOR_HUMAN_REVIEW", ev_dir,
+                             "c1", "c1", "c1", "reviewfix", "agent/reviewfix")
+    assert ok is True
+
+
+def test_review_fix_fail_when_protocol_not_passed(tmp_path):
+    from supervisor_cao.cli.acceptance import _review_fix_pass
+    ev_dir = tmp_path / "ev"
+    _write_valid_pr_content(ev_dir)
+    ok, reason = _review_fix_pass(False, True, "READY_FOR_HUMAN_REVIEW", ev_dir,
+                                  "c1", "c1", "c1", "reviewfix", "agent/reviewfix")
+    assert ok is False
+    assert "protocol" in reason
+
+
+def test_review_fix_fail_when_needs_human(tmp_path):
+    """Judge NEEDS_HUMAN means task_approved=False -> main scenario does NOT pass."""
+    from supervisor_cao.cli.acceptance import _review_fix_pass
+    ok, reason = _review_fix_pass(True, False, "NEEDS_HUMAN", tmp_path,
+                                  "c1", "c1", "c1", "reviewfix", "agent/reviewfix")
+    assert ok is False
+    assert "approved" in reason or "task_approved" in reason
+
+
+def test_review_fix_fail_when_pr_content_invalid(tmp_path):
+    from supervisor_cao.cli.acceptance import _review_fix_pass
+    ev_dir = tmp_path / "ev"
+    ev_dir.mkdir(parents=True)
+    ok, reason = _review_fix_pass(True, True, "READY_FOR_HUMAN_REVIEW", ev_dir,
+                                  "c1", "c1", "c1", "reviewfix", "agent/reviewfix")
+    assert ok is False
+    assert "pr-content" in reason or "pr_content" in reason

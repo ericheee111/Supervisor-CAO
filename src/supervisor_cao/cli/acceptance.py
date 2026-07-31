@@ -374,6 +374,33 @@ def _direct_pass(final_state, candidate, tested, reviewed, ev_dir: Path,
     return True, "ok"
 
 
+def _review_fix_pass(protocol_passed: bool, task_approved: bool, final_state: str,
+                     ev_dir: Path, candidate: str, tested: str, reviewed: str,
+                     task_id: str, head_branch: str) -> tuple[bool, str]:
+    """Check review-fix main scenario pass conditions.
+
+    Main PASS requires ALL:
+      - protocol_passed == true (CHANGES_REQUESTED + fix + incremental_review)
+      - task_approved == true (final state == READY_FOR_HUMAN_REVIEW)
+      - final_state == READY_FOR_HUMAN_REVIEW
+      - pr_content_valid == true
+
+    Judge correctly entering NEEDS_HUMAN is a safety sub-scenario (can be
+    recorded separately), but does NOT make the main review-fix scenario pass.
+    """
+    if not protocol_passed:
+        return False, "protocol not passed"
+    if not task_approved:
+        return False, "task not approved (task_approved=False)"
+    if final_state != "READY_FOR_HUMAN_REVIEW":
+        return False, f"final_state={final_state}"
+    from supervisor_cao.validation.windows_sync import validate_pr_content_artifact
+    if not validate_pr_content_artifact(ev_dir, task_id, candidate, tested, reviewed,
+                                        "main", head_branch):
+        return False, "pr-content artifact invalid"
+    return True, "ok"
+
+
 def _run_direct(dirs: dict[str, Path], meta: dict) -> tuple[bool, dict]:
     """direct: real implement + test parse_duration, approved by real Codex Review.
 
@@ -524,15 +551,10 @@ def _run_review_fix(dirs: dict[str, Path], meta: dict) -> tuple[bool, dict]:
                        capture_output=True, timeout=30)
         new_sha = subprocess.run(["git", "-C", wt, "rev-parse", "HEAD"],
                                 capture_output=True, text=True, timeout=15).stdout.strip()
-        # Directly update the candidate_sha in the DB and clear tested/reviewed
-        # SHAs (the new unsafe candidate has not been tested or reviewed yet).
-        # Roll back to LOCAL_VERIFYING so the flow re-verifies and re-reviews.
-        import sqlite3
-        with sqlite3.connect(str(dirs["state"] / "tasks.db")) as conn:
-            conn.execute(
-                "UPDATE tasks SET candidate_sha=?, tested_sha=NULL, reviewed_sha=NULL, state=? WHERE task_id=?",
-                (new_sha, TaskState.LOCAL_VERIFYING.value, task_id))
-            conn.commit()
+        # Use the audited StateStore.inject_candidate entry point (NOT raw SQL).
+        # This clears tested/reviewed SHAs and records a CONTROLLED_CANDIDATE_INJECTION
+        # event. Roll back to LOCAL_VERIFYING so the flow re-verifies and re-reviews.
+        store.inject_candidate(task_id, new_sha, TaskState.LOCAL_VERIFYING)
         print(f"  injected unsafe candidate: {new_sha[:12]}")
     # Now drive the rest (review should catch the issue -> CHANGES_REQUESTED -> fix -> ...)
     rec = _drive_to_terminal(gw, task_id, store)
@@ -565,10 +587,38 @@ def _run_review_fix(dirs: dict[str, Path], meta: dict) -> tuple[bool, dict]:
     evidence["protocol_passed"] = protocol_passed
     evidence["task_approved"] = task_approved
     evidence["final_state"] = rec["state"]
-    # Success condition: protocol_passed (NOT task_approved). Judge confirming
-    # a finding and entering NEEDS_HUMAN means the protocol worked correctly;
-    # the task is not claimed as APPROVED.
-    ok = protocol_passed
+    # Main review-fix PASS requires ALL 4 conditions:
+    #   protocol_passed + task_approved + final_state == READY_FOR_HUMAN_REVIEW
+    #   + pr_content_valid
+    # Judge correctly entering NEEDS_HUMAN is a safety sub-scenario (recorded
+    # as safety_behavior_evidence), but does NOT make the main scenario pass.
+    run_dir = dirs["runs"] / task_id
+    task_branch = cfg.task_branch_for(task_id)
+    ok, reason = _review_fix_pass(protocol_passed, task_approved, rec["state"],
+                                  run_dir, rec.get("candidate_sha") or "",
+                                  rec.get("tested_sha") or "",
+                                  rec.get("reviewed_sha") or "",
+                                  task_id, task_branch)
+    evidence["review_fix_pass_reason"] = reason
+    evidence["pr_content_valid"] = ok
+    # Record safety sub-scenario evidence when Judge correctly entered NEEDS_HUMAN
+    if rec["state"] == "NEEDS_HUMAN" and protocol_passed:
+        evidence["safety_behavior_evidence"] = (
+            "Judge correctly entered NEEDS_HUMAN — protocol worked, task not faked as approved")
+    # Write append-only evidence
+    run_id = f"{int(time.time())}-reviewfix"
+    ev_dir = _evidence_dir(ACCEPTANCE_ROOT, "review-fix", run_id)
+    _record_evidence(ev_dir, result={"passed": ok, "reason": reason},
+                     task_snapshot=rec, events=store.events(task_id),
+                     stage_attempts=[s.to_dict() for s in stages.list_stages(task_id)],
+                     budget_log=budget.summary(task_id),
+                     worker_handles=[],
+                     sha_info={"candidate": rec.get("candidate_sha"),
+                               "tested": rec.get("tested_sha"),
+                               "reviewed": rec.get("reviewed_sha")},
+                     pr_content_info={"valid": ok, "protocol_passed": protocol_passed,
+                                      "task_approved": task_approved})
+    evidence["evidence_path"] = str(ev_dir)
     return ok, evidence
 
 
