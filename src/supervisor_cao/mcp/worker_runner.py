@@ -448,28 +448,14 @@ class WorkerRunner:
         # is clean. Untracked __pycache__ is handled by .gitignore.
         subprocess.run(["git", "-C", executor_worktree, "checkout", "--", "."],
                        capture_output=True, timeout=30)
-        # Remove __pycache__ and build artifacts. If they were committed (by
-        # the executor's git add -A), git rm them so the worktree stays clean.
-        import shutil as _shutil
-        for pattern in ["__pycache__", "*.egg-info", ".eggs", "build", "dist",
-                        ".pytest_cache"]:
-            for p in Path(executor_worktree).rglob(pattern):
-                if p.is_dir():
-                    _shutil.rmtree(p, ignore_errors=True)
-                elif p.is_file():
-                    p.unlink(missing_ok=True)
-        # git rm any tracked __pycache__ files that were committed
-        subprocess.run(["git", "-C", executor_worktree, "rm", "-r", "--cached",
-                        "--ignore-unmatch", "**/__pycache__/", "*.pyc"],
+        # Remove only UNTRACKED __pycache__/build artifacts (don't touch
+        # tracked files — the executor may have committed __pycache__ via
+        # git add -A, and removing tracked files makes the worktree dirty).
+        # Use git clean -fd on specific patterns only.
+        subprocess.run(["git", "-C", executor_worktree, "clean", "-fd",
+                        "--", "__pycache__", "*.egg-info", ".eggs",
+                        "build", "dist", ".pytest_cache"],
                        capture_output=True, timeout=30)
-        # If anything was removed from cache, amend the commit
-        r_amend = subprocess.run(["git", "-C", executor_worktree, "diff", "--cached", "--quiet"],
-                                 capture_output=True, timeout=15)
-        if r_amend.returncode == 1:  # staged changes exist
-            subprocess.run(["git", "-C", executor_worktree, "commit", "--amend",
-                            "--no-edit"], capture_output=True, timeout=30)
-            # re-read HEAD after amend
-            real_sha = _git_head(executor_worktree)
         # Requirement: worktree must be clean after the run.
         if not _git_porcelain_clean(executor_worktree):
             raise WorkerError("executor: worktree dirty after run (uncommitted changes)")
