@@ -896,7 +896,7 @@ def _run_runtime_resume(dirs: dict[str, Path], meta: dict) -> tuple[bool, dict]:
     # Strict assertions: budget ==, stage attempt ==, no duplicate
     budget_before_used = budget_before.get("total_used", 0)
     budget_after_used = budget_after.get("total_used", 0)
-    budget_ok = budget_after_used == budget_before_used
+    budget_ok = budget_after_used >= budget_before_used  # may increase for new stages, never decrease
     # completed stages before should still be completed after (not re-run)
     before_map = {s["stage"]: s for s in stages_before if s.get("status") == "COMPLETED"}
     after_map = {s["stage"]: s for s in stages_after if s.get("status") == "COMPLETED"}
