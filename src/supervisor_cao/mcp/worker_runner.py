@@ -121,6 +121,10 @@ def _lenient_json_extract(text: str) -> dict | None:
                 objects.append(obj)
         except (json.JSONDecodeError, Exception):
             pass
+        # Absolute last resort: regex extraction of key fields
+        obj = _regex_json_extract(chunk)
+        if obj is not None:
+            objects.append(obj)
         pos = e
     if objects:
         # Return the last object (most likely the current worker's output)
@@ -143,6 +147,73 @@ def _fix_json_keys(chunk: str) -> str:
     # Also fix string values: replace literal newlines with \\n inside strings
     result = _fix_unescaped_quotes(result)
     return result
+
+
+def _regex_json_extract(chunk: str, stage: str = "") -> dict | None:
+    """Last-resort JSON extraction using regex to find key fields.
+
+    When Codex outputs JSON with unescaped quotes inside string values
+    (e.g. regex patterns like r"\\d+"), standard JSON parsers fail.
+    This function uses regex to extract known schema fields directly.
+    """
+    import re
+    obj = {}
+    # Extract string fields (key": "value")
+    for key in ["review_id", "task_id", "candidate_sha", "reviewed_sha",
+                "decision", "summary", "model", "ruling", "rationale",
+                "plan_id", "description", "project", "commit_message",
+                "base_sha", "schema_version"]:
+        m = re.search(rf'"{key}"\s*:\s*"((?:[^"\\]|\\.)*?)"', chunk)
+        if m:
+            obj[key] = m.group(1).replace("\\n", "\n").replace("\\\"", "\"")
+    # Extract boolean/numeric fields
+    for key in ["prerequisites_verified", "self_check_passed", "pass",
+                "total_used", "rounds", "exit_code"]:
+        m = re.search(rf'"{key}"\s*:\s*(true|false|\d+)', chunk)
+        if m:
+            val = m.group(1)
+            obj[key] = val == "true" if val in ("true", "false") else int(val)
+    # Extract findings array (best-effort)
+    findings_match = re.search(r'"findings"\s*:\s*\[(.*?)\]\s*[,}]', chunk, re.DOTALL)
+    if findings_match:
+        findings_text = findings_match.group(1)
+        findings = []
+        for finding_match in re.finditer(r'\{[^}]+\}', findings_text):
+            try:
+                f = json.loads(finding_match.group(0), strict=False)
+                findings.append(f)
+            except json.JSONDecodeError:
+                # Extract fields manually
+                f = {}
+                for fkey in ["id", "severity", "category", "file", "claim",
+                             "evidence", "recommended_direction"]:
+                    fm = re.search(rf'"{fkey}"\s*:\s*"((?:[^"\\]|\\.)*?)"',
+                                  finding_match.group(0))
+                    if fm:
+                        f[fkey] = fm.group(1)
+                if f:
+                    findings.append(f)
+        if findings:
+            obj["findings"] = findings
+    # Extract changed_files array
+    cf_match = re.search(r'"changed_files"\s*:\s*\[(.*?)\]', chunk, re.DOTALL)
+    if cf_match:
+        files = re.findall(r'"([^"]+)"', cf_match.group(1))
+        if files:
+            obj["changed_files"] = files
+    # Extract steps array (best-effort)
+    steps_match = re.search(r'"steps"\s*:\s*\[(.*?)\]\s*[,}]', chunk, re.DOTALL)
+    if steps_match:
+        steps = []
+        for step_match in re.finditer(r'\{[^}]+\}', steps_match.group(1)):
+            try:
+                s = json.loads(step_match.group(0), strict=False)
+                steps.append(s)
+            except json.JSONDecodeError:
+                pass
+        if steps:
+            obj["steps"] = steps
+    return obj if obj else None
 
 
 def _fix_unescaped_quotes(chunk: str) -> str:
