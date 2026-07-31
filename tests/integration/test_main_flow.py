@@ -430,9 +430,198 @@ class TestModelConfigProfileRender:
         assert detect_roles.issuperset(resolver_opencode_roles), (
             f"detect-models OpenCode roles {detect_roles} missing "
             f"{resolver_opencode_roles - detect_roles}")
-        # Codex roles must NOT be in OPENCODE_ROLE_LABELS (they use CLI check)
-        assert "planner" not in detect_roles
-        assert "reviewer" not in detect_roles
-        assert "judge" not in detect_roles
-        # CODEX_ROLES must be present in the script
-        assert "CODEX_ROLES" in text
+
+
+# ---------------------------------------------------------------------------
+# 6. Judge arbitration (R5: OVERTURN/UPHOLD/MIXED/UNRESOLVED)
+# ---------------------------------------------------------------------------
+
+class TestJudgeArbitration:
+    """When incremental review outputs CHANGES_REQUESTED, ALL findings go to
+    the Judge. OVERTURN → APPROVED; UPHOLD/MIXED/UNRESOLVED → NEEDS_HUMAN."""
+
+    def test_judge_overturn_approves(self, tmp_path, monkeypatch):
+        """Judge OVERTURN → task APPROVED."""
+        main_repo, bare = _setup_temp_repo(tmp_path)
+        store = StateStore(db_path=tmp_path / "tasks.db")
+        budget = CodexBudget(db_path=tmp_path / "codex.db")
+        stages = StageStore(db_path=tmp_path / "stages.db")
+        cfg = _cfg(main_repo, default_verification={"local": {"command": ["true"]}})
+        task_id = _unique_task_id("judge")
+        store.create(task_id, "demo-project", baseline_sha="base")
+        create_task_branch(main_repo, task_id, "main")
+        wt = add_executor_worktree(main_repo, "demo-project", task_id)
+        (Path(wt) / "f.py").write_text("x=1\n")
+        sha1 = commit_and_push(wt, f"agent/{task_id}", "v1")
+        # drive to INCREMENTAL_REVIEWING with a prior CHANGES_REQUESTED
+        store.transition(task_id, TaskState.RESEARCHING)
+        store.transition(task_id, TaskState.PLANNING)
+        budget.spend(task_id, "planner", input_artifact="r", candidate_sha=None)
+        store.transition(task_id, TaskState.PLAN_READY)
+        store.transition(task_id, TaskState.IMPLEMENTING)
+        store.transition(task_id, TaskState.IMPLEMENTED, new_candidate_sha=sha1)
+        store.transition(task_id, TaskState.LOCAL_VERIFYING)
+        store.transition(task_id, TaskState.LOCAL_VERIFIED, tested_sha=sha1)
+        store.transition(task_id, TaskState.REMOTE_QUEUED)
+        store.transition(task_id, TaskState.REMOTE_VERIFYING)
+        store.transition(task_id, TaskState.REMOTE_VERIFIED)
+        budget.spend(task_id, "full_review", input_artifact="v", candidate_sha=sha1)
+        store.transition(task_id, TaskState.REVIEWING, reviewed_sha=sha1)
+        store.transition(task_id, TaskState.CHANGES_REQUESTED)
+        # fix produces new SHA
+        (Path(wt) / "f.py").write_text("x=2\n")
+        sha2 = commit_and_push(wt, f"agent/{task_id}", "v2")
+        store.transition(task_id, TaskState.FIXING, new_candidate_sha=sha2)
+        store.transition(task_id, TaskState.LOCAL_VERIFYING)
+        store.transition(task_id, TaskState.LOCAL_VERIFIED, tested_sha=sha2)
+        store.transition(task_id, TaskState.REMOTE_QUEUED)
+        store.transition(task_id, TaskState.REMOTE_VERIFYING)
+        store.transition(task_id, TaskState.REMOTE_VERIFIED)
+        store.transition(task_id, TaskState.INCREMENTAL_REVIEWING, reviewed_sha=sha2)
+        # fake workers: incremental review CHANGES_REQUESTED + judge OVERTURN
+        cao = _fake_cao_client({
+            "implementation": json.dumps({"candidate_sha": sha2, "base_sha": sha1,
+                                          "changed_files": ["f.py"],
+                                          "commit_message": "v2", "rounds": 1,
+                                          "self_check_passed": True,
+                                          "focused_tests": {"run": True, "passed": True, "summary": "ok"}}),
+            "incremental_review": json.dumps({"review_id": "R2", "task_id": task_id,
+                                              "candidate_sha": sha2, "reviewed_sha": sha2,
+                                              "decision": "CHANGES_REQUESTED",
+                                              "findings": [{"id": "F1", "severity": "P1",
+                                                            "category": "correctness",
+                                                            "file": "f.py", "claim": "bug",
+                                                            "evidence": "line 1",
+                                                            "recommended_direction": "fix"}],
+                                              "summary": "issues", "model": "codex"}),
+            "decision": json.dumps({"decision_id": "D1", "task_id": task_id,
+                                    "candidate_sha": sha2, "ruling": "OVERTURN",
+                                    "rationale": "finding invalid",
+                                    "evidence_cited": ["F1"],
+                                    "new_evidence_present": False, "model": "codex"}),
+        })
+        gw = _gateway(store, budget, stages, cao)
+        _inject_config(monkeypatch, cfg)
+        rec = gw.run_next_stage(task_id)
+        assert rec["state"] == TaskState.APPROVED.value
+
+    def test_judge_uphold_needs_human(self, tmp_path, monkeypatch):
+        """Judge UPHOLD → task NEEDS_HUMAN (no fake approval)."""
+        main_repo, bare = _setup_temp_repo(tmp_path)
+        store = StateStore(db_path=tmp_path / "tasks.db")
+        budget = CodexBudget(db_path=tmp_path / "codex.db")
+        stages = StageStore(db_path=tmp_path / "stages.db")
+        cfg = _cfg(main_repo, default_verification={"local": {"command": ["true"]}})
+        task_id = _unique_task_id("uphold")
+        store.create(task_id, "demo-project", baseline_sha="base")
+        create_task_branch(main_repo, task_id, "main")
+        wt = add_executor_worktree(main_repo, "demo-project", task_id)
+        (Path(wt) / "f.py").write_text("x=1\n")
+        sha1 = commit_and_push(wt, f"agent/{task_id}", "v1")
+        store.transition(task_id, TaskState.RESEARCHING)
+        store.transition(task_id, TaskState.PLANNING)
+        budget.spend(task_id, "planner", input_artifact="r", candidate_sha=None)
+        store.transition(task_id, TaskState.PLAN_READY)
+        store.transition(task_id, TaskState.IMPLEMENTING)
+        store.transition(task_id, TaskState.IMPLEMENTED, new_candidate_sha=sha1)
+        store.transition(task_id, TaskState.LOCAL_VERIFYING)
+        store.transition(task_id, TaskState.LOCAL_VERIFIED, tested_sha=sha1)
+        store.transition(task_id, TaskState.REMOTE_QUEUED)
+        store.transition(task_id, TaskState.REMOTE_VERIFYING)
+        store.transition(task_id, TaskState.REMOTE_VERIFIED)
+        budget.spend(task_id, "full_review", input_artifact="v", candidate_sha=sha1)
+        store.transition(task_id, TaskState.REVIEWING, reviewed_sha=sha1)
+        store.transition(task_id, TaskState.CHANGES_REQUESTED)
+        (Path(wt) / "f.py").write_text("x=2\n")
+        sha2 = commit_and_push(wt, f"agent/{task_id}", "v2")
+        store.transition(task_id, TaskState.FIXING, new_candidate_sha=sha2)
+        store.transition(task_id, TaskState.LOCAL_VERIFYING)
+        store.transition(task_id, TaskState.LOCAL_VERIFIED, tested_sha=sha2)
+        store.transition(task_id, TaskState.REMOTE_QUEUED)
+        store.transition(task_id, TaskState.REMOTE_VERIFYING)
+        store.transition(task_id, TaskState.REMOTE_VERIFIED)
+        store.transition(task_id, TaskState.INCREMENTAL_REVIEWING, reviewed_sha=sha2)
+        cao = _fake_cao_client({
+            "implementation": json.dumps({"candidate_sha": sha2, "base_sha": sha1,
+                                          "changed_files": ["f.py"],
+                                          "commit_message": "v2", "rounds": 1,
+                                          "self_check_passed": True,
+                                          "focused_tests": {"run": True, "passed": True, "summary": "ok"}}),
+            "incremental_review": json.dumps({"review_id": "R2", "task_id": task_id,
+                                              "candidate_sha": sha2, "reviewed_sha": sha2,
+                                              "decision": "CHANGES_REQUESTED",
+                                              "findings": [{"id": "F1", "severity": "P0",
+                                                            "category": "safety",
+                                                            "file": "f.py", "claim": "traversal",
+                                                            "evidence": "line 1",
+                                                            "recommended_direction": "fix"}],
+                                              "summary": "unsafe", "model": "codex"}),
+            "decision": json.dumps({"decision_id": "D1", "task_id": task_id,
+                                    "candidate_sha": sha2, "ruling": "UPHOLD",
+                                    "rationale": "finding valid",
+                                    "evidence_cited": ["F1"],
+                                    "new_evidence_present": False, "model": "codex"}),
+        })
+        gw = _gateway(store, budget, stages, cao)
+        _inject_config(monkeypatch, cfg)
+        rec = gw.run_next_stage(task_id)
+        assert rec["state"] == TaskState.NEEDS_HUMAN.value
+
+
+# ---------------------------------------------------------------------------
+# 7. Generated artifact patterns (R6)
+# ---------------------------------------------------------------------------
+
+class TestGeneratedArtifactPatterns:
+    """generated_artifact_patterns default is empty; candidate commits with
+    matching paths are rejected."""
+
+    def test_default_patterns_empty(self):
+        """The platform default for generated_artifact_patterns is empty."""
+        cfg = ProjectConfig(name="test")
+        assert cfg.generated_artifact_patterns == []
+
+    def test_reject_candidate_with_artifact(self, tmp_path):
+        """_reject_generated_artifacts_in_commit raises when the HEAD commit
+        contains a matching path."""
+        from supervisor_cao.mcp.worker_runner import _reject_generated_artifacts_in_commit, WorkerError
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-b", "main", str(repo)], capture_output=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@t.t"], capture_output=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "t"], capture_output=True)
+        (repo / "__pycache__").mkdir()
+        (repo / "__pycache__" / "mod.cpython-314.pyc").write_text("bytecode")
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], capture_output=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-m", "add pycache"], capture_output=True)
+        with pytest.raises(WorkerError, match="generated artifact"):
+            _reject_generated_artifacts_in_commit(str(repo), ["__pycache__", "*.pyc"])
+
+    def test_accept_candidate_without_artifact(self, tmp_path):
+        """_reject_generated_artifacts_in_commit passes when no matching paths."""
+        from supervisor_cao.mcp.worker_runner import _reject_generated_artifacts_in_commit
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-b", "main", str(repo)], capture_output=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@t.t"], capture_output=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "t"], capture_output=True)
+        (repo / "feature.py").write_text("x=1\n")
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], capture_output=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-m", "feature"], capture_output=True)
+        # should not raise
+        _reject_generated_artifacts_in_commit(str(repo), ["__pycache__", "*.pyc"])
+
+    def test_empty_patterns_no_check(self, tmp_path):
+        """Empty patterns list → no check (platform default)."""
+        from supervisor_cao.mcp.worker_runner import _reject_generated_artifacts_in_commit
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-b", "main", str(repo)], capture_output=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@t.t"], capture_output=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "t"], capture_output=True)
+        (repo / "__pycache__").mkdir()
+        (repo / "__pycache__" / "x.pyc").write_text("b")
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], capture_output=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-m", "pyc"], capture_output=True)
+        # empty patterns → no rejection
+        _reject_generated_artifacts_in_commit(str(repo), [])

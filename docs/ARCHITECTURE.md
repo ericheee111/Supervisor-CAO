@@ -145,6 +145,31 @@ Per-task isolated worktrees: `~/cao-worktrees/<project>/<task-id>/{executor,veri
 - main clone only for fetch/branch/worktree mgmt, never edited
 - no force push, no base-branch rewrite, every valid candidate committed+pushed
 
+### WorkerMonitor (`src/supervisor_cao/workers/monitor.py`)
+
+Wraps each worker process in a **dual-handle model**: a `CaoTerminalHandle`
+(the CAO tmux session id) plus a `ProcessHandle` (the OS-level CLI process).
+The two are correlated but tracked independently so a dead process is
+detectable even when the CAO terminal record still claims RUNNING.
+
+Deterministic interface: `start_worker` / `poll_worker` / `wait_for_stage` /
+`resume_worker`. Polling compares process liveness against recorded stage
+progress; it never trusts the worker's self-reported status alone.
+
+Stall detection: a worker with no stage progress within `stall_timeout`
+(default `1800`s = 30 min) is marked `STALLED`. `STALLED` is a **handle
+status**, not a `TaskState` — the underlying task keeps its current state
+and may be resumed by a fresh worker via `resume_worker`.
+
+Concurrent ownership: each handle carries `owner_id`, `lease_until`, and
+`heartbeat`; only the current lease holder may poll or resume. A lease
+expires at `lease_until`; a new owner may take over only after expiry.
+
+`max_runtime` defaults to `null` — there is **no total runtime timeout**.
+Monitoring is progress-based (stall detection), not wall-clock-based: a
+worker that keeps advancing stage progress is never killed for running
+"too long".
+
 ### Remote validation pool (`src/supervisor_cao/validation/remote_pool.py`)
 
 Generic remote validation pool, managed over SSH with atomic locks (remote
@@ -162,6 +187,23 @@ draft_pr_created, windows_clean, fast_forwardable. Never reset --hard, never
 overwrite dirty, never force checkout, never cherry-pick, never merge dev.
 Final check: `Windows HEAD == candidate SHA`.
 
+### Judge arbitration (`src/supervisor_cao/state/judge.py`)
+
+When the Reviewer returns `CHANGES_REQUESTED`, all findings — not just the
+disputed ones — go to the Judge. The Judge emits one of four verdicts:
+
+- **`OVERTURN`** — every Reviewer finding is overturned → the task moves
+  straight to `APPROVED`.
+- **`UPHOLD`** — every finding is upheld → back to `FIXING`.
+- **`MIXED`** — some overturned, some upheld → back to `FIXING` for the
+  upheld findings only.
+- **`UNRESOLVED`** — the Judge cannot decide → `NEEDS_HUMAN`.
+
+Promotion rule: **only an all-`OVERTURN` verdict promotes to `APPROVED`**.
+`UPHOLD`, `MIXED`, and `UNRESOLVED` all route away from `APPROVED` —
+`UPHOLD`/`MIXED` to `FIXING`, `UNRESOLVED` to `NEEDS_HUMAN`. The Judge never
+auto-merges; it only arbitrates the Reviewer's findings.
+
 ### Project config (`src/supervisor_cao/projects/config.py`)
 
 Layered: public example (`config/examples/<project>.example.yaml`) + private
@@ -170,6 +212,20 @@ override. Never hard-codes project specifics. The base branch is project
 configuration (default `main`); profiles no longer carry hardcoded `model:`
 lines — model ids come from `~/.config/supervisor-cao/models.local.yaml`,
 produced by `scripts/detect-models`.
+
+### Generated artifact patterns (`src/supervisor_cao/projects/config.py`)
+
+`generated_artifact_patterns` is a project-level config field (list of
+gitignore-style globs) naming paths that are *generated*, not authored —
+e.g. `dist/`, `build/`, `*.min.js`, `coverage/`. Default is **empty**: no
+patterns, no rejection.
+
+When non-empty, the Executor rejects any candidate commit whose diff touches
+a matching path — generated artifacts must not be committed. Matching is
+path-based against the candidate's file list; there is **no unbounded
+`git clean`** and no removal of untracked files. Rejected candidates are
+returned to the Executor with the offending paths listed; the policy layer
+never deletes files.
 
 ## Role permissions
 
@@ -312,6 +368,25 @@ CAO 锁定到特定 commit（`config/cao_pinned.sha`）。升级是显式的（`
 - 主 clone 仅用于 fetch/分支/worktree 管理，永不直接编辑
 - 不 force push，不改写基础分支，每个有效 candidate 都 commit+push
 
+### WorkerMonitor（`src/supervisor_cao/workers/monitor.py`）
+
+每个 worker 进程以**双句柄模型**封装：`CaoTerminalHandle`（CAO tmux 会话 id）
+加 `ProcessHandle`（OS 层 CLI 进程）。两者关联但独立追踪，因此即使 CAO 终端
+记录仍声称 RUNNING，死进程也能被检出。
+
+确定性接口：`start_worker` / `poll_worker` / `wait_for_stage` / `resume_worker`。
+轮询将进程存活状态与已记录的阶段进度对比；绝不仅依赖 worker 自报状态。
+
+卡顿检测：worker 在 `stall_timeout`（默认 `1800` 秒 = 30 分钟）内无阶段进度
+则标记为 `STALLED`。`STALLED` 是**句柄状态**，不是 `TaskState` —— 底层任务
+保持当前状态，可由新 worker 通过 `resume_worker` 恢复。
+
+并发所有权：每个句柄携带 `owner_id`、`lease_until`、`heartbeat`；只有当前租约
+持有者可轮询或恢复。租约在 `lease_until` 过期；新 owner 仅在过期后方可接管。
+
+`max_runtime` 默认为 `null` —— **无总运行时超时**。监控基于进度（卡顿检测），
+而非墙钟：持续推阶段进度的 worker 永不因"跑太久"被杀。
+
 ### 远程验证池（`src/supervisor_cao/validation/remote_pool.py`）
 
 通用的远程验证池，通过 SSH 管理并使用原子锁（远程 flock/mkdir）。验证前记录原始分支/HEAD，拒绝 dirty 仓库，验证后恢复（不 `reset --hard`，不 `clean -fdx`）。恢复失败标记 UNHEALTHY。Supervisor 只读取：AVAILABLE / BUSY / UNHEALTHY / DIRTY / UNREACHABLE。真实主机名、容器名、用户名和路径均为私有（仅本地配置）；核心对池保持不透明。
@@ -320,9 +395,34 @@ CAO 锁定到特定 commit（`config/cao_pinned.sha`）。升级是显式的（`
 
 仅 fast-forward 同步到 Windows 仓库。7 个门禁必须全部通过：candidate_pushed、tested_eq_candidate、reviewed_eq_candidate、review_approved、draft_pr_created、windows_clean、fast_forwardable。永不 reset --hard，永不覆盖 dirty，永不强制 checkout，永不 cherry-pick，永不 merge dev。最终检查：`Windows HEAD == candidate SHA`。
 
+### Judge 仲裁（`src/supervisor_cao/state/judge.py`）
+
+当 Reviewer 返回 `CHANGES_REQUESTED` 时，**所有** findings —— 不只是争议项 ——
+都交给 Judge。Judge 给出四种裁决之一：
+
+- **`OVERTURN`** —— 所有 Reviewer findings 被推翻 → 任务直接进入 `APPROVED`。
+- **`UPHOLD`** —— 所有 findings 被维持 → 回到 `FIXING`。
+- **`MIXED`** —— 部分推翻、部分维持 → 仅对维持项回到 `FIXING`。
+- **`UNRESOLVED`** —— Judge 无法判定 → `NEEDS_HUMAN`。
+
+晋升规则：**只有全部 `OVERTURN` 的裁决才晋升到 `APPROVED`**。
+`UPHOLD`、`MIXED`、`UNRESOLVED` 都不导向 `APPROVED` —— `UPHOLD`/`MIXED` 去
+`FIXING`，`UNRESOLVED` 去 `NEEDS_HUMAN`。Judge 永不自动合并，只对 Reviewer 的
+findings 做仲裁。
+
 ### 项目配置（`src/supervisor_cao/projects/config.py`）
 
 分层加载：公开示例（`config/examples/<project>.example.yaml`）+ 私有本地（`~/.config/supervisor-cao/projects/<project>.local.yaml`）+ 任务级覆盖。永不硬编码项目特定逻辑。基础分支属于项目配置（默认 `main`）；profiles 不再带有硬编码的 `model:` 行 —— 模型 id 来自 `~/.config/supervisor-cao/models.local.yaml`，由 `scripts/detect-models` 生成。
+
+### 生成物 pattern（`src/supervisor_cao/projects/config.py`）
+
+`generated_artifact_patterns` 是项目级配置字段（gitignore 风格 glob 列表），
+命名*生成*而非*编写*的路径，例如 `dist/`、`build/`、`*.min.js`、`coverage/`。
+默认为**空**：无 pattern、无拒绝。
+
+非空时，Executor 拒绝任何 diff 触碰匹配路径的 candidate commit —— 生成物不得
+提交。匹配基于 candidate 文件列表的路径；**不做无界 `git clean`**，也不删除
+未跟踪文件。被拒 candidate 连同违规路径列表退回 Executor；策略层永不删除文件。
 
 ## 角色权限
 

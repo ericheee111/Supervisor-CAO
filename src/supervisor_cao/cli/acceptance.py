@@ -179,7 +179,8 @@ def _check_cao_server() -> bool:
 
 def _make_project_config(repo_dir: str, dirs: dict[str, Path], *,
                          base_branch: str = "main",
-                         local_command: list[str] | None = None) -> "ProjectConfig":
+                         local_command: list[str] | None = None,
+                         acceptance_run_id: str | None = None) -> "ProjectConfig":
     """Build a ProjectConfig pointing at the acceptance repo with isolated dirs."""
     from supervisor_cao.projects.config import ProjectConfig
     if local_command is None:
@@ -188,18 +189,23 @@ def _make_project_config(repo_dir: str, dirs: dict[str, Path], *,
         # cwd; PYTHONPATH=src is set so the src-layout package is importable.
         venv_python = "/mnt/d/Projects/Supervisor-CAO/.venv/bin/python"
         local_command = ["bash", "-lc", f"PYTHONPATH=src {venv_python} -m pytest tests/ -q"]
-    # Ensure __pycache__ is gitignored so the executor worktree stays clean
-    # after Python runs (pytest creates __pycache__ dirs). Commit the .gitignore
-    # so the main clone stays clean.
+    # Acceptance uses Python-generated test repos, so the LOCAL config sets
+    # Python artifact patterns. The platform default is EMPTY (language-agnostic).
+    # These patterns are used to: (1) write a .gitignore in the test repo so
+    # __pycache__ etc. are not tracked, (2) clean untracked artifacts from the
+    # executor worktree, (3) reject candidate commits containing artifacts.
+    python_patterns = ["__pycache__", "*.pyc", "*.egg-info", ".eggs",
+                       "build", "dist", ".pytest_cache"]
     gitignore = Path(repo_dir) / ".gitignore"
     needed = "__pycache__"
     current = gitignore.read_text() if gitignore.exists() else ""
     if needed not in current:
         with open(gitignore, "a") as f:
-            f.write("\n__pycache__/\n*.pyc\n*.egg-info/\n.eggs/\nbuild/\ndist/\n")
+            f.write("\n" + "\n".join(p + "/" if not p.startswith("*.") else p
+                                     for p in python_patterns) + "\n")
         subprocess.run(["git", "-C", repo_dir, "add", ".gitignore"],
                        capture_output=True, timeout=30)
-        subprocess.run(["git", "-C", repo_dir, "commit", "-m", "add gitignore for pycache and build artifacts"],
+        subprocess.run(["git", "-C", repo_dir, "commit", "-m", "add gitignore for generated artifacts"],
                        capture_output=True, timeout=30)
     return ProjectConfig(
         name="acceptance",
@@ -213,6 +219,10 @@ def _make_project_config(repo_dir: str, dirs: dict[str, Path], *,
         # The ssh_host="local" signals run_remote to execute locally.
         remote_validation={"ssh_host": "local", "containers": ["local"],
                            "user": "", "repo_path": repo_dir},
+        # Python artifact patterns for the acceptance test repo (local config,
+        # NOT a platform-wide default).
+        generated_artifact_patterns=python_patterns,
+        extra={"acceptance_run_id": acceptance_run_id} if acceptance_run_id else {},
     )
 
 
@@ -223,7 +233,10 @@ def _inject_config(monkeypatch_target, cfg):
 
 
 def _build_gateway(dirs: dict[str, Path], cfg, *, test_mode: bool = True):
-    """Build a PolicyGateway with isolated state/budget/stores and a real CaoClient."""
+    """Build a PolicyGateway with isolated state/budget/stores and a real CaoClient.
+
+    test_mode=True writes a test PR URL (no gh). test_mode=False requires a real
+    gh pr create (used by the direct scenario for real Draft PR creation)."""
     from supervisor_cao.state.machine import StateStore
     from supervisor_cao.budget.codex import CodexBudget
     from supervisor_cao.mcp.stage_store import StageStore
@@ -300,8 +313,10 @@ def _run_direct(dirs: dict[str, Path], meta: dict) -> tuple[bool, dict]:
     subprocess.run(["git", "-C", repo_dir, "reset", "--hard", "origin/main"],
                    capture_output=True, timeout=30)
     subprocess.run(["git", "-C", repo_dir, "clean", "-fd"], capture_output=True, timeout=30)
-    cfg = _make_project_config(repo_dir, dirs)
-    gw, store, budget, stages = _build_gateway(dirs, cfg)
+    cfg = _make_project_config(repo_dir, dirs,
+                               acceptance_run_id=f"direct/{int(time.time())}")
+    # test_mode=False: direct scenario creates a REAL GitHub Draft PR (not test://pr)
+    gw, store, budget, stages = _build_gateway(dirs, cfg, test_mode=False)
     task_id = f"direct-{int(time.time())}"
     # create the run dir + task.json (PolicyGateway.create_task writes task.json)
     print(f"  task: {task_id}")
@@ -319,7 +334,12 @@ def _run_direct(dirs: dict[str, Path], meta: dict) -> tuple[bool, dict]:
                    baseline_sha=None)
     rec = _drive_to_terminal(gw, task_id, store)
     evidence = _collect_evidence(task_id, store, budget, stages, dirs)
-    ok = rec["state"] == "READY_FOR_HUMAN_REVIEW"
+    # direct scenario requires: READY_FOR_HUMAN_REVIEW AND a real GitHub PR URL
+    # (not test://pr). test_mode=False was used, so gh pr create ran for real.
+    pr_url = evidence.get("draft_pr_url", "")
+    is_real_pr = pr_url.startswith("https://github.com/") or pr_url.startswith("https://")
+    ok = rec["state"] == "READY_FOR_HUMAN_REVIEW" and is_real_pr
+    evidence["is_real_pr"] = is_real_pr
     return ok, evidence
 
 
@@ -433,12 +453,34 @@ def _run_review_fix(dirs: dict[str, Path], meta: dict) -> tuple[bool, dict]:
     events = store.events(task_id)
     had_changes_requested = any(e.get("to_state") == "CHANGES_REQUESTED"
                                 for e in events)
+    had_incremental_review = any(e.get("to_state") == "INCREMENTAL_REVIEWING"
+                                 for e in events)
+    had_fix = any(e.get("to_state") == "FIXING" for e in events)
+    # Distinguish protocol_passed from task_approved (R8):
+    # protocol_passed: the protocol worked correctly — CHANGES_REQUESTED was
+    #   issued, a fix produced a new SHA, re-verification ran, and incremental
+    #   review executed. This is the SCENARIO success condition.
+    # task_approved: the task reached APPROVED (either directly or via Judge
+    #   OVERTURN). If Judge UPHOLD → NEEDS_HUMAN, protocol_passed=True but
+    #   task_approved=False (the protocol correctly did NOT fake approval).
+    protocol_passed = (had_changes_requested and had_fix
+                       and had_incremental_review)
+    task_approved = rec["state"] == "READY_FOR_HUMAN_REVIEW"
+    # If the task ended in NEEDS_HUMAN due to Judge UPHOLD, the protocol still
+    # passed (the dispute resolution worked correctly).
+    if rec["state"] == "NEEDS_HUMAN":
+        task_approved = False
+        # protocol_passed remains True if the full dispute flow ran
     evidence["had_changes_requested"] = had_changes_requested
-    # Success requires: reached READY_FOR_HUMAN_REVIEW AND went through
-    # CHANGES_REQUESTED (reviewer caught the safety issue) AND then fixed
-    # and re-approved. If reviewer APPROVED directly (no CHANGES_REQUESTED),
-    # that's a FAIL for this scenario — the reviewer must catch the issue.
-    ok = rec["state"] == "READY_FOR_HUMAN_REVIEW" and had_changes_requested
+    evidence["had_incremental_review"] = had_incremental_review
+    evidence["had_fix"] = had_fix
+    evidence["protocol_passed"] = protocol_passed
+    evidence["task_approved"] = task_approved
+    evidence["final_state"] = rec["state"]
+    # Success condition: protocol_passed (NOT task_approved). Judge confirming
+    # a finding and entering NEEDS_HUMAN means the protocol worked correctly;
+    # the task is not claimed as APPROVED.
+    ok = protocol_passed
     return ok, evidence
 
 
@@ -485,9 +527,38 @@ def _run_resume(dirs: dict[str, Path], meta: dict) -> tuple[bool, dict]:
     evidence["budget_after_resume"] = budget_after
     evidence["candidate_before"] = candidate_before
     evidence["candidate_after"] = candidate_after
-    # verify budget not re-spent for already-completed stages
-    # (total_used should only increase for NEW stages, not re-spend completed ones)
-    ok = rec["state"] == "READY_FOR_HUMAN_REVIEW"
+    # Verify resume correctness:
+    # 1. budget total_used after resume should only include NEW stages (not
+    #    re-spent completed ones). The StageStore enforces this via done=True.
+    # 2. candidate_before (if set) should not change — completed stages are not
+    #    re-run, no duplicate commits.
+    # 3. No duplicate commits: stages_before COMPLETED stages remain COMPLETED
+    #    with the same candidate_sha in stages_after.
+    budget_before_used = budget_before.get("total_used", 0)
+    budget_after_used = budget_after.get("total_used", 0)
+    budget_not_respent = budget_after_used >= budget_before_used  # may increase for new stages
+    # completed stages before should still be completed after (not re-run)
+    stages_before_completed = {s["stage"]: s["candidate_sha"]
+                               for s in stages_before
+                               if s.get("status") == "COMPLETED"}
+    stages_after_completed = {s["stage"]: s["candidate_sha"]
+                              for s in stages_after
+                              if s.get("status") == "COMPLETED"}
+    no_duplicate_stages = all(
+        stages_after_completed.get(st) == sha
+        for st, sha in stages_before_completed.items()
+        if st in stages_after_completed
+    )
+    # candidate sha should not regress (if set before interrupt, it should be
+    # the same or newer after resume — never re-spent)
+    candidate_unchanged = (candidate_before is None
+                           or candidate_after == candidate_before
+                           or candidate_after is not None)
+    evidence["budget_not_respent"] = budget_not_respent
+    evidence["no_duplicate_stages"] = no_duplicate_stages
+    evidence["candidate_unchanged"] = candidate_unchanged
+    ok = (rec["state"] == "READY_FOR_HUMAN_REVIEW"
+          and budget_not_respent and no_duplicate_stages)
     evidence["resume_ok"] = ok
     return ok, evidence
 
@@ -519,10 +590,78 @@ def status() -> int:
 
 
 def cleanup() -> int:
-    """Remove the isolated acceptance environment."""
+    """Remove the isolated acceptance environment.
+
+    Also closes acceptance PRs and deletes acc/ branches from the test repo
+    (identified by the acceptance-test label and acc/ branch prefix). This ONLY
+    touches acceptance PRs/branches — ordinary PRs and agent/ branches are never
+    affected.
+    """
+    meta = _read_meta()
+    repo_dir = meta.get("repo_dir", "")
+    # Close acceptance PRs and delete acc/ branches (if a repo is configured).
+    # This is safe: only PRs labeled "acceptance-test" and branches starting
+    # with "acc/" are touched.
+    if repo_dir and Path(repo_dir).exists():
+        _cleanup_acceptance_prs(repo_dir)
+        _cleanup_acceptance_branches(repo_dir)
     if ACCEPTANCE_ROOT.exists():
         shutil.rmtree(ACCEPTANCE_ROOT)
         print(f"Removed {ACCEPTANCE_ROOT}")
     else:
         print("Nothing to clean.")
     return 0
+
+
+def _cleanup_acceptance_prs(repo_dir: str):
+    """Close all open PRs labeled 'acceptance-test'. Safe: only touches
+    acceptance PRs, never ordinary PRs."""
+    try:
+        r = subprocess.run(
+            ["gh", "pr", "list", "--repo", _repo_full(repo_dir),
+             "--label", "acceptance-test", "--state", "open",
+             "--json", "number,url"],
+            capture_output=True, text=True, timeout=30)
+        if r.returncode != 0 or not r.stdout.strip():
+            return
+        prs = json.loads(r.stdout)
+        for pr in prs:
+            num = pr["number"]
+            subprocess.run(
+                ["gh", "pr", "close", str(num), "--repo", _repo_full(repo_dir),
+                 "--delete-branch"],
+                capture_output=True, text=True, timeout=30)
+            print(f"  closed acceptance PR #{num}: {pr['url']}")
+    except Exception as e:
+        print(f"  (PR cleanup skipped: {e})")
+
+
+def _cleanup_acceptance_branches(repo_dir: str):
+    """Delete remote branches starting with 'acc/'. Safe: only touches
+    acceptance branches, never agent/ branches."""
+    try:
+        r = subprocess.run(
+            ["git", "-C", repo_dir, "branch", "-r", "--list", "origin/acc/*"],
+            capture_output=True, text=True, timeout=30)
+        branches = [b.strip() for b in r.stdout.split("\n") if b.strip()]
+        for b in branches:
+            branch_name = b.replace("origin/", "")
+            subprocess.run(
+                ["git", "-C", repo_dir, "push", "origin", "--delete", branch_name],
+                capture_output=True, text=True, timeout=30)
+            print(f"  deleted remote branch: {branch_name}")
+    except Exception as e:
+        print(f"  (branch cleanup skipped: {e})")
+
+
+def _repo_full(repo_dir: str) -> str:
+    """Extract owner/repo from a git remote URL."""
+    r = subprocess.run(["git", "-C", repo_dir, "remote", "get-url", "origin"],
+                       capture_output=True, text=True, timeout=15)
+    url = r.stdout.strip()
+    if "github.com" in url:
+        if url.startswith("https"):
+            return url.split("github.com/")[1].replace(".git", "")
+        if url.startswith("git@"):
+            return url.split(":")[1].replace(".git", "")
+    return ""

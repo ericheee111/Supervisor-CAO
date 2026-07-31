@@ -35,6 +35,38 @@ This round added production hardening:
 - Acceptance CLI: `supervisor-cao acceptance prepare/run/status/cleanup` with
   isolated state/budget/runs/worktree directories.
 
+## Acceptance scenarios
+
+The three real acceptance scenarios (run via `supervisor-cao acceptance run`,
+each against a live `cao-server` with real Workers):
+
+- **direct**: a task taken straight through the pipeline with no fix cycle.
+  Uses **real `gh` PR creation** (`test_mode=False`): the Draft PR is a real
+  GitHub PR, not a simulated artifact. Validates the full
+  plan → implement → verify → review → APPROVED → Draft PR → Windows sync
+  path end-to-end.
+- **review-fix**: a task where the Reviewer returns
+  `CHANGES_REQUESTED`, exercising the fix cycle. Distinguishes two
+  outcomes: `protocol_passed` (the policy-layer cycle completed — fix →
+  reverify → incremental review ran) vs `task_approved` (the post-fix
+  review actually returned `APPROVED`). A scenario may `protocol_passed`
+  without `task_approved` (e.g. Judge upheld findings → `NEEDS_HUMAN`);
+  only `task_approved` counts as a full pass.
+- **resume**: interrupts a running task mid-stage and resumes it. Verifies
+  that **budget is not re-spent**: a COMPLETED stage with the same
+  `candidate_sha` is not re-run, the Codex call log is not double-charged,
+  and no duplicate commit/PR/Windows-sync occurs. Resume only re-runs
+  stages whose `candidate_sha` differs (stale) or that were never
+  COMPLETED.
+
+## Scenario cleanup
+
+`supervisor-cao acceptance cleanup` closes any acceptance PRs created during
+a run (identified by the `acceptance-test` label) and deletes the `acc/`
+branches they were created from. Cleanup is scoped to PRs/branches labeled
+`acceptance-test` only — it never touches unrelated PRs or branches. Run
+cleanup after each scenario to keep the test repo clean.
+
 ## Test suite
 
 | Level | Scope |
@@ -182,6 +214,30 @@ and are pending. Not `READY` until all three pass.
   commit/PR）；支持连续多轮 `CHANGES_REQUESTED`。
 - 验收 CLI：`supervisor-cao acceptance prepare/run/status/cleanup`，使用独立的
   state/budget/runs/worktree 目录。
+
+## 验收场景
+
+三条真实验收场景（通过 `supervisor-cao acceptance run` 运行，每条针对实时
+`cao-server` 与真实 Worker）：
+
+- **direct**：任务直接走完整流水线，无修复回合。使用**真实 `gh` PR 创建**
+  （`test_mode=False`）：Draft PR 是真实的 GitHub PR，不是模拟产物。端到端验证
+  plan → implement → verify → review → APPROVED → Draft PR → Windows 同步路径。
+- **review-fix**：Reviewer 返回 `CHANGES_REQUESTED` 的任务，演练修复回合。区分两个
+  结果：`protocol_passed`（策略层周期完成 —— fix → 重新验证 → 增量 review 已跑）
+  与 `task_approved`（修复后 review 实际返回 `APPROVED`）。一个场景可能
+  `protocol_passed` 但未 `task_approved`（例如 Judge 维持 findings → `NEEDS_HUMAN`）；
+  只有 `task_approved` 算完整通过。
+- **resume**：在阶段中途打断运行中的任务并恢复。验证**预算不重复花费**：
+  相同 `candidate_sha` 的 COMPLETED 阶段不重跑、Codex 调用日志不双扣、不产生重复
+  commit/PR/Windows-sync。恢复只重跑 `candidate_sha` 不同（过期）或从未 COMPLETED
+  的阶段。
+
+## 场景清理
+
+`supervisor-cao acceptance cleanup` 关闭运行期间创建的验收 PR（以 `acceptance-test`
+标签识别）并删除其来源的 `acc/` 分支。清理仅限带 `acceptance-test` 标签的 PR/分支 ——
+绝不触碰无关 PR 或分支。每条场景后运行清理以保持测试仓库干净。
 
 ## 测试套件
 

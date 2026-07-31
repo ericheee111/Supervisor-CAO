@@ -2,13 +2,12 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://supervisor-cao.local/schemas/decision.schema.json",
   "title": "Decision",
-  "description": "Validates the Codex Judge arbitration artifact for the Supervisor-CAO platform. A decision records the judge's ruling on a disputed review finding: uphold, overturn, or modify, along with the rationale, evidence cited, and whether new evidence was introduced. PUBLIC schema: sanitized, contains no secrets, hostnames, or private paths.",
+  "description": "Validates the Codex Judge arbitration artifact for the Supervisor-CAO platform. A decision records the judge's ruling on disputed review findings. The ruling is one of OVERTURN (all findings invalid/fixed → approve), UPHOLD (at least one finding valid → do not approve), MIXED (some valid, some not), or UNRESOLVED (insufficient evidence → human review). PUBLIC schema: sanitized, contains no secrets, hostnames, or private paths.",
   "type": "object",
   "additionalProperties": false,
   "required": [
     "decision_id",
     "task_id",
-    "dispute_id",
     "candidate_sha",
     "ruling",
     "rationale",
@@ -27,7 +26,7 @@
     },
     "dispute_id": {
       "type": "string",
-      "description": "Identifier of the dispute being arbitrated."
+      "description": "Identifier of the dispute being arbitrated (optional for single-finding arbitrations)."
     },
     "candidate_sha": {
       "type": "string",
@@ -35,12 +34,25 @@
     },
     "ruling": {
       "type": "string",
-      "enum": ["uphold_finding", "overturn_finding", "modify_finding"],
-      "description": "The judge's ruling on the disputed finding."
+      "enum": ["OVERTURN", "UPHOLD", "MIXED", "UNRESOLVED"],
+      "description": "The judge's overall ruling on all findings. OVERTURN = all findings invalid/fixed, candidate should be approved. UPHOLD = at least one finding is valid, candidate should not be approved. MIXED = some findings valid, some not. UNRESOLVED = insufficient evidence to decide."
+    },
+    "findings_rulings": {
+      "type": "array",
+      "description": "Per-finding rulings (optional but recommended for transparency).",
+      "items": {
+        "type": "object",
+        "properties": {
+          "finding_id": {"type": "string"},
+          "ruling": {"type": "string", "enum": ["OVERTURN", "UPHOLD"]},
+          "rationale": {"type": "string"}
+        },
+        "required": ["finding_id", "ruling"]
+      }
     },
     "rationale": {
       "type": "string",
-      "description": "The judge's rationale for the ruling."
+      "description": "The judge's rationale for the overall ruling."
     },
     "evidence_cited": {
       "type": "array",

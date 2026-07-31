@@ -165,3 +165,37 @@ def test_events_logged(store, task):
     assert len(events) >= 2  # CREATE + TRANSITION
     assert events[0]["event"] == "CREATE"
     assert events[1]["event"] == "TRANSITION"
+
+
+# --- NEEDS_HUMAN coverage (R1: STALLED is NOT a TaskState; NEEDS_HUMAN is) ---
+
+def test_needs_human_reachable_from_non_terminal(store, task):
+    """NEEDS_HUMAN is reachable from any non-terminal state."""
+    store.transition("T1", TaskState.RESEARCHING)
+    store.transition("T1", TaskState.NEEDS_HUMAN)
+    rec = store.get("T1")
+    assert rec.state == TaskState.NEEDS_HUMAN.value
+
+
+def test_needs_human_reachable_from_failed(store, task):
+    """FAILED → NEEDS_HUMAN is a legal transition."""
+    store.transition("T1", TaskState.RESEARCHING)
+    store.transition("T1", TaskState.FAILED, error="something broke")
+    store.transition("T1", TaskState.NEEDS_HUMAN)
+    rec = store.get("T1")
+    assert rec.state == TaskState.NEEDS_HUMAN.value
+
+
+def test_needs_human_is_terminal(store, task):
+    """NEEDS_HUMAN is a terminal state — no outgoing transitions."""
+    store.transition("T1", TaskState.RESEARCHING)
+    store.transition("T1", TaskState.NEEDS_HUMAN)
+    # Any transition out of NEEDS_HUMAN should be illegal
+    with pytest.raises(IllegalTransition):
+        store.transition("T1", TaskState.RESEARCHING)
+
+
+def test_stalled_not_in_taskstate():
+    """STALLED is a WorkerHandle status, NOT a TaskState (R1)."""
+    values = {t.value for t in TaskState}
+    assert "STALLED" not in values

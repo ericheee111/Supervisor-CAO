@@ -35,6 +35,7 @@ from typing import Any
 import jsonschema
 
 from supervisor_cao.mcp.cao_client import CaoClient, WorkerResult
+from supervisor_cao.workers.worktrees import git_porcelain_clean as _git_porcelain_clean
 
 SCHEMAS_DIR = Path(__file__).resolve().parents[3] / "schemas"
 RUN_ROOT = Path.home() / "cao-runs"
@@ -407,7 +408,9 @@ class WorkerRunner:
 
     def run_executor(self, task_id: str, plan: dict, base_sha: str,
                      executor_worktree: str, session_name: str | None,
-                     expected_branch: str | None = None) -> tuple[dict, str]:
+                     expected_branch: str | None = None,
+                     generated_artifact_patterns: list[str] | None = None,
+                     max_runtime: int | None = None) -> tuple[dict, str]:
         """Run the GLM Executor. Returns (implementation_artifact, real_candidate_sha).
 
         The Executor edits files in its worktree, commits, and pushes. After the
@@ -415,6 +418,15 @@ class WorkerRunner:
         LLM claim), verify the worktree is clean, verify a real diff exists, the
         correct task branch is checked out, and the commit was pushed to the remote.
         The candidate_sha in the artifact is the real SHA.
+
+        ``generated_artifact_patterns``: project-configured paths the executor
+        may create but must NOT commit (e.g. __pycache__, *.pyc). A candidate
+        commit containing any matching path is REJECTED. The cleanup only
+        removes UNTRACKED files matching these patterns inside the worktree.
+
+        ``max_runtime``: total time limit in seconds, or None for no limit
+        (default). The worker is allowed to run indefinitely as long as it
+        shows progress; stall is detected by the WorkerMonitor.
         """
         prompt = (
             f"You are the GLM Executor. Your worktree is {executor_worktree}.\n"
@@ -424,10 +436,11 @@ class WorkerRunner:
             + _schema_hint("implementation")
             + "\n\nNote: candidate_sha will be verified from git, not from your claim."
         )
-        # The executor runs with a longer timeout (it does real work).
+        # max_runtime=None means no total time limit; the WorkerMonitor handles
+        # stall detection. If a hard limit is configured, pass it as the timeout.
         result = self.client.launch_worker(
             "glm-executor", prompt, executor_worktree, session_name,
-            task_id=task_id, stage="implementation", timeout=600)
+            task_id=task_id, stage="implementation", timeout=max_runtime)
         if not result.success or not result.last_message:
             raise WorkerError(f"executor worker failed: {result.error or 'no output'}")
         obj = extract_strict_json(result.last_message)
@@ -442,21 +455,21 @@ class WorkerRunner:
         # Requirement: new SHA must differ from base (no-progress check).
         if base_sha and real_sha == base_sha:
             raise WorkerError("executor: HEAD SHA equals base SHA (no progress; no commit made)")
-        # Clean up stray files the executor may have left (e.g. .gitignore
-        # edits, __pycache__ if not gitignored). Restore tracked files that
-        # the executor modified post-commit (like .gitignore) so the worktree
-        # is clean. Untracked __pycache__ is handled by .gitignore.
-        subprocess.run(["git", "-C", executor_worktree, "checkout", "--", "."],
-                       capture_output=True, timeout=30)
-        # Remove only UNTRACKED __pycache__/build artifacts (don't touch
-        # tracked files — the executor may have committed __pycache__ via
-        # git add -A, and removing tracked files makes the worktree dirty).
-        # Use git clean -fd on specific patterns only.
-        subprocess.run(["git", "-C", executor_worktree, "clean", "-fd",
-                        "--", "__pycache__", "*.egg-info", ".eggs",
-                        "build", "dist", ".pytest_cache"],
-                       capture_output=True, timeout=30)
-        # Requirement: worktree must be clean after the run.
+        # Reject the candidate if it contains generated-artifact paths. The
+        # executor must re-submit without the artifacts. Only configured patterns
+        # are checked (the platform is language-agnostic).
+        _reject_generated_artifacts_in_commit(executor_worktree,
+                                              generated_artifact_patterns or [])
+        # Remove only UNTRACKED files matching the configured artifact patterns.
+        # git clean -fd only removes untracked files; tracked files are not
+        # affected. No unbounded `git clean -fd` without pathspecs.
+        if generated_artifact_patterns:
+            subprocess.run(["git", "-C", executor_worktree, "clean", "-fd",
+                            "--", *generated_artifact_patterns],
+                           capture_output=True, timeout=30)
+        # Requirement: worktree must be clean after the run (strict check —
+        # no ignoring of tracked __pycache__/*.pyc; they must be gitignored
+        # or not committed in the first place).
         if not _git_porcelain_clean(executor_worktree):
             raise WorkerError("executor: worktree dirty after run (uncommitted changes)")
         # Requirement: verify a real diff exists against the base.
@@ -596,6 +609,37 @@ class WorkerRunner:
         return self._run(task_id, "incremental_review", "codex-reviewer", prompt,
                          working_directory, session_name, candidate_sha=candidate_sha)
 
+    def run_judge(self, task_id: str, candidate_sha: str,
+                  findings: list[dict], implementation: dict, verification: dict,
+                  working_directory: str, session_name: str | None) -> dict:
+        """Run the Codex Judge to arbitrate CHANGES_REQUESTED findings.
+
+        The Judge rules on each finding: OVERTURN / UPHOLD / MIXED / UNRESOLVED.
+        Only if ALL findings are OVERTURN does the task proceed to APPROVED.
+        """
+        prompt = (
+            f"You are the Codex Judge. Arbitrate the following review findings.\n"
+            f"Candidate SHA: {candidate_sha}\n"
+            f"Implementation:\n{json.dumps(implementation, indent=2)}\n"
+            f"Verification:\n{json.dumps(verification, indent=2)}\n"
+            f"Findings to arbitrate:\n{json.dumps(findings, indent=2)}\n\n"
+            "For each finding, examine the cited evidence (file, claim, evidence) "
+            "against the actual code and tests. Rule on whether the finding is "
+            "valid. Your overall ruling MUST be exactly one of:\n"
+            "  OVERTURN   — ALL findings are invalid/already-fixed; the candidate "
+            "should be APPROVED.\n"
+            "  UPHOLD     — At least one finding is valid and must be addressed; "
+            "the candidate should NOT be approved.\n"
+            "  MIXED      — Some findings are valid, some are not; the candidate "
+            "needs partial fixes.\n"
+            "  UNRESOLVED — The evidence is insufficient to decide; the task "
+            "needs human review.\n"
+            "Do NOT introduce new findings. Decide only on the evidence presented.\n\n"
+            + _schema_hint("decision")
+        )
+        return self._run(task_id, "decision", "codex-judge", prompt,
+                         working_directory, session_name, candidate_sha=candidate_sha)
+
 
 # ---------------------------------------------------------------------------
 # Deterministic test runner (requirement 3): NOT the LLM
@@ -694,17 +738,36 @@ def _branch_pushed(repo: str, branch: str) -> bool:
         return False
 
 
-def _git_porcelain_clean(repo: str) -> bool:
-    """Return True if `git status --porcelain` is empty, ignoring __pycache__
-    and *.pyc files (these are build artifacts that don't affect correctness)."""
+def _reject_generated_artifacts_in_commit(worktree: str,
+                                          patterns: list[str]) -> None:
+    """Reject the candidate commit if it contains generated-artifact paths.
+
+    Checks ``git diff --cached --name-only`` (staged) and ``git show --name-only``
+    (HEAD commit) against the configured patterns. If any matching path is found,
+    raises WorkerError — the executor must re-submit without the artifacts.
+
+    Only configured patterns are checked; the platform is language-agnostic and
+    does NOT hard-code Python patterns.
+    """
+    if not patterns:
+        return
     try:
-        r = subprocess.run(["git", "-C", repo, "status", "--porcelain"],
-                           capture_output=True, text=True, timeout=15)
+        # Check the HEAD commit's changed files
+        r = subprocess.run(
+            ["git", "-C", worktree, "show", "--name-only", "--pretty=format:", "HEAD"],
+            capture_output=True, text=True, timeout=30)
         if r.returncode != 0:
-            return False
-        lines = [l for l in r.stdout.strip().split("\n") if l.strip()
-                 and "__pycache__" not in l and ".pyc" not in l
-                 and ".egg-info" not in l and ".pytest_cache" not in l]
-        return len(lines) == 0
+            return
+        files = [f.strip() for f in r.stdout.split("\n") if f.strip()]
+        import fnmatch
+        for f in files:
+            for pat in patterns:
+                # match against the basename and the full path
+                if fnmatch.fnmatch(f, pat) or fnmatch.fnmatch(Path(f).name, pat):
+                    raise WorkerError(
+                        f"executor: candidate commit contains generated artifact "
+                        f"'{f}' matching pattern '{pat}'; re-submit without it")
+    except WorkerError:
+        raise
     except Exception:
-        return False
+        pass  # best-effort; don't block on git errors
