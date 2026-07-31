@@ -1,121 +1,204 @@
-# Usable Supervisor Runtime 设计文档
+# Usable Supervisor Runtime 设计文档（修订版）
 
 **日期**: 2026-07-31
 **分支**: `feat/usable-supervisor-runtime`
-**状态**: 设计待批准
+**状态**: 设计已批准（用户 2026-07-31 确认 11 条修订意见），进入实现
 **基线**: `main` (commit `ee09ac7`)
 
 ## 1. 背景与目标
 
-Supervisor-CAO 的运行时"骨架"（状态机、StageStore 幂等、CaoClient、WorkerRunner、
-WorkerMonitor、PolicyGateway）已全部存在且测试覆盖良好，但**执行路径存在断点**：
-`WorkerRunner` 各 `run_*` 方法同步直调 `CaoClient.launch_worker`，完全绕过了已实现
-但未接入的 `WorkerMonitor`（`start_worker`/`wait_for_stage`/`poll_worker` 是死代码），
-导致 progress-based 无超时监控、STALLED 重新挂载、崩溃后 worker 续跑等能力均不可用。
-同时 CLI 缺少 `task start/watch/resume` 等长任务命令。
+Supervisor-CAO 的运行时"骨架"已存在，但**执行路径存在断点**：`WorkerRunner` 各
+`run_*` 方法同步直调 `CaoClient.launch_worker`，完全绕过了已实现但未接入的
+`WorkerMonitor`，导致 progress-based 无超时监控、STALLED 重新挂载、崩溃后 worker
+续跑等能力均不可用。CLI 缺少 `task start/watch/resume` 等长任务命令。
 
 **本轮目标**：让 Supervisor 真正可用。用户只需 5 个 CLI 命令即可驱动完整任务闭环。
-不涉及 PR handoff、Windows 同步或 forge API——任务在 Reviewer 批准后即视为完成
-（`APPROVED` 为成功终态）。
+不涉及 PR handoff、Windows 同步或 forge API——runtime CLI 把 `APPROVED` 列为本轮
+成功终态。
 
 **非目标**: 不做 PR 创建/内容包/Windows 同步/forge API；不合并或继续修改
-`feat/pr-content-handoff`。
+`feat/pr-content-handoff`；不全局删除 `APPROVED` 的后续转移（状态机可保留可选后处理）。
 
 ## 2. 现状映射（调研结论）
 
 | 主题 | 现状 | 文件:行 |
 |------|------|---------|
 | CLI task 命令 | 仅有 `task list/show/logs`；无 `start/watch/resume/status` | `cli/main.py:247-286` |
-| WorkerRunner | 各 `run_*` 同步调 `client.launch_worker`，不经过 WorkerMonitor | `mcp/worker_runner.py:315-349, 357/441/526` |
-| CaoClient | `launch_worker` 阻塞同步；`get_terminal_status/output` 已就绪但未被执行路径用 | `mcp/cao_client.py:155-175, 223-333` |
+| WorkerRunner | 各 `run_*` 同步调 `client.launch_worker`，两套执行入口含糊 | `mcp/worker_runner.py:315-349, 357/441/526` |
+| CaoClient run-step | 放在 daemon 线程中，Controller 退出后线程和结果丢失；terminal_id 可能是 `unknown-*` | `mcp/cao_client.py:223-333`, `worker_monitor.py:426-477` |
 | WorkerMonitor | `start_worker`/`wait_for_stage`/`poll_worker`/`resume_worker` 已实现，**未接入执行路径** | `mcp/worker_monitor.py:236-364` |
-| StageStore | `set_handle_status` 已实现，**无调用方**；`begin_stage` 幂等检查已就绪 | `mcp/stage_store.py:263-290, 151-222` |
+| ProcessHandle reaper | `_start_process_worker` 用 daemon reaper 线程写 exit code，Controller 退出后丢失 | `worker_monitor.py:503-557` |
+| StageStore | `set_handle_status` 已实现，**无调用方**；幂等键缺少 `input_sha` | `mcp/stage_store.py:263-290, 151-222` |
 | PolicyGateway | 构造了 `worker_monitor` 但 `_stage_*` 不用它；STALLED 恢复分支不可达 | `mcp/policy_gateway.py:73, 308-396, 370-388` |
-| 状态机 | `APPROVED` 不是终态（→ DRAFT_PR_CREATED）；本轮需改为终态 | `state/machine.py:89` |
-| WorkerHandle | `CaoTerminalHandle`/`ProcessHandle`/`WorkerHandle` 已定义 | `worker_monitor.py:69-136` |
-| ProcessHandle 启动 | `_start_process_worker` 已用 `start_new_session=True` + 持久日志 | `worker_monitor.py:503-557` |
-| acceptance | `_build_gateway`/`_drive_to_terminal` 可复用 | `cli/acceptance.py:244-269, 295-312` |
-| profiles | MCP 配置已就绪，无需改 | `profiles/supervisor.md` |
+| 状态机 | `APPROVED` 非终态（→ DRAFT_PR_CREATED 等） | `state/machine.py:89` |
+| ProjectConfig | 无 config 快照持久化；resume 会重新加载可变配置 | `projects/config.py` |
+| remote verification | 无 disabled/optional/required 模式定义 | `policy_gateway.py:518` |
+| owner lease | `DEFAULT_LEASE_DURATION=300s`；无 `owner_pid` 存活检查；无双 Controller 互斥 | `worker_monitor.py:57, 704-735` |
 
 ## 3. 设计决策
 
-### 3.1 简化成功路径
+### 3.1 统一 monitor 封装（不留两套 run_* 入口）
 
-`APPROVED` 改为**成功终态**（无后续转移）。新转移表：
-
-```python
-TaskState.APPROVED: set(),  # terminal success (本轮)
-```
-
-移除 `APPROVED → {PR_CONTENT_READY/DRAFT_PR_CREATED, FAILED}`（这些属于 PR handoff
-分支，不在本轮范围）。`FAILED`/`NEEDS_HUMAN` 仍为终态。
-
-核心状态链（本轮）:
+废弃 `WorkerRunner.run_*` 作为生产执行入口。生产路径**只有 WorkerMonitor 可以启动
+Worker**。新的四阶段流程：
 
 ```text
-CREATED → RESEARCHING → PLANNING → IMPLEMENTING → LOCAL_VERIFYING →
-REMOTE_VERIFYING（项目未配置可跳过）→ REVIEWING → CHANGES_REQUESTED/APPROVED
+build_<stage>_request(task_id, ...) -> StageRequest
+start_stage(task_id, stage, request) -> worker_id    # WorkerMonitor.start_worker
+wait_for_stage(task_id, stall_timeout) -> WorkerResult  # 阻塞轮询
+finalize_<stage>_result(task_id, worker_result) -> artifact  # 解析+验证+落盘
 ```
 
-Fix 回路保留: `CHANGES_REQUESTED → FIXING → LOCAL_VERIFYING → ... →
-INCREMENTAL_REVIEWING → APPROVED/CHANGES_REQUESTED`。
+- `build_<stage>_request`: 纯函数，构造 prompt + 参数（profile/working_directory/
+  session_name/model/timeout）。不启动 Worker，不调网络。
+- `start_stage`: 调 `WorkerMonitor.start_worker`，返回 `worker_id`，Worker 在后台运行。
+  写 `StageStore.set_handle_status(handle_status="RUNNING", resume_state=<当前状态>,
+  worker_id=worker_id)`。
+- `wait_for_stage`: 调 `WorkerMonitor.wait_for_stage`，阻塞直到 COMPLETED/FAILED/STALLED。
+  工具内部持续轮询，不需要 Supervisor 模型反复调用。
+- `finalize_<stage>_result`: 从 worker-shim 的 `result.json` 或 `get_terminal_output`
+  收集结果 → `extract_strict_json` → `validate_and_stamp` → `_save_artifact` →
+  `complete_stage` + `transition`。
 
-### 3.2 接通 WorkerMonitor 到执行路径
+`WorkerRunner` 重构为 `StageRequestBuilder`（prompt 构造）+ `ResultFinalizer`（结果解析），
+不再持有 `CaoClient` 或直接调 `launch_worker`。原 `run_*` 方法删除或改为 `build_*`/
+`finalize_*`。
 
-**核心改动**：`PolicyGateway._stage_*` 方法不再直接调 `self.runner.run_xxx`（同步阻塞），
-改为经 `WorkerMonitor` 非阻塞驱动：
+### 3.2 Worker-shim 持久化（OpenCode + Codex 统一）
 
-1. `self.worker_monitor.start_worker(...)` → 返回 `worker_id`，Worker 在后台运行。
-2. `self.stages.set_handle_status(task_id, stage, handle_status="RUNNING",
-   resume_state=<当前状态>, worker_id=worker_id)` → 持久化到 StageStore。
-3. `self.worker_monitor.wait_for_stage(task_id, stall_timeout=cfg.stall_timeout)` →
-   阻塞直到 COMPLETED/FAILED/STALLED（工具内部轮询，不需要 Supervisor 模型反复调用）。
-4. COMPLETED → 收集结果（`get_terminal_output` + `extract_strict_json`）→
-   `complete_stage` + `transition`。
-5. STALLED → 先 `resume_worker`（重新挂载原 handle）；失败才 `NEEDS_HUMAN`。
+**不再依赖 daemon 线程完成结果收集。** OpenCode 和 Codex 都通过独立持久 worker-shim
+运行：
 
-**`wait_for_stage` 轮询条件**（任一满足即继续等待）:
-- 输出仍在增长（`output_offset` 变化）
-- terminal 状态仍为 PROCESSING/RUNNING
-- 进程或子进程仍存活（`os.kill(pid, 0)`）
-- CPU 时间或 I/O 计数仍变化
-- 测试/构建/Git 子进程仍运行
+**worker-shim** 是一个独立 Python 进程（`scripts/worker-shim`），负责：
+1. 启动实际 Worker（OpenCode CLI 或 Codex run-step）
+2. 持久化进程信息到 SQLite（`workers` 表）
+3. 将 stdout/stderr 写入持久日志文件
+4. Worker 完成后写 `result.json` + `exit-code` 文件
+5. 自行退出（不依赖 Controller 的 daemon reaper）
 
-全部无进展超过 `stall_timeout`（默认 1800s）才标记 STALLED。
+**持久化字段**（`workers` 表，已存在 + 新增）:
+- `pid`、`pgid`（`start_new_session=True`，脱离前台）
+- `stdout_log`、`stderr_log`（持久日志文件路径）
+- `result_json`（结果文件路径）
+- `exit_code_file`
+- `last_progress_at`
+- `owner_id`、`owner_pid`（Controller PID，用于崩溃后存活检查）
+- `lease_until`
 
-**WorkerRunner 改造**：新增 `run_stage_via_monitor(task_id, stage, profile, prompt,
-working_directory, ...)` 方法，封装"start_worker → set_handle_status →
-wait_for_stage → 收集结果"流程。各 `_stage_*` 方法调它而非直接 `launch_worker`。
-原 `run_*` 方法保留为内部辅助（构造 prompt + 解析结果），不再直接调 `client.launch_worker`。
+**Codex 异步启动修复**：
+- **不**放在 daemon 线程中跑 run-step。
+- worker-shim 内部先创建 CAO terminal 取得真实 `terminal_id`（不是 `unknown-*`），
+  再提交 run-step 到该 terminal。
+- 如果 run-step 不支持预创建 terminal，worker-shim 直接用 `subprocess.Popen` 启动
+  `codex` CLI（与 OpenCode 同路径），结果写 `result.json`。
+- Controller 退出后 worker-shim 继续运行，结果已落盘，resume 时直接读 `result.json`。
 
-### 3.3 两种 Worker Handle 持久化
+### 3.3 状态机：不全局删除 APPROVED 后续转移
 
-**CaoTerminalHandle**（Codex）:
-- `terminal_id`、`session_name`、`output_offset`、`last_progress_at`
-- 通过 CaoClient run-step 启动，terminal_id 持久化到 `workers` 表
+`APPROVED` 的后续转移（`→ PR_CONTENT_READY/DRAFT_PR_CREATED` 等）**保留在状态机中**
+（状态机可保留可选后处理）。但 runtime CLI 把 `APPROVED` 列为**本轮成功终态**——
+`task start`/`task watch`/`task resume` 到达 `APPROVED` 即停止驱动，不继续后处理。
 
-**ProcessHandle**（OpenCode）:
-- `pid`、`pgid`、`stdout_log`、`stderr_log`、`exit_code_file`、`last_progress_at`
-- `start_new_session=True`（脱离前台），stdout/stderr 写入持久日志文件
-- 进程信息持久化到 `workers` 表
+```python
+# 状态机不变：
+TaskState.APPROVED: {TaskState.PR_CONTENT_READY, TaskState.FAILED},  # 保留
+# runtime CLI 终态判断：
+RUNTIME_TERMINAL = {TaskState.APPROVED.value, TaskState.FAILED.value,
+                    TaskState.NEEDS_HUMAN.value}
+```
 
-所有 handle 保存到 SQLite（`workers.db`），Controller 退出后仍可恢复。
+### 3.4 ProjectConfig 快照持久化
 
-### 3.4 真正实现 resume
+`task start` 必须支持 `--project`（指定项目名），或在临时 repo 模式要求 `--verify-command`。
 
-`task resume <task-id>`:
-1. 从 SQLite 读取原 Stage attempt 和 Worker handle（`StageStore.get` +
-   `WorkerMonitor.find_for_task`）。
-2. 复用同一 `terminal_id`（CAO）或 `pid`（process）。
-3. 不重复调用 Planner/Executor（StageStore 幂等：COMPLETED 跳过）。
-4. 不重复消费 Codex 预算（`CodexBudget` 记录已花费）。
-5. 不重复创建 branch 或 commit（worktree 已存在，`create_task_branch` 幂等）。
-6. Worker 已完成时只收集原结果（`get_terminal_output` + 解析）。
-7. Worker 仍运行时继续等待（`wait_for_stage`）。
+**启动时持久化解析后的完整 ProjectConfig 快照**:
+- `task start` 解析 config（合并 builtin → example → local → override）后，
+  将完整 `ProjectConfig.to_dict()` 写入 `<run-dir>/config-snapshot.json`。
+- `task resume` **不得重新加载可变配置**——从 `config-snapshot.json` 读取，确保
+  resume 行为与 start 时一致。
+- `PolicyGateway` 在 resume 时从快照加载 config，不从 `~/.config/` 重新读。
 
-**不允许**通过"重新运行同一 Stage"伪装恢复。
+### 3.5 task watch / logs --follow 只读
 
-### 3.5 CLI 命令
+`task watch` 和 `task logs --follow` **必须只读**：
+- 使用新增的 `WorkerMonitor.peek_worker(worker_id)` 方法（只读轮询，不获取/续订
+  owner lease）。
+- **不得**调用 `start_worker`/`wait_for_stage`/`resume_worker`（这些会获取 lease）。
+- **不得**修改任何状态、Stage、Worker handle。
+- 只读取: 当前 state、Stage status、Worker status、output_offset、last_progress_at、
+  stdout/stderr 日志新增部分、SHA、budget。
+
+### 3.6 Ctrl+C 与 owner lease 安全
+
+**Ctrl+C 时**:
+- 释放 Controller 的 owner lease（`WorkerMonitor.release_ownership(worker_id)`）。
+- **不杀 Worker**（Worker 在 `start_new_session` 的独立进程组中，不受 Ctrl+C 影响）。
+- 打印 `task resume <task-id>` 提示。
+
+**异常崩溃后安全接管**:
+- `workers` 表新增 `owner_pid` 字段（Controller 进程 PID）。
+- resume 时检查 `owner_pid` 是否存活（`os.kill(pid, 0)` / `OpenProcess`）。
+- 若 `owner_pid` 已死且 lease 过期 → 安全接管（claim ownership）。
+- 若 `owner_pid` 仍存活且 lease 未过期 → **拒绝接管**（两个活跃 Controller 不得同时
+  拥有同一 handle）。
+- 若 `owner_pid` 仍存活但 lease 过期 → 警告（可能双 Controller），仍拒绝接管，进入
+  `NEEDS_HUMAN`。
+
+**双 Controller 互斥**: `start_stage`/`wait_for_stage`/`resume_worker` 在获取 lease 前
+检查 `owner_pid` 存活性。lease 未过期且 owner 存活时，其他 Controller 无法获取。
+
+### 3.7 真正取消总时限
+
+```python
+max_runtime = None   # 无固定总超时
+max_polls = None     # 无轮询次数上限
+```
+
+- `WorkerMonitor.wait_for_stage` 的 `max_polls` 默认改为 `None`（无限轮询）。
+- `PROCESSING` 只算 **liveness**（Worker 还活着），**不算每次都有新 progress**。
+- **Progress** 必须来自以下之一的变化:
+  - 输出增长（`output_offset` 变化）
+  - CPU 时间变化（`os.times`/`psutil`）
+  - I/O 计数变化（`/proc/<pid>/io` 或 `psutil.Process.io_counters()`）
+  - 子进程仍运行（`os.kill(pgid, 0)` 或枚举子进程）
+  - provider 更新时间变化（CAO `last_active`）
+- 全部无 progress 超过 `stall_timeout`（默认 1800s）才标记 STALLED。
+
+### 3.8 Stage 幂等键
+
+```text
+task_id + stage + attempt + input_sha
+```
+
+- `input_sha`: stage 输入的 SHA（如 plan.json 的 SHA、candidate_sha 等）。
+- `StageStore.begin_stage` 已有 `input_sha` 参数和 `attempt` 字段——需确保所有
+  `_stage_*` 调用时传入 `input_sha`。
+- `Codex call_id` 和 `worker_id` 必须持久化到 `stage_runs` 表（字段已存在但未写入）。
+- Resume 时:
+  - COMPLETED + 同 `input_sha` → 跳过（不重复预算/Worker/branch/commit）
+  - COMPLETED + 不同 `input_sha` → reclaim（attempt++，重新运行）
+  - RUNNING + owner 存活 → 继续 `wait_for_stage`
+  - RUNNING + owner 死亡 + lease 过期 → 安全接管，继续 `wait_for_stage`
+  - RUNNING + owner 死亡 + lease 未过期 → NEEDS_HUMAN
+
+### 3.9 Remote verification mode
+
+明确定义三种模式:
+
+| 模式 | 行为 |
+|------|------|
+| `disabled` | 跳过 remote verification，直接从 LOCAL_VERIFIED 到 REVIEWING |
+| `optional` | 尝试 remote verification，失败则 fallback 到 LOCAL_VERIFIED（默认） |
+| `required` | remote verification 必须通过，失败则 FAILED |
+
+- `ProjectConfig.remote_validation.mode`（新增字段，默认 `optional`）。
+- `disabled` 跳过时写 **skip artifact**（`verification-remote.json`:
+  `{"skipped": true, "reason": "disabled"}`）和 **audit 事件**
+  (`REMOTE_VERIFICATION_SKIPPED`)。
+- `optional` 失败时写 fallback artifact + audit 事件。
+- `required` 失败时 `transition(FAILED)`。
+
+### 3.10 CLI 命令
 
 #### `task start`
 
@@ -123,108 +206,106 @@ wait_for_stage → 收集结果"流程。各 `_stage_*` 方法调它而非直接
 supervisor-cao task start \
   --repo /path/to/repo \
   --base-branch main \
-  --description-file task.md
+  --description-file task.md \
+  [--project <name>] \
+  [--verify-command "pytest"] \
+  [--stall-timeout 1800]
 ```
 
-- 读取 `--description-file` 获取任务描述。
-- 创建 task（`PolicyGateway.create_task`）。
-- **默认持续等待任务完成**（循环 `run_next_stage` 直到终态）。
-- 按 Ctrl+C 只退出前台监控，**不杀 Worker**（Worker 在后台 `start_new_session` 运行）。
-- Ctrl+C 后打印 `task resume <task-id>` 提示。
+- `--project`: 指定项目名（从 config 加载）。若未指定，用临时 repo 模式。
+- 临时 repo 模式必须提供 `--verify-command`。
+- 解析 config → 持久化 `config-snapshot.json`。
+- 创建 task → 持续等待到 `APPROVED`/`FAILED`/`NEEDS_HUMAN`。
+- Ctrl+C 释放 lease，不杀 Worker，打印 `task resume`。
 
 #### `task watch`
 
 ```bash
-supervisor-cao task watch <task-id> [--json] [--follow] [--poll-interval 5] [--stall-timeout 1800]
+supervisor-cao task watch <task-id> [--json] [--follow] [--poll-interval 5]
 ```
 
-持续显示:
-- 当前 Stage
-- Worker 类型（CaoTerminal / Process）
-- terminal_id 或 pid
-- 已运行时间
-- 最后进展时间
-- 最新输出摘要（默认只显示新增输出，不重复打印全部日志）
-- candidate/tested/reviewed SHA
-- Codex 预算
-
-`--json`: 每次轮询输出一行 JSON（供程序化消费）。
-`--follow`: 持续轮询直到终态（类似 `tail -f`）。
-`--poll-interval`: 轮询间隔秒数（默认 5）。
-`--stall-timeout`: STALLED 超时秒数（默认 1800）。
+只读（`peek_worker`），持续显示 Stage/Worker/输出/SHA/budget。
 
 #### `task resume`
 
 ```bash
-supervisor-cao task resume <task-id>
+supervisor-cao task resume <task-id> [--stall-timeout 1800]
 ```
 
-见 §3.4。默认持续等待到终态（同 `task start`）。
+从 `config-snapshot.json` 加载配置。从 SQLite 读取 handle。安全接管。继续到终态。
 
-#### `task status`
+#### `task status` / `task logs`
 
-```bash
-supervisor-cao task status <task-id>
-```
+`status`: 一次性快照。`logs [--follow]`: 只读 tailing。
 
-一次性输出当前状态快照（不轮询）。
-
-#### `task logs`
-
-已有，改为支持 `--follow` 和只显示新增输出。
-
-### 3.6 max_runtime: null
-
-`ProjectConfig.executor_limits.max_runtime` 默认改为 `null`（无固定总超时）。
-`CaoClient.launch_worker` 的 `timeout=None` 已用 86400s 安全上界（`cao_client.py:196`）。
-`WorkerMonitor.wait_for_stage` 用 `stall_timeout`（progress-based）替代固定总超时。
-
-### 3.7 Acceptance 三场景
+### 3.11 Acceptance 三场景
 
 新增 `supervisor-cao acceptance runtime-direct`、`runtime-review-fix`、
-`runtime-resume`（复用现有 `_build_gateway` + 真实 CaoClient，不用 fake/mock）。
+`runtime-resume`。**repo 路径通过 CLI 参数传入，不硬编码**:
 
-使用 `/root/projects/supervisor-cao-live-test` 作为测试 repo。
+```bash
+supervisor-cao acceptance runtime-direct --repo /root/projects/supervisor-cao-live-test
+```
 
-**direct**: 真实完成 `parse_duration` 任务，最终状态 `APPROVED`。
-**review-fix**: 真实缺陷 → CHANGES_REQUESTED → fix → APPROVED。
-**resume**: 真实 controller restart + Worker reattach。
-
-每条场景保存完整 evidence（task 事件、Worker handles、Stage attempts、stdout/stderr
-日志、Codex 调用、SHA、Git commit/branch、Review 决定）。
+- `--repo` 必填，指定 live test repo 路径。
+- 不用 fake CaoClient 或 local_fixture。
+- 每条场景保存完整 evidence（task 事件、Worker handles、Stage attempts、stdout/stderr
+  日志、Codex 调用、SHA、Git commit/branch、Review 决定）。
 
 ## 4. 涉及修改的文件
 
 | 文件 | 改动 |
 |------|------|
-| `src/supervisor_cao/cli/main.py` | 新增 `task start/watch/resume/status` 命令 |
-| `src/supervisor_cao/cli/task_runner.py` | **新建**: task 命令驱动逻辑（复用 `_drive_to_terminal` + `wait_for_stage`） |
-| `src/supervisor_cao/mcp/policy_gateway.py` | `_stage_*` 改为经 WorkerMonitor 驱动；APPROVED 终态 |
-| `src/supervisor_cao/mcp/worker_runner.py` | 新增 `run_stage_via_monitor`；原 `run_*` 保留为 prompt 构造+结果解析 |
-| `src/supervisor_cao/mcp/worker_monitor.py` | 微调 `wait_for_stage` 轮询条件（CPU/IO/子进程检测） |
-| `src/supervisor_cao/mcp/stage_store.py` | `set_handle_status` 接入执行路径 |
-| `src/supervisor_cao/state/machine.py` | `APPROVED` 改为终态 |
-| `src/supervisor_cao/cli/acceptance.py` | 新增 `runtime-direct`/`runtime-review-fix`/`runtime-resume` |
-| `src/supervisor_cao/projects/config.py` | `max_runtime` 默认 null |
-| `tests/unit/test_task_cli.py` | **新建**: task 命令测试 |
-| `tests/unit/test_worker_monitor_integration.py` | **新建**: WorkerMonitor 接入执行路径测试 |
-| `tests/unit/test_state_machine.py` | APPROVED 终态测试 |
-| `docs/TASK_CLI.md` | **新建**: task 子命令用户文档 |
+| `src/supervisor_cao/cli/main.py` | 新增 `task start/watch/resume/status` |
+| `src/supervisor_cao/cli/task_runner.py` | **新建**: task 命令驱动逻辑 |
+| `scripts/worker-shim` | **新建**: 独立持久 Worker 启动器 |
+| `src/supervisor_cao/mcp/worker_runner.py` | 重构为 `build_*`/`finalize_*`，删除 `run_*` 执行入口 |
+| `src/supervisor_cao/mcp/worker_monitor.py` | worker-shim 集成；`peek_worker`；`owner_pid`；取消 max_polls；progress 检测增强 |
+| `src/supervisor_cao/mcp/stage_store.py` | `input_sha` 幂等键；`codex_call_id`/`worker_id` 写入 |
+| `src/supervisor_cao/mcp/policy_gateway.py` | `_stage_*` 改为四阶段流程；config 快照加载；remote verification mode |
+| `src/supervisor_cao/state/machine.py` | 保留 APPROVED 后续转移；runtime 终态判断 |
+| `src/supervisor_cao/projects/config.py` | `remote_validation.mode`；`max_runtime=None` |
+| `src/supervisor_cao/cli/acceptance.py` | `runtime-*` 场景 + `--repo` 参数 |
+| `tests/unit/test_task_cli.py` | **新建** |
+| `tests/unit/test_worker_monitor_integration.py` | **新建** |
+| `tests/unit/test_worker_shim.py` | **新建** |
+| `docs/TASK_CLI.md` | **新建** |
 
 ## 5. 实施顺序（TDD）
 
-1. 状态机: APPROVED 终态 + 测试
-2. WorkerMonitor 接入: `run_stage_via_monitor` + `set_handle_status` + 测试
-3. PolicyGateway: `_stage_*` 改为经 monitor 驱动 + 测试
-4. CLI: `task start/watch/resume/status` + 测试
-5. acceptance: `runtime-direct`/`runtime-review-fix`/`runtime-resume`
-6. 文档 + 完整回归 + push
+1. worker-shim 持久化 + 测试
+2. WorkerMonitor 改造（peek_worker/owner_pid/取消 max_polls/progress 增强）+ 测试
+3. WorkerRunner 重构（build_*/start_stage/wait_for_stage/finalize_*）+ 测试
+4. StageStore 幂等键（input_sha/call_id/worker_id）+ 测试
+5. PolicyGateway 四阶段流程 + remote verification mode + 测试
+6. CLI task start/watch/resume/status + 测试
+7. acceptance runtime-direct/review-fix/resume + --repo 参数
+8. 文档 + 完整回归 + push
 
 ## 6. 约束
 
 - 不做 PR/Windows同步/forge API
 - 不合并或修改 `feat/pr-content-handoff`
-- `APPROVED` 即任务成功终态
+- runtime CLI 把 APPROVED 列为本轮成功终态（状态机保留后续转移）
 - 不用 fake CaoClient 或 local_fixture 做 live acceptance
-- 三条 runtime acceptance 全部通过前状态保持 `READY_WITH_KNOWN_LIMITATIONS`
-- Ctrl+C 不杀 Worker
+- repo 路径通过 CLI 参数传入，不硬编码
+- Ctrl+C 不杀 Worker，释放 lease
+- task watch/logs 只读，不获取 lease
+- 三条 runtime acceptance 全部通过前保持 `READY_WITH_KNOWN_LIMITATIONS`
+- 生产路径只有 WorkerMonitor 可以启动 Worker
+- 结果写入不依赖 daemon reaper 线程
+
+## 7. 已确认决策记录（用户 2026-07-31 批复 11 条）
+
+1. 统一 monitor 封装：`build_*`/`start_stage`/`wait_for_stage`/`finalize_*`，只有
+   WorkerMonitor 启动 Worker。
+2. Codex 异步启动修复：worker-shim 持久化，不依赖 daemon 线程。
+3. OpenCode/Codex 统一 worker-shim：pid/pgid/stdout/stderr/result.json/exit-code。
+4. 不全局删除 APPROVED 后续转移；runtime CLI 列为本轮终态。
+5. task start 支持 --project 或 --verify-command；持久化 config 快照。
+6. task watch/logs --follow 只读，用 peek_worker。
+7. Ctrl+C 释放 lease 不杀 Worker；owner_pid 存活检查安全接管；双 Controller 互斥。
+8. max_runtime=None, max_polls=None；PROCESSING 只算 liveness；progress 来自输出/CPU/IO/子进程/provider。
+9. 幂等键 task_id+stage+attempt+input_sha；codex_call_id/worker_id 持久化。
+10. remote verification mode: disabled/optional/required；跳过写 skip artifact+audit。
+11. live acceptance repo 路径通过 CLI 参数传入。
