@@ -106,6 +106,17 @@ def test_negative_raises():
         parse_duration("-500ms")
 
 
+def test_fractions_raise():
+    with pytest.raises(ValueError):
+        parse_duration("1.5s")
+    with pytest.raises(ValueError):
+        parse_duration("0.5h")
+    with pytest.raises(ValueError):
+        parse_duration("2.5m")
+    with pytest.raises(ValueError):
+        parse_duration("0.5ms")
+
+
 def test_combined_units_raises():
     with pytest.raises(ValueError):
         parse_duration("1s2m")
