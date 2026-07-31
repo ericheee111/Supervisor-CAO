@@ -355,14 +355,12 @@ class CaoClient:
                                 initial_message: str,
                                 max_wait: int = 300,
                                 poll_interval: int = 5) -> str:
-        """Poll terminal status until it's no longer 'processing' AND output
-        contains a JSON object (or max_wait elapsed).
+        """Poll terminal status until output contains a JSON object.
 
-        CAO's run-step may return 200 early (on Codex's first step-finish
-        with reason="tool-calls") while Codex is still running. CAO may also
-        mark the terminal as 'completed' prematurely. This method waits until
-        the output contains a '{' followed by '}' (indicating JSON), then
-        uses _fallback_extract to get the clean agent output.
+        CAO's run-step may return 200 early while Codex is still running.
+        This method polls the terminal output until it contains a JSON
+        object ('{' followed by '}'), using both _fallback_extract (clean
+        agent text) and raw terminal output as fallback.
         """
         import time as _time
         deadline = _time.time() + max_wait
@@ -371,17 +369,21 @@ class CaoClient:
             try:
                 ts = self.get_terminal_status(terminal_id)
                 status = ts.get("status", "unknown")
-                # Even if 'completed', check if output has JSON yet
+                # Try fallback extract (clean agent text from tmux pane)
                 fb = self._fallback_extract(terminal_id)
                 if fb and len(fb) > len(last_output):
                     last_output = fb
+                # Also try raw terminal output if fallback didn't work
+                if "{" not in last_output or "}" not in last_output:
+                    raw_output = self.get_terminal_output(terminal_id, mode="full")
+                    if raw_output and ("{" in raw_output and "}" in raw_output):
+                        last_output = raw_output
                 # Check if we have a JSON object in the output
                 if "{" in last_output and "}" in last_output:
                     break
                 # If terminal is truly done (error/unknown) and no JSON, stop
                 if status in ("error", "unknown"):
                     break
-                # Still processing or completed-but-no-JSON: keep waiting
             except Exception:
                 pass
             _time.sleep(poll_interval)
