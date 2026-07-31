@@ -353,22 +353,45 @@ def _drive_to_terminal(gw, task_id: str, store, max_stages: int = 40) -> dict:
     return gw.get_task(task_id)
 
 
+def _direct_pass(final_state, candidate, tested, reviewed, ev_dir: Path,
+                 task_id: str, head_branch: str) -> tuple[bool, str]:
+    """Check direct scenario pass conditions (forge-agnostic).
+
+    PASS requires ALL:
+      - final_state == READY_FOR_HUMAN_REVIEW
+      - candidate == tested == reviewed
+      - pr-content artifact valid (sha256, schema, workflow_state, SHAs, push.json)
+    No forge API is called; no real PR URL is required.
+    """
+    if final_state != "READY_FOR_HUMAN_REVIEW":
+        return False, f"final_state={final_state}"
+    if not (candidate == tested == reviewed):
+        return False, f"SHA mismatch: candidate={candidate} tested={tested} reviewed={reviewed}"
+    from supervisor_cao.validation.windows_sync import validate_pr_content_artifact
+    if not validate_pr_content_artifact(ev_dir, task_id, candidate, tested, reviewed,
+                                        "main", head_branch):
+        return False, "pr-content artifact invalid"
+    return True, "ok"
+
+
 def _run_direct(dirs: dict[str, Path], meta: dict) -> tuple[bool, dict]:
-    """direct: real implement + test parse_duration, approved by real Codex Review."""
+    """direct: real implement + test parse_duration, approved by real Codex Review.
+
+    Uses test_mode=True (no gh, no forge API). Pass conditions are forge-agnostic:
+    final state READY_FOR_HUMAN_REVIEW + SHA equality + valid pr-content artifact.
+    """
     if not _check_cao_server():
         print("  SKIP: cao-server not running (start with 'supervisor-cao up')")
         return False, {"error": "cao-server not running"}
     repo_dir = meta["repo_dir"]
-    # reset the repo to a clean state on main
     subprocess.run(["git", "-C", repo_dir, "reset", "--hard", "origin/main"],
                    capture_output=True, timeout=30)
     subprocess.run(["git", "-C", repo_dir, "clean", "-fd"], capture_output=True, timeout=30)
     cfg = _make_project_config(repo_dir, dirs,
                                acceptance_run_id=f"direct/{int(time.time())}")
-    # test_mode=False: direct scenario creates a REAL GitHub Draft PR (not test://pr)
-    gw, store, budget, stages = _build_gateway(dirs, cfg, test_mode=False)
+    # test_mode=True: no gh pr create; forge-agnostic PR content generation only.
+    gw, store, budget, stages = _build_gateway(dirs, cfg, test_mode=True)
     task_id = f"direct-{int(time.time())}"
-    # create the run dir + task.json (PolicyGateway.create_task writes task.json)
     print(f"  task: {task_id}")
     print(f"  description: implement parse_duration in src/scao_live/duration.py")
     gw.create_task(task_id, "acceptance",
@@ -384,12 +407,27 @@ def _run_direct(dirs: dict[str, Path], meta: dict) -> tuple[bool, dict]:
                    baseline_sha=None)
     rec = _drive_to_terminal(gw, task_id, store)
     evidence = _collect_evidence(task_id, store, budget, stages, dirs)
-    # direct scenario requires: READY_FOR_HUMAN_REVIEW AND a real GitHub PR URL
-    # (not test://pr). test_mode=False was used, so gh pr create ran for real.
-    pr_url = evidence.get("draft_pr_url", "")
-    is_real_pr = pr_url.startswith("https://github.com/") or pr_url.startswith("https://")
-    ok = rec["state"] == "READY_FOR_HUMAN_REVIEW" and is_real_pr
-    evidence["is_real_pr"] = is_real_pr
+    # Forge-agnostic pass conditions (no real PR URL required)
+    run_dir = dirs["runs"] / task_id
+    task_branch = cfg.task_branch_for(task_id)
+    ok, reason = _direct_pass(rec["state"], rec.get("candidate_sha"),
+                              rec.get("tested_sha"), rec.get("reviewed_sha"),
+                              run_dir, task_id, task_branch)
+    evidence["direct_pass_reason"] = reason
+    evidence["pr_content_valid"] = ok
+    # Write append-only evidence
+    run_id = f"{int(time.time())}-direct"
+    ev_dir = _evidence_dir(ACCEPTANCE_ROOT, "direct", run_id)
+    _record_evidence(ev_dir, result={"passed": ok, "reason": reason},
+                     task_snapshot=rec, events=store.events(task_id),
+                     stage_attempts=[s.to_dict() for s in stages.list_stages(task_id)],
+                     budget_log=budget.summary(task_id),
+                     worker_handles=[],
+                     sha_info={"candidate": rec.get("candidate_sha"),
+                               "tested": rec.get("tested_sha"),
+                               "reviewed": rec.get("reviewed_sha")},
+                     pr_content_info={"valid": ok})
+    evidence["evidence_path"] = str(ev_dir)
     return ok, evidence
 
 

@@ -84,3 +84,68 @@ def test_purge_evidence_refuses_without_force(tmp_path):
     with patch("supervisor_cao.cli.acceptance.ACCEPTANCE_ROOT", tmp_path / "acceptance"):
         purge_evidence(force=False)
     assert ev_dir.exists(), "purge without --force must not delete"
+
+
+# --- direct scenario pass conditions ---
+
+def _write_valid_pr_content(ev_dir, candidate="c1", task_id="direct",
+                            head_branch="agent/direct"):
+    from supervisor_cao.pr_content.renderer import render_pr_content
+    ev_dir.mkdir(parents=True, exist_ok=True)
+    arts = {
+        "plan": {"steps": [{"description": "x"}]},
+        "implementation": {"candidate_sha": candidate, "changed_files": ["a.py"]},
+        "verification": {"candidate_sha": candidate, "tested_sha": candidate,
+                         "wsl_results": {}, "remote_results": {}},
+        "review": {"reviewed_sha": candidate, "decision": "APPROVED", "findings": []},
+        "budget": {"total_used": 1, "remaining": 3},
+    }
+    push = {"schema_version": 1, "remote": "origin", "branch": head_branch,
+            "pushed_sha": candidate, "push_succeeded": True}
+    j, m, s = render_pr_content(arts, task_id, "main", head_branch, push)
+    (ev_dir / "pr-content.json").write_text(j)
+    (ev_dir / "pr-content.md").write_text(m)
+    (ev_dir / "pr-content.sha256").write_text(s)
+    (ev_dir / "push.json").write_text(json.dumps(push))
+
+
+def test_direct_pass_conditions_all_met(tmp_path):
+    """direct PASS requires: READY_FOR_HUMAN_REVIEW + SHAs equal + pr-content valid."""
+    from supervisor_cao.cli.acceptance import _direct_pass
+    ev_dir = tmp_path / "ev"
+    _write_valid_pr_content(ev_dir, candidate="c1", task_id="direct",
+                           head_branch="agent/direct")
+    ok, _ = _direct_pass("READY_FOR_HUMAN_REVIEW", "c1", "c1", "c1", ev_dir,
+                         "direct", "agent/direct")
+    assert ok is True
+
+
+def test_direct_fail_when_not_ready(tmp_path):
+    from supervisor_cao.cli.acceptance import _direct_pass
+    ev_dir = tmp_path / "ev"
+    _write_valid_pr_content(ev_dir)
+    ok, reason = _direct_pass("APPROVED", "c1", "c1", "c1", ev_dir,
+                              "direct", "agent/direct")
+    assert ok is False
+    assert "APPROVED" in reason
+
+
+def test_direct_fail_when_sha_mismatch(tmp_path):
+    from supervisor_cao.cli.acceptance import _direct_pass
+    ev_dir = tmp_path / "ev"
+    _write_valid_pr_content(ev_dir, candidate="c1")
+    ok, reason = _direct_pass("READY_FOR_HUMAN_REVIEW", "c1", "c2", "c1", ev_dir,
+                              "direct", "agent/direct")
+    assert ok is False
+    assert "SHA" in reason or "mismatch" in reason
+
+
+def test_direct_fail_when_pr_content_invalid(tmp_path):
+    from supervisor_cao.cli.acceptance import _direct_pass
+    ev_dir = tmp_path / "ev"
+    ev_dir.mkdir(parents=True)
+    # no pr-content files
+    ok, reason = _direct_pass("READY_FOR_HUMAN_REVIEW", "c1", "c1", "c1", ev_dir,
+                              "direct", "agent/direct")
+    assert ok is False
+    assert "pr-content" in reason or "pr_content" in reason
