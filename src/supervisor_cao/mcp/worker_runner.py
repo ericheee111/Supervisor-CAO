@@ -695,9 +695,16 @@ def _branch_pushed(repo: str, branch: str) -> bool:
 
 
 def _git_porcelain_clean(repo: str) -> bool:
+    """Return True if `git status --porcelain` is empty, ignoring __pycache__
+    and *.pyc files (these are build artifacts that don't affect correctness)."""
     try:
         r = subprocess.run(["git", "-C", repo, "status", "--porcelain"],
                            capture_output=True, text=True, timeout=15)
-        return r.returncode == 0 and r.stdout.strip() == ""
+        if r.returncode != 0:
+            return False
+        lines = [l for l in r.stdout.strip().split("\n") if l.strip()
+                 and "__pycache__" not in l and ".pyc" not in l
+                 and ".egg-info" not in l and ".pytest_cache" not in l]
+        return len(lines) == 0
     except Exception:
         return False
