@@ -437,7 +437,8 @@ class WorkerRunner:
                 "stage": "implementation", "profile": "glm-executor",
                 "prompt": WorkerRunner._executor_prompt(
                     task_id, kwargs.get("plan", {}),
-                    kwargs.get("base_sha")),
+                    kwargs.get("base_sha"),
+                    kwargs.get("working_directory", "")),
                 "working_directory": kwargs["working_directory"],
                 "session_name": kwargs.get("session_name"),
                 # candidate_sha=None: let the executor's JSON keep its own
@@ -550,12 +551,19 @@ class WorkerRunner:
         )
 
     @staticmethod
-    def _executor_prompt(task_id, plan, base_sha):
+    def _executor_prompt(task_id, plan, base_sha, working_directory=""):
         steps = plan.get("steps", [])
         steps_text = json.dumps(steps, indent=2) if steps else str(plan)
+        cwd_hint = ""
+        if working_directory:
+            cwd_hint = f"IMPORTANT: Your working directory is {working_directory}. "
+            cwd_hint += "Only read and modify files within this directory. "
+            cwd_hint += "Do NOT explore or modify files outside this directory. "
+            cwd_hint += "Use relative paths or paths within your working directory.\n\n"
         return (
             f"You are the GLM Executor. Implement the plan in your worktree.\n"
             f"Base SHA: {base_sha or 'unknown'}\n"
+            + cwd_hint +
             f"Plan:\n{steps_text}\n\n"
             "Edit the necessary files, run tests, commit, and push your task branch. "
             "Then output your result as JSON.\n\n"

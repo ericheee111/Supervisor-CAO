@@ -235,22 +235,13 @@ class CaoClient:
         # handles stall detection via progress indicators.
         t = timeout if timeout is not None else 86400
         provider = self.provider_for(profile)
-        # Convert WSL path to Windows path for CAO server (Windows binary).
-        # /mnt/d/... -> D:\... ; /mnt/c/... -> C:\...
-        win_wd = working_directory
-        if working_directory.startswith("/mnt/"):
-            parts = working_directory[5:].split("/", 1)
-            if len(parts) >= 2:
-                win_wd = parts[0].upper() + ":\\" + parts[1].replace("/", "\\")
-            elif len(parts) == 1:
-                win_wd = f"{parts[0].upper()}:\\"
         payload: dict[str, Any] = {
             "provider": provider,
             "agent": profile,
             "prompt": prompt,
             "teardown": False,  # keep terminal so we can re-read output on retry
             "timeout": float(t),
-            "working_directory": win_wd,
+            "working_directory": working_directory,
         }
         # NOTE: session_name is intentionally NOT forwarded to run-step. CAO's
         # run-step requires an EXISTING session when session_name is set (it does
