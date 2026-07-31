@@ -97,11 +97,37 @@ def _lenient_json_extract(text: str) -> dict | None:
                 objects.append(obj)
         except (json.JSONDecodeError, Exception):
             pass
+        # Try removing all whitespace from key names (fixes Codex's
+        # "finding\n  s" -> "findings")
+        try:
+            fixed2 = _fix_json_keys(chunk)
+            obj = json.loads(fixed2)
+            if isinstance(obj, dict):
+                objects.append(obj)
+        except (json.JSONDecodeError, Exception):
+            pass
         pos = e
     if objects:
         # Return the last object (most likely the current worker's output)
         return objects[-1]
     return None
+
+
+def _fix_json_keys(chunk: str) -> str:
+    """Fix Codex JSON where key names contain newlines/whitespace.
+
+    E.g. "finding\\n  s" -> "findings". Uses regex to find quoted keys
+    that span multiple lines and removes internal whitespace.
+    """
+    # Match "key\n  rest" patterns inside quotes (key names with newlines)
+    # Replace newlines+whitespace between key name fragments
+    import re
+    # Find all "..." that contain \n followed by whitespace, and remove
+    # the newline+whitespace (joining the key fragments)
+    result = re.sub(r'"(\w+)\s*\n\s*(\w+)"', r'"\1\2"', chunk)
+    # Also fix string values: replace literal newlines with \\n inside strings
+    result = _fix_unescaped_quotes(result)
+    return result
 
 
 def _fix_unescaped_quotes(chunk: str) -> str:
