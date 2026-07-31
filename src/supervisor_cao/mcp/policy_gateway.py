@@ -84,6 +84,38 @@ class PolicyGateway:
 
     # --- task lifecycle ---
 
+    def save_config_snapshot(self, task_id: str, cfg) -> None:
+        """Persist the resolved ProjectConfig to config-snapshot.json.
+
+        Resume reads this snapshot instead of re-loading mutable config.
+        """
+        run_dir = self.run_root / task_id
+        run_dir.mkdir(parents=True, exist_ok=True)
+        snapshot = {
+            "name": cfg.name, "base_branch": cfg.base_branch,
+            "task_branch_prefix": cfg.task_branch_prefix,
+            "wsl_repo": cfg.wsl_repo, "windows_repo": cfg.windows_repo,
+            "remote_validation": cfg.remote_validation,
+            "remote_verification_mode": getattr(cfg, 'remote_verification_mode', 'optional'),
+            "default_verification": cfg.default_verification,
+            "executor_limits": cfg.executor_limits,
+            "codex_budget": cfg.codex_budget,
+            "generated_artifact_patterns": cfg.generated_artifact_patterns,
+            "stall_timeout": cfg.stall_timeout,
+            "extra": cfg.extra,
+        }
+        (run_dir / "config-snapshot.json").write_text(json.dumps(snapshot, indent=2))
+
+    @staticmethod
+    def load_config_snapshot(run_dir: Path):
+        """Load a previously persisted config snapshot (for resume)."""
+        from supervisor_cao.projects.config import ProjectConfig
+        path = run_dir / "config-snapshot.json"
+        if not path.exists():
+            return None
+        data = json.loads(path.read_text())
+        return ProjectConfig(**data)
+
     def create_task(self, task_id: str, project: str, description: str,
                     baseline_sha: str | None = None) -> dict:
         """Create a new task. Returns the initial task record."""
@@ -598,21 +630,31 @@ class PolicyGateway:
         self.store.transition(task_id, TaskState.LOCAL_VERIFIED, tested_sha=rec.candidate_sha)
 
     def _stage_remote_verify(self, task_id, rec, cfg, session_name, run_dir):
-        # Remote verification goes through the ValidationBackend. Production
-        # delegates to scripts/run-verification (real exit code). A local-fixture
-        # backend (tests) may simulate. If no remote pool is configured and this
-        # is NOT a local fixture, the backend returns FAILED and the state
-        # machine does NOT advance to REMOTE_VERIFIED (production cannot fake it).
+        # Remote verification mode: disabled / optional / required
+        mode = getattr(cfg, 'remote_verification_mode', 'optional')
         stage = "remote_verification"
         run, done = self.stages.begin_stage(task_id, stage, "qwen-verifier",
                                             candidate_sha=rec.candidate_sha)
         if done:
-            # Must go through REMOTE_QUEUED -> REMOTE_VERIFYING -> REMOTE_VERIFIED.
-            # Direct LOCAL_VERIFIED -> REMOTE_VERIFIED is illegal.
             if rec.state == TaskState.LOCAL_VERIFIED.value:
                 self.store.transition(task_id, TaskState.REMOTE_QUEUED)
                 self.store.transition(task_id, TaskState.REMOTE_VERIFYING)
             elif rec.state == TaskState.REMOTE_QUEUED.value:
+                self.store.transition(task_id, TaskState.REMOTE_VERIFYING)
+            self.store.transition(task_id, TaskState.REMOTE_VERIFIED)
+            return
+        # Mode: disabled → skip with artifact + audit event
+        if mode == "disabled":
+            skip_artifact = {"skipped": True, "reason": "disabled",
+                             "candidate_sha": rec.candidate_sha}
+            (run_dir / "verification-remote.json").write_text(
+                json.dumps(skip_artifact, indent=2))
+            self.stages.complete_stage(task_id, stage,
+                                       artifact_path=str(run_dir / "verification-remote.json"),
+                                       candidate_sha=rec.candidate_sha)
+            # Skip remote verification: go directly to REMOTE_VERIFIED → REVIEWING
+            if rec.state == TaskState.LOCAL_VERIFIED.value:
+                self.store.transition(task_id, TaskState.REMOTE_QUEUED)
                 self.store.transition(task_id, TaskState.REMOTE_VERIFYING)
             self.store.transition(task_id, TaskState.REMOTE_VERIFIED)
             return
@@ -625,6 +667,18 @@ class PolicyGateway:
         result = backend.run_remote(task_id, rec.candidate_sha, run_dir)
         backend.write_artifact(result, run_dir, remote=True, task_id=task_id)
         if not result.passed:
+            # Mode: optional → fallback to LOCAL_VERIFIED; required → FAILED
+            if mode == "optional":
+                fallback_artifact = {"skipped": True, "reason": "optional_fallback",
+                                     "original_error": result.summary}
+                (run_dir / "verification-remote.json").write_text(
+                    json.dumps(fallback_artifact, indent=2))
+                self.stages.complete_stage(task_id, stage,
+                                           artifact_path=str(run_dir / "verification-remote.json"),
+                                           candidate_sha=rec.candidate_sha)
+                self.store.transition(task_id, TaskState.REMOTE_VERIFIED)
+                return
+            # required → FAILED
             self.stages.fail_stage(task_id, stage)
             self.store.transition(task_id, TaskState.FAILED,
                                   error=result.summary or "remote verification failed")

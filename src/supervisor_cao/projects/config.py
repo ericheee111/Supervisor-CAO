@@ -30,8 +30,12 @@ class ProjectConfig:
     wsl_repo: str = ""              # Linux fs path to the project's main clone
     windows_repo: str = ""          # Windows path (private, set in local config)
     remote_validation: dict = field(default_factory=dict)  # SSH host, containers (private)
+    # Remote verification mode: "disabled" (skip), "optional" (fallback), "required" (fail)
+    remote_verification_mode: str = "optional"
     default_verification: dict = field(default_factory=dict)
     executor_limits: dict = field(default_factory=dict)
+    # max_runtime=None means no total time limit (progress-based stall only)
+    # This is the default; per-project overrides possible via local config.
     codex_budget: dict = field(default_factory=dict)
     # Generated-artifact patterns: paths that the executor may create but must
     # NOT commit. Generic default is EMPTY (the platform is language-agnostic).

@@ -193,7 +193,8 @@ class TestRemoteUnconfiguredBlocks:
         store = StateStore(db_path=tmp_path / "tasks.db")
         budget = CodexBudget(db_path=tmp_path / "codex.db")
         stages = StageStore(db_path=tmp_path / "stages.db")
-        cfg = _cfg(main_repo, default_verification={"local": {"command": ["true"]}})  # no remote_validation
+        cfg = _cfg(main_repo, default_verification={"local": {"command": ["true"]}},
+                   remote_verification_mode="required")  # no remote_validation, required → fail
 
         task_id = _unique_task_id("remote")
         store.create(task_id, "demo-project", baseline_sha="base")
