@@ -76,8 +76,15 @@ Output ONLY a single JSON object (no markdown, no prose before or after, no code
   "task_id": "<task id whose dispute is being arbitrated>",
   "dispute_id": "<identifier of the dispute being arbitrated>",
   "candidate_sha": "<Git SHA of the candidate commit under dispute>",
-  "ruling": "uphold_finding",
-  "rationale": "<the judge's rationale for the ruling>",
+  "ruling": "OVERTURN",
+  "findings_rulings": [
+    {
+      "finding_id": "<id of the finding>",
+      "ruling": "OVERTURN",
+      "rationale": "<why this finding is invalid or already fixed>"
+    }
+  ],
+  "rationale": "<the judge's overall rationale for the ruling>",
   "evidence_cited": ["<evidence reference>", "<evidence reference>"],
   "new_evidence_present": false,
   "model": "codex"
@@ -88,10 +95,15 @@ Notes on the fields:
 
 - `decision_id` — stable unique identifier for the decision.
 - `task_id` — identifier of the task whose dispute is being arbitrated.
-- `dispute_id` — identifier of the dispute being arbitrated.
+- `dispute_id` — identifier of the dispute being arbitrated (optional for single-finding arbitrations).
 - `candidate_sha` — Git SHA of the candidate commit under dispute.
-- `ruling` — the judge's ruling on the disputed finding. MUST be exactly one of `"uphold_finding"`, `"overturn_finding"`, or `"modify_finding"` (no other values).
-- `rationale` — the judge's rationale for the ruling.
+- `ruling` — the judge's overall ruling on ALL findings. MUST be exactly one of:
+  - `"OVERTURN"` — ALL findings are invalid or already fixed; the candidate should be APPROVED.
+  - `"UPHOLD"` — At least one finding is valid and must be addressed; the candidate should NOT be approved.
+  - `"MIXED"` — Some findings are valid, some are not; the candidate needs partial fixes.
+  - `"UNRESOLVED"` — The evidence is insufficient to decide; the task needs human review.
+- `findings_rulings` — per-finding rulings (recommended for transparency). Each entry has `finding_id`, `ruling` (OVERTURN or UPHOLD), and `rationale`.
+- `rationale` — the judge's overall rationale for the ruling.
 - `evidence_cited` — list of evidence references (e.g. log paths, finding ids, code excerpts) cited in support of the ruling.
 - `new_evidence_present` — boolean; whether the judge introduced new evidence not previously available to the reviewer or executor.
 - `model` — identifier of the model that produced the decision.

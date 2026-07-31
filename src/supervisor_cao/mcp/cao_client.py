@@ -112,6 +112,41 @@ class CaoClient:
         except Exception:
             return False
 
+    # --- terminal status / output polling (for WorkerMonitor) ---
+
+    def get_terminal_status(self, terminal_id: str) -> dict:
+        """GET /terminals/{terminal_id} — returns status, last_active, session_name.
+
+        The ``status`` field is one of: unknown, idle, processing, completed,
+        waiting_user_answer, error. This is the canonical liveness signal for
+        CAO-backed workers (no separate heartbeat endpoint exists).
+        ``last_active`` is updated only on input sends (not every output chunk),
+        so a static last_active during PROCESSING is normal.
+        """
+        try:
+            r = requests.get(f"{self.server_url}/terminals/{terminal_id}",
+                             timeout=10)
+            if r.status_code == 200:
+                return r.json()
+            return {"status": "unknown", "http_code": r.status_code}
+        except Exception as e:
+            return {"status": "unknown", "error": str(e)}
+
+    def get_terminal_output(self, terminal_id: str, mode: str = "full") -> str:
+        """GET /terminals/{terminal_id}/output?mode=full|last — raw tmux pane.
+
+        Returns the output string (may be large). Used by WorkerMonitor to
+        diff output length for progress detection.
+        """
+        try:
+            r = requests.get(f"{self.server_url}/terminals/{terminal_id}/output",
+                             params={"mode": mode}, timeout=15)
+            if r.status_code == 200:
+                return r.json().get("output", "")
+            return ""
+        except Exception:
+            return ""
+
     # --- worker launch ---
 
     def provider_for(self, profile: str) -> str:

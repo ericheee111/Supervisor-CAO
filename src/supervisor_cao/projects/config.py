@@ -33,6 +33,19 @@ class ProjectConfig:
     default_verification: dict = field(default_factory=dict)
     executor_limits: dict = field(default_factory=dict)
     codex_budget: dict = field(default_factory=dict)
+    # Generated-artifact patterns: paths that the executor may create but must
+    # NOT commit. Generic default is EMPTY (the platform is language-agnostic).
+    # Python projects set ["__pycache__", "*.pyc", "*.egg-info", ...] in their
+    # local config. The executor cleanup only removes UNTRACKED files matching
+    # these patterns inside the worktree; a candidate commit containing any
+    # matching path is REJECTED. This is project-level and cannot be overridden
+    # per-task (security: prevents smuggling artifacts into commits).
+    generated_artifact_patterns: list[str] = field(default_factory=list)
+    # Stall detection: when ALL progress indicators (CAO status PROCESSING,
+    # subprocess alive, output growth, CPU/IO change) are stopped for this many
+    # seconds, the worker handle is marked STALLED. Default 1800s (30 min) is
+    # conservative; per-stage overrides via executor_limits.stall_overrides.
+    stall_timeout: int = 1800
     extra: dict = field(default_factory=dict)
 
     @property
@@ -65,6 +78,7 @@ ALLOWED_TASK_OVERRIDE_KEYS = {
 FORBIDDEN_TASK_OVERRIDE_KEYS = {
     "wsl_repo", "windows_repo", "remote_validation", "base_branch",
     "task_branch_prefix", "codex_budget", "executor_limits",
+    "generated_artifact_patterns", "stall_timeout",
 }
 
 
@@ -110,6 +124,8 @@ def load_project(name: str, task_override_path: str | Path | None = None) -> Pro
         default_verification=cfg.get("default_verification", {}),
         executor_limits=cfg.get("executor_limits", {}),
         codex_budget=cfg.get("codex_budget", {}),
+        generated_artifact_patterns=cfg.get("generated_artifact_patterns", []),
+        stall_timeout=cfg.get("stall_timeout", 1800),
         extra=cfg.get("extra", {}),
     )
 

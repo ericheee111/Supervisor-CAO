@@ -65,7 +65,7 @@ def test_decision_schema_valid():
     schema = _load("decision.schema.json")
     validate({
         "decision_id": "D1", "task_id": "T1", "dispute_id": "S1",
-        "candidate_sha": "c1", "ruling": "uphold_finding", "rationale": "because",
+        "candidate_sha": "c1", "ruling": "UPHOLD", "rationale": "because",
         "evidence_cited": ["e1"], "new_evidence_present": False, "model": "codex",
     }, schema)
 

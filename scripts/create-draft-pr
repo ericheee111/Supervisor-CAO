@@ -78,7 +78,7 @@ def build_pr_body(task_id: str, plan_summary: str, baseline_sha: str, candidate_
 
 
 def create_or_update_draft(repo: str, task_branch: str, base_branch: str, title: str,
-                           body: str) -> str:
+                           body: str, label: str | None = None) -> str:
     """Create or update a draft PR via gh. Returns the PR URL."""
     # check existing
     r = _run(["gh", "pr", "list", "--repo", _repo_full(repo), "--head", task_branch,
@@ -91,10 +91,14 @@ def create_or_update_draft(repo: str, task_branch: str, base_branch: str, title:
             pass
     if existing:
         pr_num = existing[0]["number"]
-        _run(["gh", "pr", "edit", str(pr_num), "--repo", _repo_full(repo), "--body", body, "--title", title])
+        _run(["gh", "pr", "edit", str(pr_num), "--repo", _repo_full(repo),
+              "--body", body, "--title", title])
         return existing[0]["url"]
-    r = _run(["gh", "pr", "create", "--repo", _repo_full(repo), "--head", task_branch,
-              "--base", base_branch, "--title", title, "--body", body, "--draft"])
+    create_cmd = ["gh", "pr", "create", "--repo", _repo_full(repo), "--head", task_branch,
+                  "--base", base_branch, "--title", title, "--body", body, "--draft"]
+    if label:
+        create_cmd += ["--label", label]
+    r = _run(create_cmd)
     return r.stdout.strip()
 
 
@@ -138,6 +142,10 @@ def main() -> int:
     ap.add_argument("--test-mode", action="store_true",
                     help="write a test PR URL without calling gh (temp repos only). "
                          "Production mode requires real gh pr create/edit success.")
+    ap.add_argument("--label", default=None,
+                    help="optional PR label (e.g. acceptance-test for acceptance PRs)")
+    ap.add_argument("--acceptance-run-id", default=None,
+                    help="acceptance run id; sets the PR title prefix and label")
     args = ap.parse_args()
 
     run_dir = Path(args.run_dir)
@@ -187,6 +195,10 @@ def main() -> int:
                  if (run_dir / n).exists()]
 
     title = f"[Draft] {args.task_id}"
+    label = args.label
+    if args.acceptance_run_id:
+        title = f"[Acceptance/{args.acceptance_run_id}] {args.task_id}"
+        label = label or "acceptance-test"
     body = build_pr_body(args.task_id, plan_summary, "", candidate_sha, changed_files,
                          wsl_tests, remote_tests, codex_review, codex_call_count, artifacts, [])
     # Requirement 7: test-mode writes a test PR URL without calling gh.
@@ -197,7 +209,8 @@ def main() -> int:
         (run_dir / "draft-pr-url.txt").write_text(url)
         return 0
     try:
-        url = create_or_update_draft(args.repo, args.task_branch, args.base_branch, title, body)
+        url = create_or_update_draft(args.repo, args.task_branch, args.base_branch,
+                                     title, body, label=label)
         print(f"Draft PR: {url}")
         (run_dir / "draft-pr-url.txt").write_text(url)
         return 0

@@ -67,6 +67,12 @@ class StageRun:
     finished: float | None
     attempt: int = 0
     input_sha: str | None = None
+    # Worker handle status (separate from task state). A STALLED handle does NOT
+    # change the task's TaskState; it records that the worker is stalled. The
+    # resume_state saves the task state to restore after a successful reattach.
+    handle_status: str | None = None   # RUNNING/COMPLETED/FAILED/STALLED
+    resume_state: str | None = None    # task state to restore after reattach
+    worker_id: str | None = None       # WorkerMonitor handle id
 
     def to_dict(self) -> dict:
         return {
@@ -77,6 +83,8 @@ class StageRun:
             "codex_call_id": self.codex_call_id,
             "started": self.started, "finished": self.finished,
             "attempt": self.attempt, "input_sha": self.input_sha,
+            "handle_status": self.handle_status, "resume_state": self.resume_state,
+            "worker_id": self.worker_id,
         }
 
 
@@ -119,6 +127,9 @@ class StageStore:
                     finished REAL,
                     attempt INTEGER NOT NULL DEFAULT 0,
                     input_sha TEXT,
+                    handle_status TEXT,
+                    resume_state TEXT,
+                    worker_id TEXT,
                     PRIMARY KEY (task_id, stage)
                 )
                 """
@@ -129,6 +140,12 @@ class StageStore:
                 c.execute("ALTER TABLE stage_runs ADD COLUMN attempt INTEGER NOT NULL DEFAULT 0")
             if "input_sha" not in cols:
                 c.execute("ALTER TABLE stage_runs ADD COLUMN input_sha TEXT")
+            if "handle_status" not in cols:
+                c.execute("ALTER TABLE stage_runs ADD COLUMN handle_status TEXT")
+            if "resume_state" not in cols:
+                c.execute("ALTER TABLE stage_runs ADD COLUMN resume_state TEXT")
+            if "worker_id" not in cols:
+                c.execute("ALTER TABLE stage_runs ADD COLUMN worker_id TEXT")
             c.commit()
 
     def begin_stage(self, task_id: str, stage: str,
@@ -181,25 +198,28 @@ class StageStore:
                 c.execute(
                     "UPDATE stage_runs SET stage_run_id=?, status=?, terminal_id=?, "
                     "worker_profile=?, artifact_path=?, candidate_sha=?, codex_call_id=?, "
-                    "started=?, finished=NULL, attempt=?, input_sha=? WHERE task_id=? AND stage=?",
+                    "started=?, finished=NULL, attempt=?, input_sha=?, "
+                    "handle_status=NULL, resume_state=NULL, worker_id=NULL "
+                    "WHERE task_id=? AND stage=?",
                     (run_id, PENDING, None, worker_profile, None, None, None, now,
                      next_attempt, input_sha, task_id, stage),
                 )
                 c.commit()
                 return StageRun(task_id, stage, run_id, PENDING, None, worker_profile,
-                                None, None, None, now, None, next_attempt, input_sha), False
+                                None, None, None, now, None, next_attempt, input_sha,
+                                None, None, None), False
             # no prior record: insert new
             run_id = str(uuid.uuid4())
             c.execute(
                 "INSERT INTO stage_runs (task_id, stage, stage_run_id, status, terminal_id, "
                 "worker_profile, artifact_path, candidate_sha, codex_call_id, started, finished, "
-                "attempt, input_sha) "
-                "VALUES (?,?,?,?,NULL,?,NULL,NULL,NULL,?,NULL,0,?)",
+                "attempt, input_sha, handle_status, resume_state, worker_id) "
+                "VALUES (?,?,?,?,NULL,?,NULL,NULL,NULL,?,NULL,0,?,NULL,NULL,NULL)",
                 (task_id, stage, run_id, PENDING, worker_profile, now, input_sha),
             )
             c.commit()
             return StageRun(task_id, stage, run_id, PENDING, None, worker_profile,
-                            None, None, None, now, None, 0, input_sha), False
+                            None, None, None, now, None, 0, input_sha, None, None, None), False
 
     def mark_running(self, task_id: str, stage: str, terminal_id: str | None = None,
                      candidate_sha: str | None = None) -> None:
@@ -240,6 +260,35 @@ class StageStore:
             )
             c.commit()
 
+    def set_handle_status(self, task_id: str, stage: str, *,
+                          handle_status: str | None = None,
+                          resume_state: str | None = None,
+                          worker_id: str | None = None) -> None:
+        """Update the worker handle status on a stage run. handle_status is one
+        of RUNNING/COMPLETED/FAILED/STALLED (worker-level, NOT task state).
+        resume_state saves the task state to restore after a successful reattach.
+        worker_id is the WorkerMonitor handle id for resume lookup."""
+        with self._lock, self._conn() as c:
+            sets: list[str] = []
+            vals: list = []
+            if handle_status is not None:
+                sets.append("handle_status=?")
+                vals.append(handle_status)
+            if resume_state is not None:
+                sets.append("resume_state=?")
+                vals.append(resume_state)
+            if worker_id is not None:
+                sets.append("worker_id=?")
+                vals.append(worker_id)
+            if not sets:
+                return
+            vals.extend([task_id, stage])
+            c.execute(
+                f"UPDATE stage_runs SET {', '.join(sets)} WHERE task_id=? AND stage=?",
+                vals,
+            )
+            c.commit()
+
     def get(self, task_id: str, stage: str) -> StageRun | None:
         with self._lock, self._conn() as c:
             row = c.execute(
@@ -257,6 +306,7 @@ class StageStore:
         return [self._row_to_run(r) for r in rows]
 
     def _row_to_run(self, row: sqlite3.Row) -> StageRun:
+        keys = row.keys()
         return StageRun(
             task_id=row["task_id"], stage=row["stage"],
             stage_run_id=row["stage_run_id"], status=row["status"],
@@ -264,6 +314,9 @@ class StageStore:
             artifact_path=row["artifact_path"], candidate_sha=row["candidate_sha"],
             codex_call_id=row["codex_call_id"], started=row["started"],
             finished=row["finished"],
-            attempt=row["attempt"] if "attempt" in row.keys() else 0,
-            input_sha=row["input_sha"] if "input_sha" in row.keys() else None,
+            attempt=row["attempt"] if "attempt" in keys else 0,
+            input_sha=row["input_sha"] if "input_sha" in keys else None,
+            handle_status=row["handle_status"] if "handle_status" in keys else None,
+            resume_state=row["resume_state"] if "resume_state" in keys else None,
+            worker_id=row["worker_id"] if "worker_id" in keys else None,
         )

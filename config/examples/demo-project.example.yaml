@@ -46,6 +46,42 @@ executor_limits:
   push_every_valid_candidate: true
   require_clean_worktree: true
   require_commit: true
+  # Maximum wall-clock seconds a single worker may run. null = no total limit;
+  # the worker is allowed to run indefinitely as long as it shows progress
+  # (output growth, PROCESSING status, or alive subprocess). Only when ALL
+  # progress indicators stop for stall_timeout seconds is the handle marked
+  # STALLED. Set an integer to enforce a hard cap (rarely needed).
+  max_runtime: null
+  # Per-stage stall-timeout overrides. If a stage key is present, its value
+  # overrides the project-level stall_timeout for that stage only.
+  stall_overrides:
+    planner: 600        # Codex planner should not stall longer than 10 min
+    implementation: 1800  # executor may need up to 30 min
+    review: 900
+    incremental_review: 600
+
+# Stall detection: when ALL progress indicators (CAO status PROCESSING,
+# subprocess alive, output growth, CPU/IO change) are stopped for this many
+# seconds, the worker handle is marked STALLED. Default 1800s (30 min).
+# The handle's resume_state is saved; a reattach is attempted before
+# transitioning the task to NEEDS_HUMAN.
+stall_timeout: 1800
+
+# Generated-artifact patterns: paths the executor may create but MUST NOT
+# commit. The platform is language-agnostic; the generic default is EMPTY.
+# A project using Python sets these in its LOCAL config (not here) e.g.:
+#   generated_artifact_patterns:
+#     - "__pycache__"
+#     - "*.pyc"
+#     - "*.egg-info"
+#     - ".eggs"
+#     - "build"
+#     - "dist"
+#     - ".pytest_cache"
+# The executor cleanup removes only UNTRACKED files matching these patterns
+# inside the worktree. A candidate commit containing any matching path is
+# REJECTED (the executor must re-submit without the artifacts).
+generated_artifact_patterns: []
 
 # Codex budget per task. Enforced in code, not by the Supervisor.
 codex_budget:

@@ -33,6 +33,7 @@ from supervisor_cao.workers.worktrees import (
 from supervisor_cao.validation.windows_sync import sync as win_sync, WindowsSyncBlocked
 from supervisor_cao.mcp.cao_client import CaoClient
 from supervisor_cao.mcp.worker_runner import WorkerRunner, WorkerError
+from supervisor_cao.mcp.worker_monitor import WorkerMonitor
 from supervisor_cao.mcp.stage_store import StageStore, COMPLETED as STAGE_COMPLETED
 
 RUN_ROOT = Path.home() / "cao-runs"
@@ -55,6 +56,7 @@ class PolicyGateway:
                  budget: CodexBudget | None = None,
                  cao_client: CaoClient | None = None,
                  stage_store: StageStore | None = None,
+                 worker_monitor: WorkerMonitor | None = None,
                  test_mode: bool = False,
                  backend_factory=None,
                  local_fixture: bool = False,
@@ -68,6 +70,8 @@ class PolicyGateway:
         self.cao = cao_client or CaoClient(run_root=self.run_root)
         self.stages = stage_store or StageStore()
         self.runner = WorkerRunner(self.cao, run_root=self.run_root)
+        self.worker_monitor = worker_monitor or WorkerMonitor(
+            cao_client=self.cao, run_root=self.run_root)
         # Test mode is enabled via dependency injection (NOT a .test-mode file).
         # When True, the draft-PR step writes a test URL instead of calling gh.
         self.test_mode = test_mode
@@ -364,6 +368,23 @@ class PolicyGateway:
                 raise PolicyError(f"no stage handler for state {state}")
         except WorkerError as e:
             self.stages.fail_stage(task_id, _stage_for_state(state))
+            # Check if there is a stalled worker handle for this task.
+            # STALLED is a worker-level status, NOT a TaskState. We attempt
+            # reattach; only if it fails do we transition the task to NEEDS_HUMAN.
+            handle = self.worker_monitor.find_for_task(task_id)
+            if handle and handle.status == "STALLED":
+                if self.worker_monitor.resume_worker(handle.worker_id):
+                    # reattach succeeded — restore resume_state and continue
+                    if handle.resume_state:
+                        try:
+                            self.store.transition(task_id, handle.resume_state)
+                        except Exception:
+                            pass  # state may have advanced; best-effort
+                    return self.store.get(task_id).to_dict()
+                # reattach failed — task needs human intervention
+                self.store.transition(task_id, TaskState.NEEDS_HUMAN,
+                                      error=f"worker stalled and reattach failed: {e}")
+                raise PolicyError(str(e))
             self.store.transition(task_id, TaskState.FAILED, error=str(e))
             raise PolicyError(str(e))
         except PolicyError:
@@ -448,7 +469,9 @@ class PolicyGateway:
         self.stages.mark_running(task_id, stage, candidate_sha=base_sha)
         impl, real_sha = self.runner.run_executor(
             task_id, plan, base_sha, executor_wt, session_name,
-            expected_branch=adapter.task_branch_for(task_id))
+            expected_branch=adapter.task_branch_for(task_id),
+            generated_artifact_patterns=cfg.generated_artifact_patterns,
+            max_runtime=cfg.executor_limits.get("max_runtime"))
         self.stages.complete_stage(task_id, stage, artifact_path=str(run_dir / "implementation.json"),
                                    candidate_sha=real_sha)
         self.store.transition(task_id, TaskState.IMPLEMENTED, new_candidate_sha=real_sha)
@@ -602,7 +625,9 @@ class PolicyGateway:
         impl, real_sha = self.runner.run_executor(
             task_id, fix_plan, fix_base,
             executor_wt, session_name,
-            expected_branch=adapter.task_branch_for(task_id))
+            expected_branch=adapter.task_branch_for(task_id),
+            generated_artifact_patterns=cfg.generated_artifact_patterns,
+            max_runtime=cfg.executor_limits.get("max_runtime"))
         self.stages.complete_stage(task_id, stage, artifact_path=str(run_dir / "implementation.json"),
                                    candidate_sha=real_sha)
         # new SHA invalidates old verification/review — re-verify then incremental
@@ -663,6 +688,10 @@ class PolicyGateway:
                "--base-branch", cfg.base_branch, "--run-dir", str(run_dir)]
         if self.test_mode:
             cmd.append("--test-mode")
+        # Acceptance runs pass a run-id for PR title/label isolation.
+        acceptance_run_id = cfg.extra.get("acceptance_run_id")
+        if acceptance_run_id:
+            cmd += ["--acceptance-run-id", str(acceptance_run_id)]
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         if r.returncode != 0:
             self.stages.fail_stage(task_id, stage)
@@ -707,13 +736,66 @@ class PolicyGateway:
             raise PolicyError(f"REVIEWING: invalid review decision {decision!r}")
 
     def _apply_incremental_decision(self, task_id, rec, review: dict):
+        """Apply the incremental review decision. When CHANGES_REQUESTED, ALL
+        findings are submitted to the Codex Judge (the platform does NOT
+        auto-approve based on 'insufficient evidence'). Judge rulings:
+        OVERTURN / UPHOLD / MIXED / UNRESOLVED.
+        - All findings OVERTURN → APPROVED.
+        - Any UPHOLD / MIXED / UNRESOLVED, or budget exhausted → NEEDS_HUMAN.
+        """
         decision = review.get("decision")
         if decision == "APPROVED":
             self.store.transition(task_id, TaskState.APPROVED)
         elif decision == "CHANGES_REQUESTED":
-            self.store.transition(task_id, TaskState.CHANGES_REQUESTED)
+            # Submit ALL findings to the Judge. Do not auto-approve.
+            self._stage_judge(task_id, rec, review)
         else:
             raise PolicyError(f"INCREMENTAL_REVIEWING: invalid decision {decision!r}")
+
+    def _stage_judge(self, task_id, rec, review: dict):
+        """Submit all CHANGES_REQUESTED findings to the Codex Judge.
+
+        The Judge rules on each finding: OVERTURN / UPHOLD / MIXED / UNRESOLVED.
+        Only if ALL findings are OVERTURN does the task proceed to APPROVED.
+        Any other ruling or budget exhaustion → NEEDS_HUMAN (no fake approval).
+        """
+        findings = review.get("findings", [])
+        if not findings:
+            # No findings to arbitrate — treat as approval (reviewer found nothing).
+            self.store.transition(task_id, TaskState.APPROVED)
+            return
+        run_dir = self.run_root / task_id
+        run_dir.mkdir(parents=True, exist_ok=True)
+        # spend judge budget (idempotent: if a prior judge call exists for this
+        # candidate, the budget spend will raise BudgetExhausted, which we
+        # catch → NEEDS_HUMAN)
+        try:
+            call = self.budget.spend(task_id, "judge",
+                                     input_artifact=str(run_dir / "incremental_review.json"),
+                                     candidate_sha=rec.candidate_sha)
+        except Exception as e:
+            # budget exhausted — cannot arbitrate; NEEDS_HUMAN
+            self.store.transition(task_id, TaskState.NEEDS_HUMAN,
+                                  error=f"judge budget exhausted: {e}")
+            raise PolicyError(f"JUDGE_BUDGET_EXHAUSTED: {e}")
+        impl = self.get_artifact(task_id, "implementation") or {}
+        verify = self.get_artifact(task_id, "verification") or {}
+        cfg = load_project(rec.project)
+        # Run the Judge via WorkerRunner
+        decision = self.runner.run_judge(
+            task_id, rec.candidate_sha, findings, impl, verify,
+            cfg.wsl_repo or str(run_dir), f"scao-{task_id}")
+        self._save_budget_summary(task_id)
+        # Save the judge decision artifact
+        (run_dir / "decision.json").write_text(json.dumps(decision, indent=2))
+        ruling = decision.get("ruling", "UNRESOLVED")
+        if ruling == "OVERTURN":
+            # All findings overturned → approve
+            self.store.transition(task_id, TaskState.APPROVED)
+        else:
+            # UPHOLD / MIXED / UNRESOLVED → NEEDS_HUMAN (no fake approval)
+            self.store.transition(task_id, TaskState.NEEDS_HUMAN,
+                                  error=f"judge ruling={ruling}: findings not fully overturned")
 
     def _save_budget_summary(self, task_id: str):
         run_dir = self.run_root / task_id
