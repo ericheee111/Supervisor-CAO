@@ -868,6 +868,10 @@ class PolicyGateway:
     def _apply_review_decision(self, task_id, rec, review: dict):
         """The review decision (parsed from real Worker output) drives state."""
         decision = review.get("decision")
+        # Ensure we're in REVIEWING state before transitioning to the decision
+        # state (REMOTE_VERIFIED -> REVIEWING -> CHANGES_REQUESTED/APPROVED)
+        if rec.state == TaskState.REMOTE_VERIFIED.value:
+            self.store.transition(task_id, TaskState.REVIEWING)
         if decision == "APPROVED":
             self.store.transition(task_id, TaskState.APPROVED)
         elif decision == "CHANGES_REQUESTED":
