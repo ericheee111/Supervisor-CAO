@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+"""worker-shim: persistent worker launcher.
+
+Wraps a Worker command (OpenCode CLI or Codex run-step) in an independent
+process that survives Controller exit. Writes result.json + exit-code to
+persistent files. Does NOT depend on a daemon reaper thread in the Controller.
+
+Usage:
+  worker-shim --stdout <path> --stderr <path> --result <path> --exit-code <path> \
+              -- <command> [args...]
+
+The shim:
+  1. Launches the Worker command as a child process (inheriting the new session).
+  2. Streams stdout/stderr to the log files.
+  3. Waits for the child to exit.
+  4. Writes the exit code to --exit-code file.
+  5. Writes a minimal result.json with exit_code + success flag.
+  6. Exits with the child's exit code.
+
+The Controller (WorkerMonitor) launches the shim with start_new_session=True,
+so Ctrl+C on the Controller does not kill the shim or the Worker.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Persistent worker launcher shim")
+    ap.add_argument("--stdout", required=True, help="path to stdout log file")
+    ap.add_argument("--stderr", required=True, help="path to stderr log file")
+    ap.add_argument("--result", required=True, help="path to result.json")
+    ap.add_argument("--exit-code", required=True, help="path to exit code file")
+    ap.add_argument("command", nargs=argparse.REMAINDER, help="command to run (after --)")
+    args = ap.parse_args()
+
+    # Remove leading -- if present
+    cmd = args.command
+    if cmd and cmd[0] == "--":
+        cmd = cmd[1:]
+    if not cmd:
+        print("ERROR: no command specified", file=sys.stderr)
+        return 2
+
+    # Ensure log dirs exist
+    for p in [args.stdout, args.stderr, args.result, args.exit_code]:
+        Path(p).parent.mkdir(parents=True, exist_ok=True)
+
+    # Write a partial result file immediately (signals "shim started")
+    Path(args.result).write_text(json.dumps({"done": False, "started": True}))
+
+    try:
+        with open(args.stdout, "w", buffering=1) as stdout_f, \
+             open(args.stderr, "w", buffering=1) as stderr_f:
+            proc = subprocess.run(cmd, stdout=stdout_f, stderr=stderr_f)
+            exit_code = proc.returncode
+    except Exception as e:
+        exit_code = -1
+        Path(args.stderr).write_text(f"worker-shim error: {e}\n", encoding="utf-8")
+
+    # Write exit code file
+    Path(args.exit_code).write_text(str(exit_code))
+
+    # Write result.json (minimal — the Controller parses the stdout log for
+    # the actual agent message)
+    result = {
+        "done": True,
+        "exit_code": exit_code,
+        "success": exit_code == 0,
+    }
+    # Try to read stdout for last_message extraction (OpenCode NDJSON)
+    try:
+        stdout_content = Path(args.stdout).read_text(encoding="utf-8", errors="replace")
+        result["raw_output"] = stdout_content
+        # Extract last assistant message from OpenCode NDJSON
+        last_msg = _extract_last_message(stdout_content)
+        if last_msg:
+            result["last_message"] = last_msg
+    except Exception:
+        pass
+
+    Path(args.result).write_text(json.dumps(result, ensure_ascii=False))
+    return exit_code
+
+
+def _extract_last_message(output: str) -> str | None:
+    """Extract the last assistant message from OpenCode NDJSON output."""
+    lines = [l for l in output.strip().split("\n") if l.strip()]
+    for line in reversed(lines):
+        try:
+            obj = json.loads(line)
+            if obj.get("type") == "assistant" or obj.get("role") == "assistant":
+                content = obj.get("content", "")
+                if isinstance(content, list):
+                    for part in reversed(content):
+                        if isinstance(part, dict) and part.get("type") == "text":
+                            return part.get("text", "")
+                elif isinstance(content, str) and content.strip():
+                    return content
+        except (json.JSONDecodeError, KeyError, TypeError):
+            continue
+    # Fallback: return last non-empty line
+    return lines[-1] if lines else None
+
+
+if __name__ == "__main__":
+    sys.exit(main())

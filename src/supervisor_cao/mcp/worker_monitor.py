@@ -179,7 +179,7 @@ class WorkerMonitor:
         self._db = str(db_path)
         self._run_root = run_root or (Path.home() / "cao-runs")
         self._lock = threading.Lock()
-        self._owner_id = str(uuid.uuid4())
+        self._owner_id = f"{uuid.uuid4()}:{os.getpid()}"  # encode PID for crash detection
         self._init_schema()
 
     def _conn(self) -> sqlite3.Connection:
@@ -320,13 +320,16 @@ class WorkerMonitor:
         return status
 
     def wait_for_stage(self, task_id: str, stall_timeout: int = 1800,
-                       max_polls: int = 10000) -> dict:
+                       max_polls: int | None = None) -> dict:
         """Block until the current stage's worker reaches a terminal state
         (COMPLETED / FAILED / STALLED). Returns the final WorkerStatus as dict.
 
         This is the single call the Supervisor makes — ordinary polling happens
         inside this method, not via the LLM. Poll intervals back off from 2s
         to 30s.
+
+        ``max_polls=None`` means no poll limit (wait indefinitely as long as
+        the worker shows progress).
         """
         # find the RUNNING worker for this task
         wh = self._find_running_for_task(task_id)
@@ -336,7 +339,12 @@ class WorkerMonitor:
         stall_deadline = time.time() + stall_timeout
         poll_idx = 0
         last_progress = wh.last_progress_at
-        for _ in range(max_polls):
+        poll_count = 0
+        while True:
+            if max_polls is not None and poll_count >= max_polls:
+                return {"worker_id": wh.worker_id, "status": H_FAILED,
+                        "error": "max_polls exceeded"}
+            poll_count += 1
             status = self.poll_worker(wh.worker_id)
             if status.progress_detected:
                 last_progress = time.time()
@@ -360,8 +368,6 @@ class WorkerMonitor:
             interval = POLL_INTERVALS[min(poll_idx, len(POLL_INTERVALS) - 1)]
             poll_idx += 1
             time.sleep(interval)
-        return {"worker_id": wh.worker_id, "status": H_FAILED,
-                "error": "max_polls exceeded"}
 
     def resume_worker(self, worker_id: str) -> bool:
         """Reattach to a STALLED or orphaned worker handle.
@@ -418,6 +424,76 @@ class WorkerMonitor:
                 (task_id,),
             ).fetchone()
         return self._row_to_handle(row) if row else None
+
+    def peek_worker(self, worker_id: str) -> WorkerStatus:
+        """Read-only poll: check worker status WITHOUT acquiring/renewing lease.
+
+        Used by task watch / logs --follow (read-only commands that must not
+        interfere with an active Controller's ownership).
+        """
+        wh = self._load(worker_id)
+        if wh is None:
+            return WorkerStatus(worker_id, H_FAILED, error="handle not found")
+        if wh.status in (H_COMPLETED, H_FAILED):
+            return WorkerStatus(worker_id, wh.status, exit_code=wh.exit_code)
+        if wh.status == H_STALLED:
+            return WorkerStatus(worker_id, H_STALLED, error="handle stalled")
+        # Do a read-only poll (no lease update)
+        status = self._do_poll(wh)
+        # Do NOT call _update_from_poll (that renews lease). Just return status.
+        return status
+
+    def release_ownership(self, worker_id: str) -> None:
+        """Release the Controller's lease on a worker (for Ctrl+C exit).
+
+        Does NOT kill the worker. The worker continues running in the background.
+        """
+        with self._lock, self._conn() as c:
+            c.execute(
+                "UPDATE workers SET lease_until=? WHERE worker_id=? AND owner_id=?",
+                (time.time(), worker_id, self._owner_id),
+            )
+            c.commit()
+        self._log_event(worker_id, "LEASE_RELEASED", {"controller": self._owner_id})
+
+    def safe_takeover(self, worker_id: str) -> bool:
+        """Safely take over an orphaned worker handle after a Controller crash.
+
+        Checks if the previous owner_pid is still alive. If alive and lease
+        valid → refuse (two active Controllers must not own the same handle).
+        If dead or lease expired → claim ownership.
+        """
+        wh = self._load(worker_id)
+        if wh is None:
+            return False
+        now = time.time()
+        # Check previous owner_pid (stored in owner_id field as "uuid:pid")
+        prev_owner_pid = self._extract_owner_pid(wh.owner_id)
+        if prev_owner_pid and self._process_alive(prev_owner_pid) and now < wh.lease_until:
+            # Previous owner still alive and lease valid — refuse
+            self._log_event(worker_id, "TAKEOVER_REFUSED",
+                            {"reason": "owner still alive", "owner_pid": prev_owner_pid})
+            return False
+        # Claim ownership
+        with self._lock, self._conn() as c:
+            c.execute(
+                "UPDATE workers SET owner_id=?, lease_until=?, last_heartbeat_at=? "
+                "WHERE worker_id=?",
+                (self._owner_id, now + DEFAULT_LEASE_DURATION, now, worker_id),
+            )
+            c.commit()
+        self._log_event(worker_id, "TAKEOVER", {"new_owner": self._owner_id})
+        return True
+
+    @staticmethod
+    def _extract_owner_pid(owner_id: str) -> int | None:
+        """Extract PID from owner_id if encoded as 'uuid:pid'."""
+        if ":" in owner_id:
+            try:
+                return int(owner_id.rsplit(":", 1)[1])
+            except (ValueError, IndexError):
+                pass
+        return None
 
     # ------------------------------------------------------------------
     # Internal: launch helpers
@@ -503,12 +579,12 @@ class WorkerMonitor:
     def _start_process_worker(self, worker_id, task_id, stage, profile, prompt,
                               working_directory, session_name, model, timeout,
                               run_dir) -> ProcessHandle:
-        """Launch an OpenCode worker as a detached subprocess.
+        """Launch an OpenCode worker via worker-shim (persistent, no daemon reaper).
 
-        Uses ``start_new_session=True`` (POSIX setsid) or
-        ``CREATE_NEW_PROCESS_GROUP`` (Windows) so Ctrl+C on the orchestrator
-        does not kill the worker. stdout/stderr go to log files; the exit
-        code is written to exit_code_file by a reaper thread.
+        Uses ``scripts/worker-shim`` to wrap the OpenCode command in an
+        independent process that survives Controller exit. The shim writes
+        stdout/stderr to log files, result.json, and exit-code — all persistent.
+        No daemon reaper thread is needed; poll_worker reads these files.
         """
         model_arg = model or _profile_model(profile)
         cmd = ["opencode", "run", "--format", "json", "--agent", profile]
@@ -518,17 +594,21 @@ class WorkerMonitor:
         stdout_log = str(run_dir / f"{stage}-stdout.log")
         stderr_log = str(run_dir / f"{stage}-stderr.log")
         exit_code_file = str(run_dir / f"{stage}-exit.txt")
-        stdout_f = open(stdout_log, "w", buffering=1)
-        stderr_f = open(stderr_log, "w", buffering=1)
-        kwargs: dict[str, Any] = {
-            "stdout": stdout_f, "stderr": stderr_f,
-            "cwd": working_directory,
-        }
+        result_file = str(run_dir / f"{stage}-result.json")
+        # Launch via worker-shim (persistent, survives Controller exit)
+        shim = Path(__file__).resolve().parents[3] / "scripts" / "worker-shim"
+        shim_cmd = [
+            sys.executable, str(shim),
+            "--stdout", stdout_log, "--stderr", stderr_log,
+            "--result", result_file, "--exit-code", exit_code_file,
+            "--", *cmd,
+        ]
+        kwargs: dict[str, Any] = {"cwd": working_directory}
         if sys.platform == "win32":
             kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
         else:
             kwargs["start_new_session"] = True
-        proc = subprocess.Popen(cmd, **kwargs)
+        proc = subprocess.Popen(shim_cmd, **kwargs)
         pid = proc.pid
         pgid = pid
         if sys.platform != "win32":
@@ -536,20 +616,9 @@ class WorkerMonitor:
                 pgid = os.getpgid(pid)
             except Exception:
                 pass
-        # reaper thread: wait for exit, write code, close files
-        def _reaper():
-            code = proc.wait()
-            try:
-                Path(exit_code_file).write_text(str(code))
-            except Exception:
-                pass
-            try:
-                stdout_f.close()
-                stderr_f.close()
-            except Exception:
-                pass
-            self._log_event(worker_id, "PROCESS_EXITED", {"code": code})
-        threading.Thread(target=_reaper, daemon=True).start()
+        # Do NOT start a daemon reaper thread. The shim writes exit-code and
+        # result.json itself. poll_worker reads those files.
+        self._log_event(worker_id, "PROCESS_STARTED", {"pid": pid, "pgid": pgid})
         return ProcessHandle(
             pid=pid, pgid=pgid,
             stdout_log=stdout_log, stderr_log=stderr_log,
@@ -625,6 +694,15 @@ class WorkerMonitor:
                             raw_output=raw)
 
     def _poll_process(self, wh: WorkerHandle) -> WorkerStatus:
+        """Poll a process worker. Reads result.json/exit-code files (no daemon reaper).
+
+        Progress detection:
+          - output grew (stdout log size increased)
+          - output hash changed
+          - process still alive (liveness, not progress)
+          - CPU time changed (best-effort, POSIX only)
+          - child subprocesses still running (best-effort)
+        """
         ph = wh.process_handle
         pid = ph["pid"]
         alive = self._process_alive(pid)
@@ -641,10 +719,33 @@ class WorkerMonitor:
             pass
         new_hash = hashlib.md5(output[-2000:].encode()).hexdigest() if output else ""
         hash_changed = new_hash != wh.output_hash
-        # Check exit code file
+        # CPU time change detection (POSIX only, best-effort)
+        cpu_changed = self._cpu_time_changed(pid, wh)
+        # Child subprocess running (best-effort)
+        children_running = self._children_running(pid, ph.get("pgid", pid))
+        # Check result.json (written by worker-shim on completion)
+        result_file = self._run_root / wh.task_id / f"{wh.stage}-result.json"
+        if result_file.exists():
+            try:
+                data = json.loads(result_file.read_text())
+                if data.get("done"):
+                    exit_code = data.get("exit_code", -1)
+                    last_message = data.get("last_message")
+                    raw = data.get("raw_output", output)
+                    if not last_message:
+                        last_message = _extract_opencode_message(raw)
+                    if exit_code == 0 and last_message:
+                        return WorkerStatus(wh.worker_id, H_COMPLETED,
+                                            last_message=last_message, raw_output=raw,
+                                            exit_code=exit_code, progress_detected=True)
+                    return WorkerStatus(wh.worker_id, H_FAILED,
+                                        error=f"process exited code={exit_code}",
+                                        exit_code=exit_code, raw_output=raw)
+            except Exception:
+                pass
+        # Fallback: check exit code file
         exit_code = self._read_exit_code_val(ph["exit_code_file"])
         if exit_code is not None:
-            # process has exited
             last_message = _extract_opencode_message(output)
             if exit_code == 0 and last_message:
                 return WorkerStatus(wh.worker_id, H_COMPLETED,
@@ -653,7 +754,9 @@ class WorkerMonitor:
             return WorkerStatus(wh.worker_id, H_FAILED,
                                 error=f"process exited code={exit_code}",
                                 exit_code=exit_code, raw_output=output)
-        progress = output_grew or hash_changed
+        # Progress: output grew OR hash changed OR CPU changed OR children running.
+        # PROCESSING (alive) is liveness, NOT progress.
+        progress = output_grew or hash_changed or cpu_changed or children_running
         return WorkerStatus(wh.worker_id, H_RUNNING,
                             progress_detected=progress,
                             output_grew=output_grew,
@@ -841,6 +944,41 @@ class WorkerMonitor:
             return True
         except (ProcessLookupError, PermissionError, OSError):
             return False
+
+    @staticmethod
+    def _cpu_time_changed(pid: int, wh: WorkerHandle) -> bool:
+        """Check if CPU time changed since last poll (POSIX, best-effort)."""
+        if sys.platform == "win32":
+            return False  # not easily available on Windows
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text().split()
+            utime = int(stat[13])
+            stime = int(stat[14])
+            total = utime + stime
+            prev = getattr(wh, '_prev_cpu_time', None)
+            if prev is not None and total != prev:
+                wh._prev_cpu_time = total  # type: ignore
+                return True
+            wh._prev_cpu_time = total  # type: ignore
+        except Exception:
+            pass
+        return False
+
+    @staticmethod
+    def _children_running(pid: int, pgid: int) -> bool:
+        """Check if any child subprocess is running (best-effort, POSIX)."""
+        if sys.platform == "win32":
+            return False
+        try:
+            # Check /proc for children of this pid
+            proc_children = Path(f"/proc/{pid}/task/{pid}/children")
+            if proc_children.exists():
+                children = proc_children.read_text().strip().split()
+                if children:
+                    return True
+        except Exception:
+            pass
+        return False
 
     @staticmethod
     def _read_exit_code_val(exit_code_file: str) -> int | None:
