@@ -798,26 +798,26 @@ def _run_runtime_review_fix(dirs: dict[str, Path], meta: dict) -> tuple[bool, di
     # Inject a real defect: off-by-one in a simple function
     src_dir = Path(repo_dir) / "src" / "scao_live"
     src_dir.mkdir(parents=True, exist_ok=True)
-    # Inject a function that passes basic tests but has a clear boundary defect:
-    # parse_int accepts empty string as 0 (should raise ValueError)
-    (src_dir / "int_utils.py").write_text(
-        "def parse_int(s):\n"
-        "    \"\"\"Parse a string to int. Has a boundary defect: accepts empty string as 0.\"\"\"\n"
-        "    if not s:\n"
-        "        return 0  # BUG: should raise ValueError for empty input\n"
-        "    return int(s)\n"
+    # Inject a function with a safety defect that passes basic tests:
+    # safe_join doesn't check for path traversal (.. in parts)
+    src_dir = Path(repo_dir) / "src" / "scao_live"
+    src_dir.mkdir(parents=True, exist_ok=True)
+    (src_dir / "paths.py").write_text(
+        "def safe_join(base, *parts):\n"
+        "    \"\"\"Join base with parts. Should prevent path traversal.\"\"\"\n"
+        "    import os\n"
+        "    # DEFECT: no check for '..' in parts — allows path traversal\n"
+        "    return os.path.join(base, *parts)\n"
     )
-    (Path(repo_dir) / "tests" / "test_int_utils.py").write_text(
-        "from scao_live.int_utils import parse_int\n\n"
-        "def test_basic():\n"
-        "    assert parse_int('42') == 42\n\n"
-        "def test_zero():\n"
-        "    assert parse_int('0') == 0\n\n"
-        "def test_negative():\n"
-        "    assert parse_int('-1') == -1\n"
+    (Path(repo_dir) / "tests" / "test_paths.py").write_text(
+        "from scao_live.paths import safe_join\n\n"
+        "def test_basic_join():\n"
+        "    assert safe_join('/base', 'a', 'b') == '/base/a/b'\n\n"
+        "def test_single_part():\n"
+        "    assert safe_join('/base', 'x') == '/base/x'\n"
     )
     subprocess.run(["git", "-C", repo_dir, "add", "-A"], capture_output=True, timeout=30)
-    subprocess.run(["git", "-C", repo_dir, "commit", "-m", "add parse_int with boundary defect"],
+    subprocess.run(["git", "-C", repo_dir, "commit", "-m", "add safe_join with traversal defect"],
                    capture_output=True, timeout=30)
     cfg = _make_project_config(repo_dir, dirs)
     cfg.remote_verification_mode = "disabled"
@@ -826,9 +826,9 @@ def _run_runtime_review_fix(dirs: dict[str, Path], meta: dict) -> tuple[bool, di
     print(f"  task: {task_id}")
     gw.save_config_snapshot(task_id, cfg)
     gw.create_task(task_id, "acceptance",
-                   "Review and fix src/scao_live/int_utils.py: parse_int should raise "
-                   "ValueError for empty string input, not return 0. Add a test for the "
-                   "empty-string case. Run tests to verify.",
+                   "Review and improve src/scao_live/paths.py: the safe_join function "
+                   "should prevent path traversal (reject '..' in parts). Add a test "
+                   "for the traversal case. Run tests to verify.",
                    baseline_sha=None)
     from supervisor_cao.state.machine import TaskState
     terminal = {TaskState.APPROVED.value, TaskState.FAILED.value, TaskState.NEEDS_HUMAN.value}
