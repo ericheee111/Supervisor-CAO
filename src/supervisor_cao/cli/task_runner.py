@@ -49,12 +49,13 @@ def _build_gateway(run_root: Path | None = None) -> PolicyGateway:
 def _make_temp_config(repo: str, base_branch: str, verify_command: str | None,
                       stall_timeout: int = 1800) -> ProjectConfig:
     """Build a temporary ProjectConfig for --repo mode."""
+    import shlex
     return ProjectConfig(
         name="temp-task",
         base_branch=base_branch,
         wsl_repo=repo,
         remote_verification_mode="disabled",
-        default_verification={"local": {"command": verify_command.split()}} if verify_command else {},
+        default_verification={"local": {"command": shlex.split(verify_command)}} if verify_command else {},
         stall_timeout=stall_timeout,
     )
 
@@ -64,7 +65,8 @@ def task_start(repo: str, base_branch: str, description_file: str,
                stall_timeout: int = 1800) -> int:
     """Start a new task and drive it to terminal."""
     desc = Path(description_file).read_text(encoding="utf-8")
-    task_id = f"task-{int(time.time())}"
+    import uuid as _uuid
+    task_id = f"task-{int(time.time())}-{_uuid.uuid4().hex[:6]}"
     run_root = RUN_ROOT
     gw = _build_gateway(run_root)
 
