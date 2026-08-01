@@ -434,8 +434,29 @@ def validate_and_stamp(stage: str, obj: dict, task_id: str,
     strip = {"stage", "schema_version"}
     if candidate_sha is not None and "candidate_sha" not in declared_props:
         strip.add("candidate_sha")
+    # Also strip fields not declared in the schema (additionalProperties: false
+    # would reject them). Codex sometimes adds extra fields like 'description'
+    # at the top level of plan/review JSON.
+    if schema.get("additionalProperties") is False:
+        strip.update(k for k in obj.keys() if k not in declared_props and k not in strip)
     validation_obj = {k: v for k, v in obj.items() if k not in strip}
+    # Clean ANSI escape codes from string values (Codex/tmux output may
+    # contain \x1b[39m etc. inside string values)
+    import re as _re
+    _ansi_re = _re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')
+    def _clean_ansi(val):
+        if isinstance(val, str):
+            return _ansi_re.sub('', val).replace('\r\n', '\n').strip()
+        if isinstance(val, list):
+            return [_clean_ansi(v) for v in val]
+        if isinstance(val, dict):
+            return {k: _clean_ansi(v) for k, v in val.items()}
+        return val
+    validation_obj = {k: _clean_ansi(v) for k, v in validation_obj.items()}
     jsonschema.validate(validation_obj, schema)
+    # Update obj with cleaned values
+    for k, v in validation_obj.items():
+        obj[k] = v
     # stamp remaining platform metadata after validation
     obj["stage"] = stage
     obj["schema_version"] = SCHEMA_VERSION
