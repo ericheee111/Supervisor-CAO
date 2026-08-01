@@ -904,7 +904,16 @@ def _run_runtime_review_fix(dirs: dict[str, Path], meta: dict) -> tuple[bool, di
 
 
 def _run_runtime_resume(dirs: dict[str, Path], meta: dict) -> tuple[bool, dict]:
-    """runtime-resume: real controller restart + Worker reattach."""
+    """runtime-resume: real controller restart + Worker reattach.
+
+    Verifies:
+    1. Worker handle persisted with worker_id, terminal_id/pid, attempt, call_id
+    2. Controller restart (new gateway, same SQLite)
+    3. worker_id, terminal_id/pid, attempt, call_id unchanged after resume
+    4. No duplicate Workers for the same stage
+    5. Budget calls not re-spent for pre-interrupt stages
+    6. Final state APPROVED
+    """
     if not _check_cao_server():
         print("  SKIP: cao-server not running")
         return False, {"error": "cao-server not running"}
@@ -924,7 +933,8 @@ def _run_runtime_resume(dirs: dict[str, Path], meta: dict) -> tuple[bool, dict]:
                    baseline_sha=None)
     from supervisor_cao.state.machine import TaskState
     terminal = {TaskState.APPROVED.value, TaskState.FAILED.value, TaskState.NEEDS_HUMAN.value}
-    # Drive 2 stages, then "interrupt" (build new gateway = controller restart)
+
+    # Step 1-2: Drive stages until we have a RUNNING worker with persisted handle
     for i in range(1, 3):
         rec = gw.get_task(task_id)
         if rec["state"] in terminal:
@@ -932,47 +942,140 @@ def _run_runtime_resume(dirs: dict[str, Path], meta: dict) -> tuple[bool, dict]:
         print(f"  [pre-interrupt stage {i}] {rec['state']} -> run_next_stage ...")
         rec = gw.run_next_stage(task_id)
         print(f"    state={rec['state']}")
+
+    # Step 3: Save pre-interrupt snapshot
     budget_before = budget.summary(task_id)
     stages_before = [s.to_dict() for s in stages.list_stages(task_id)]
+    # Capture worker handle before interrupt
+    wh_before = gw.worker_monitor.find_for_task(task_id)
+    worker_handle_before = None
+    if wh_before:
+        worker_handle_before = {
+            "worker_id": wh_before.worker_id,
+            "handle_type": wh_before.handle_type,
+            "status": wh_before.status,
+            "stage": wh_before.stage,
+            "terminal_id": wh_before.cao_handle.get("terminal_id") if wh_before.cao_handle else None,
+            "pid": wh_before.process_handle.get("pid") if wh_before.process_handle else None,
+        }
+    # Capture Codex call_ids before interrupt
+    codex_calls_before = []
+    try:
+        import sqlite3 as _sqlite
+        with _sqlite.connect(str(dirs["budget"] / "codex.db")) as c:
+            rows = c.execute("SELECT role, call_index FROM codex_calls WHERE task_id=? ORDER BY call_index",
+                             (task_id,)).fetchall()
+            codex_calls_before = [(r[0], r[1]) for r in rows]
+    except Exception:
+        pass
+    # Capture stage attempts before interrupt
+    stage_attempts_before = {s["stage"]: s.get("attempt", 0) for s in stages_before}
     print(f"  === INTERRUPT (controller restart) === budget={budget_before}")
-    # Build new gateway (simulates controller restart, reuses same SQLite)
+    if worker_handle_before:
+        print(f"  worker_before: id={worker_handle_before['worker_id'][:8]} "
+              f"type={worker_handle_before['handle_type']} "
+              f"stage={worker_handle_before['stage']}")
+
+    # Step 4-6: Build new gateway (controller restart), safe takeover, resume
     gw2, store2, budget2, stages2 = _build_gateway(dirs, cfg)
-    # Safe takeover
-    wh = gw2.worker_monitor.find_for_task(task_id)
-    if wh:
-        gw2.worker_monitor.safe_takeover(wh.worker_id)
+    wh_after = gw2.worker_monitor.find_for_task(task_id)
+    worker_handle_after = None
+    if wh_after:
+        worker_handle_after = {
+            "worker_id": wh_after.worker_id,
+            "handle_type": wh_after.handle_type,
+            "status": wh_after.status,
+            "stage": wh_after.stage,
+            "terminal_id": wh_after.cao_handle.get("terminal_id") if wh_after.cao_handle else None,
+            "pid": wh_after.process_handle.get("pid") if wh_after.process_handle else None,
+        }
+        # Safe takeover
+        gw2.worker_monitor.safe_takeover(wh_after.worker_id)
+
+    # Step 7: Drive to terminal
     rec = _drive_to_runtime_terminal(gw2, task_id, store2, terminal)
     budget_after = budget2.summary(task_id)
     stages_after = [s.to_dict() for s in stages2.list_stages(task_id)]
     evidence = _collect_evidence(task_id, store2, budget2, stages2, dirs)
-    # Strict assertions: budget ==, stage attempt ==, no duplicate
-    budget_before_used = budget_before.get("total_used", 0)
-    budget_after_used = budget_after.get("total_used", 0)
-    budget_ok = budget_after_used >= budget_before_used  # may increase for new stages, never decrease
-    # completed stages before should still be completed after (not re-run)
-    before_map = {s["stage"]: s for s in stages_before if s.get("status") == "COMPLETED"}
-    after_map = {s["stage"]: s for s in stages_after if s.get("status") == "COMPLETED"}
-    stages_ok = True
-    for stage_name, before_s in before_map.items():
-        if stage_name in after_map:
-            after_s = after_map[stage_name]
-            if after_s.get("attempt", 0) > before_s.get("attempt", 0):
-                stages_ok = False
+
+    # Step 8: Verify resume correctness
+    # 8a: worker_id unchanged
+    worker_id_match = (worker_handle_before and worker_handle_after
+                       and worker_handle_before["worker_id"] == worker_handle_after["worker_id"])
+    # 8b: terminal_id or pid unchanged
+    handle_id_match = False
+    if worker_handle_before and worker_handle_after:
+        if worker_handle_before.get("terminal_id") and worker_handle_after.get("terminal_id"):
+            handle_id_match = worker_handle_before["terminal_id"] == worker_handle_after["terminal_id"]
+        elif worker_handle_before.get("pid") and worker_handle_after.get("pid"):
+            handle_id_match = worker_handle_before["pid"] == worker_handle_after["pid"]
+    # 8c: stage attempt unchanged for pre-interrupt completed stages
+    stage_attempts_after = {s["stage"]: s.get("attempt", 0) for s in stages_after}
+    attempts_ok = True
+    for stage_name, before_attempt in stage_attempts_before.items():
+        after_attempt = stage_attempts_after.get(stage_name, 0)
+        if after_attempt != before_attempt:
+            attempts_ok = False
+            break
+    # 8d: Codex call_id unchanged for pre-interrupt calls
+    codex_calls_after = []
+    try:
+        import sqlite3 as _sqlite
+        with _sqlite.connect(str(dirs["budget"] / "codex.db")) as c:
+            rows = c.execute("SELECT role, call_index FROM codex_calls WHERE task_id=? ORDER BY call_index",
+                             (task_id,)).fetchall()
+            codex_calls_after = [(r[0], r[1]) for r in rows]
+    except Exception:
+        pass
+    # Pre-interrupt calls must still exist (not re-spent)
+    calls_ok = all(call in codex_calls_after for call in codex_calls_before)
+    # 8e: no duplicate workers for same stage
+    no_duplicate_workers = True
+    try:
+        import sqlite3 as _sqlite
+        with _sqlite.connect(str(dirs["state"] / "workers.db")) as c:
+            dupes = c.execute(
+                "SELECT stage, COUNT(*) as cnt FROM workers WHERE task_id=? GROUP BY stage HAVING cnt > 1",
+                (task_id,)).fetchall()
+            no_duplicate_workers = len(dupes) == 0
+    except Exception:
+        pass
+
+    # Budget check: pre-interrupt call_ids must not change (new calls allowed)
+    budget_ok = calls_ok
+
+    evidence["worker_handle_before"] = worker_handle_before
+    evidence["worker_handle_after"] = worker_handle_after
+    evidence["worker_id_match"] = worker_id_match
+    evidence["handle_id_match"] = handle_id_match
+    evidence["attempts_ok"] = attempts_ok
+    evidence["calls_ok"] = calls_ok
+    evidence["no_duplicate_workers"] = no_duplicate_workers
+    evidence["budget_ok"] = budget_ok
+    evidence["codex_calls_before"] = codex_calls_before
+    evidence["codex_calls_after"] = codex_calls_after
     evidence["budget_before"] = budget_before
     evidence["budget_after"] = budget_after
-    evidence["budget_ok"] = budget_ok
-    evidence["stages_ok"] = stages_ok
     evidence["final_state"] = rec["state"]
-    ok = (rec["state"] == TaskState.APPROVED.value and budget_ok and stages_ok)
+
+    ok = (rec["state"] == TaskState.APPROVED.value
+          and worker_id_match and handle_id_match and attempts_ok
+          and calls_ok and no_duplicate_workers)
     run_id = f"{int(time.time())}-rt-resume"
     ev_dir = _evidence_dir(ACCEPTANCE_ROOT, "runtime-resume", run_id)
     _record_evidence(ev_dir, result={"passed": ok},
                      task_snapshot=rec, events=store2.events(task_id),
                      stage_attempts=stages_after,
                      budget_log=budget_after,
-                     worker_handles=[],
-                     sha_info={"candidate": rec.get("candidate_sha")},
-                     pr_content_info={"budget_ok": budget_ok, "stages_ok": stages_ok})
+                     worker_handles=[worker_handle_before, worker_handle_after] if worker_handle_before else [],
+                     sha_info={"candidate": rec.get("candidate_sha"),
+                               "tested": rec.get("tested_sha"),
+                               "reviewed": rec.get("reviewed_sha")},
+                     pr_content_info={"worker_id_match": worker_id_match,
+                                      "handle_id_match": handle_id_match,
+                                      "attempts_ok": attempts_ok,
+                                      "calls_ok": calls_ok,
+                                      "no_duplicate_workers": no_duplicate_workers})
     evidence["evidence_path"] = str(ev_dir)
     return ok, evidence
 
