@@ -798,20 +798,26 @@ def _run_runtime_review_fix(dirs: dict[str, Path], meta: dict) -> tuple[bool, di
     # Inject a real defect: off-by-one in a simple function
     src_dir = Path(repo_dir) / "src" / "scao_live"
     src_dir.mkdir(parents=True, exist_ok=True)
-    (src_dir / "math_utils.py").write_text(
-        "def add_one(n):\n"
-        "    \"\"\"Add one to n. Has an off-by-one bug (returns n instead of n+1).\"\"\"\n"
-        "    return n  # BUG: should be n + 1\n"
+    # Inject a function that passes basic tests but has a clear boundary defect:
+    # parse_int accepts empty string as 0 (should raise ValueError)
+    (src_dir / "int_utils.py").write_text(
+        "def parse_int(s):\n"
+        "    \"\"\"Parse a string to int. Has a boundary defect: accepts empty string as 0.\"\"\"\n"
+        "    if not s:\n"
+        "        return 0  # BUG: should raise ValueError for empty input\n"
+        "    return int(s)\n"
     )
-    (Path(repo_dir) / "tests" / "test_math_utils.py").write_text(
-        "from scao_live.math_utils import add_one\n\n"
-        "def test_add_one():\n"
-        "    assert add_one(5) == 6\n\n"
-        "def test_add_one_zero():\n"
-        "    assert add_one(0) == 1\n"
+    (Path(repo_dir) / "tests" / "test_int_utils.py").write_text(
+        "from scao_live.int_utils import parse_int\n\n"
+        "def test_basic():\n"
+        "    assert parse_int('42') == 42\n\n"
+        "def test_zero():\n"
+        "    assert parse_int('0') == 0\n\n"
+        "def test_negative():\n"
+        "    assert parse_int('-1') == -1\n"
     )
     subprocess.run(["git", "-C", repo_dir, "add", "-A"], capture_output=True, timeout=30)
-    subprocess.run(["git", "-C", repo_dir, "commit", "-m", "add buggy add_one"],
+    subprocess.run(["git", "-C", repo_dir, "commit", "-m", "add parse_int with boundary defect"],
                    capture_output=True, timeout=30)
     cfg = _make_project_config(repo_dir, dirs)
     cfg.remote_verification_mode = "disabled"
@@ -820,8 +826,9 @@ def _run_runtime_review_fix(dirs: dict[str, Path], meta: dict) -> tuple[bool, di
     print(f"  task: {task_id}")
     gw.save_config_snapshot(task_id, cfg)
     gw.create_task(task_id, "acceptance",
-                   "Fix the bug in src/scao_live/math_utils.py: add_one should return n+1, "
-                   "not n. Run tests to verify.",
+                   "Review and fix src/scao_live/int_utils.py: parse_int should raise "
+                   "ValueError for empty string input, not return 0. Add a test for the "
+                   "empty-string case. Run tests to verify.",
                    baseline_sha=None)
     from supervisor_cao.state.machine import TaskState
     terminal = {TaskState.APPROVED.value, TaskState.FAILED.value, TaskState.NEEDS_HUMAN.value}
@@ -833,24 +840,65 @@ def _run_runtime_review_fix(dirs: dict[str, Path], meta: dict) -> tuple[bool, di
     had_incremental = any(e.get("to_state") == "INCREMENTAL_REVIEWING" for e in events)
     protocol_passed = had_changes_requested and had_fix and had_incremental
     task_approved = rec["state"] == TaskState.APPROVED.value
+    # Track first vs fixed candidate SHA
+    fix_events = [e for e in events if e.get("to_state") == "FIXING"]
+    first_candidate = None
+    fixed_candidate = rec.get("candidate_sha")
+    if fix_events:
+        # The candidate before FIXING is the first candidate
+        pre_fix_events = [e for e in events if e.get("ts", 0) < fix_events[0].get("ts", 0)]
+        for e in reversed(pre_fix_events):
+            if e.get("detail"):
+                try:
+                    detail = json.loads(e["detail"]) if isinstance(e["detail"], str) else e["detail"]
+                    if "candidate_sha" in detail:
+                        first_candidate = detail["candidate_sha"]
+                        break
+                except Exception:
+                    pass
+    sha_match = (rec.get("candidate_sha") == rec.get("tested_sha") == rec.get("reviewed_sha"))
+    sha_changed = (first_candidate != fixed_candidate) if first_candidate else False
     evidence["protocol_passed"] = protocol_passed
     evidence["task_approved"] = task_approved
     evidence["final_state"] = rec["state"]
-    # PASS if either:
-    # 1. Full protocol passed (CHANGES_REQUESTED + fix + incremental review) + APPROVED
-    # 2. Reviewer directly APPROVED (task_approved + APPROVED) — correct behavior
-    #    when the executor's fix is sufficient
-    ok = task_approved and rec["state"] == TaskState.APPROVED.value
+    evidence["first_candidate_sha"] = first_candidate
+    evidence["fixed_candidate_sha"] = fixed_candidate
+    evidence["sha_match"] = sha_match
+    evidence["sha_changed"] = sha_changed
+    # Strict pass conditions:
+    # 1. protocol_passed (CHANGES_REQUESTED + fix + incremental review)
+    # 2. task_approved (final state == APPROVED)
+    # 3. final_state == APPROVED
+    # 4. first_candidate != fixed_candidate (fix produced new SHA)
+    # 5. candidate == tested == reviewed
+    if protocol_passed and task_approved and rec["state"] == TaskState.APPROVED.value \
+            and sha_changed and sha_match:
+        ok = True
+        status = "PASS"
+    elif task_approved and not protocol_passed:
+        # Reviewer directly APPROVED without CHANGES_REQUESTED
+        ok = False
+        status = "SKIPPED_PROTOCOL"
+    else:
+        ok = False
+        status = "FAIL"
+    evidence["status"] = status
     run_id = f"{int(time.time())}-rt-rfix"
     ev_dir = _evidence_dir(ACCEPTANCE_ROOT, "runtime-review-fix", run_id)
-    _record_evidence(ev_dir, result={"passed": ok},
+    _record_evidence(ev_dir, result={"passed": ok, "status": status},
                      task_snapshot=rec, events=events,
                      stage_attempts=[s.to_dict() for s in stages.list_stages(task_id)],
                      budget_log=budget.summary(task_id),
                      worker_handles=[],
-                     sha_info={"candidate": rec.get("candidate_sha")},
+                     sha_info={"candidate": rec.get("candidate_sha"),
+                               "tested": rec.get("tested_sha"),
+                               "reviewed": rec.get("reviewed_sha"),
+                               "first_candidate": first_candidate,
+                               "fixed_candidate": fixed_candidate},
                      pr_content_info={"protocol_passed": protocol_passed,
-                                      "task_approved": task_approved})
+                                      "task_approved": task_approved,
+                                      "sha_match": sha_match,
+                                      "sha_changed": sha_changed})
     evidence["evidence_path"] = str(ev_dir)
     return ok, evidence
 
