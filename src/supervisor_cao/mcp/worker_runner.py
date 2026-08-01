@@ -577,46 +577,55 @@ class WorkerRunner:
         ``worker_result`` is the dict returned by WorkerMonitor.wait_for_stage
         (contains last_message, raw_output, exit_code).
 
+        For review/incremental_review/decision stages:
+          - Only accepts fully parseable JSON (no regex field reconstruction)
+          - Must pass the corresponding JSON Schema
+          - Schema failure raises WorkerError (caller does one format-correction retry)
+
+        For research/plan stages:
+          - Allows limited control-character cleanup (_lenient_json_extract)
+          - Must still pass the JSON Schema
+          - Schema failure raises WorkerError
+
         Raises WorkerError if no valid JSON is found or schema validation fails.
-        The caller (_run_stage_via_monitor) retries with a stronger prompt.
         """
+        # Stages that require strict JSON parsing (no lenient/regex fallback)
+        STRICT_STAGES = {"review", "incremental_review", "decision"}
+
         last_message = worker_result.get("last_message", "")
         raw = worker_result.get("raw_output", "")
         obj = None
+
+        # Try strict JSON extraction first (always)
         if last_message:
             try:
                 obj = extract_strict_json(last_message)
             except WorkerError:
                 pass
-        if obj is None and last_message:
-            # Fallback: try lenient JSON extraction (fixes unescaped quotes
-            # in Codex output, e.g. "Initial test repository" in string values)
-            obj = _lenient_json_extract(last_message)
         if obj is None and raw:
             try:
                 obj = extract_strict_json(raw)
             except WorkerError:
                 pass
-        if obj is None and raw:
-            obj = _lenient_json_extract(raw)
+
+        # For non-strict stages, allow lenient extraction as fallback
+        if obj is None and stage not in STRICT_STAGES:
+            if last_message:
+                obj = _lenient_json_extract(last_message)
+            if obj is None and raw:
+                obj = _lenient_json_extract(raw)
+
         if obj is None:
             raise WorkerError(
                 f"{stage} worker: no JSON object found in worker output")
+
+        # Schema validation — required for ALL stages
         try:
             obj = validate_and_stamp(stage, obj, task_id, candidate_sha)
         except jsonschema.ValidationError as e:
-            # Schema validation failed (e.g. Codex used non-standard enum value).
-            # Best-effort: stamp platform metadata without schema validation
-            # so the caller can still read the decision and act on it.
-            obj["task_id"] = task_id
-            obj["stage"] = stage
-            obj["schema_version"] = SCHEMA_VERSION
-            if candidate_sha is not None:
-                obj["candidate_sha"] = candidate_sha
-            # Log the validation error as a warning but don't fail
-            import sys as _sys
-            print(f"WARNING: {stage} schema validation failed: {e.message}",
-                  file=_sys.stderr)
+            raise WorkerError(
+                f"{stage} worker: JSON schema validation failed: {e.message}")
+
         _save_artifact(task_id, stage, obj, run_root=self._run_root)
         return obj
 

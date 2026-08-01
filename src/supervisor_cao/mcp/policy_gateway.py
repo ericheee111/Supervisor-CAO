@@ -437,6 +437,13 @@ class PolicyGateway:
         point — this is the single path for both production and tests.
         Tests inject a mock WorkerMonitor that returns canned results.
         Returns the parsed artifact dict. Raises PolicyError on failure.
+
+        For review/incremental_review/decision stages:
+        - If finalize_result fails (JSON parse or schema validation),
+          retry once with a format-correction prompt via the same Worker.
+        - Second failure → FAILED or NEEDS_HUMAN.
+        - Never guesses APPROVED/CHANGES_REQUESTED/OVERTURN/UPHOLD from
+          damaged text.
         """
         worker_id = self.worker_monitor.start_worker(
             task_id=task_id, stage=stage, profile=request["profile"],
@@ -459,10 +466,54 @@ class PolicyGateway:
             self.stages.fail_stage(task_id, stage, error=error)
             raise PolicyError(f"{stage}: {error}")
         # Finalize: parse + validate + stamp + save artifact
-        artifact = self.runner.finalize_result(
-            request["stage"], task_id, result,
-            candidate_sha=request.get("candidate_sha"))
-        return artifact
+        try:
+            artifact = self.runner.finalize_result(
+                request["stage"], task_id, result,
+                candidate_sha=request.get("candidate_sha"))
+            return artifact
+        except WorkerError as e:
+            # One format-correction retry with a stronger JSON-only prompt
+            retry_prompt = (
+                "CRITICAL: Your previous response did not contain a valid "
+                "JSON object that passes schema validation. You MUST output "
+                "ONLY a raw JSON object. No prose, no markdown, no code fences. "
+                "Start with { and end with }. Ensure all string values have "
+                "escaped quotes and no literal newlines. Ensure enum values "
+                "match exactly (APPROVED/CHANGES_REQUESTED for decision; "
+                "OVERTURN/UPHOLD/MIXED/UNRESOLVED for ruling).\n\n"
+                + request["prompt"])
+            retry_request = dict(request)
+            retry_request["prompt"] = retry_prompt
+            # Start a new Worker for the retry (same stage, stronger prompt)
+            retry_worker_id = self.worker_monitor.start_worker(
+                task_id=task_id, stage=stage, profile=retry_request["profile"],
+                prompt=retry_request["prompt"],
+                working_directory=retry_request["working_directory"],
+                session_name=retry_request.get("session_name"),
+                model=retry_request.get("model"),
+                timeout=retry_request.get("timeout"),
+                stall_timeout=stall_timeout,
+                resume_state=retry_request.get("resume_state"),
+            )
+            retry_result = self.worker_monitor.wait_for_stage(
+                task_id, stall_timeout=stall_timeout)
+            if retry_result.get("status") != "COMPLETED":
+                self.stages.fail_stage(task_id, stage,
+                                       error=f"format retry failed: {retry_result.get('error', '')}")
+                self.store.transition(task_id, TaskState.NEEDS_HUMAN,
+                                      error=f"{stage}: format correction failed after retry")
+                raise PolicyError(f"{stage}: format correction failed after retry")
+            try:
+                artifact = self.runner.finalize_result(
+                    request["stage"], task_id, retry_result,
+                    candidate_sha=request.get("candidate_sha"))
+                return artifact
+            except WorkerError:
+                self.stages.fail_stage(task_id, stage, error=str(e))
+                self.store.transition(task_id, TaskState.NEEDS_HUMAN,
+                                      error=f"{stage}: JSON schema validation failed after retry")
+                raise PolicyError(
+                    f"{stage}: JSON schema validation failed after format-correction retry")
 
     def _stage_research(self, task_id, rec, cfg, session_name, run_dir):
         stage = "research"
