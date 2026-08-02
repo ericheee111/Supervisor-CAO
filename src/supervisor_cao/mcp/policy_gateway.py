@@ -438,6 +438,11 @@ class PolicyGateway:
         Tests inject a mock WorkerMonitor that returns canned results.
         Returns the parsed artifact dict. Raises PolicyError on failure.
 
+        Resume: if a RUNNING worker already exists for this task (e.g. after
+        a Controller interrupt), it is taken over and waited on — a second
+        Worker is NOT started. Goal §4: "同一个task_id + stage + attempt最多
+        存在一个Worker handle".
+
         For review/incremental_review/decision stages:
         - If finalize_result fails (JSON parse or schema validation),
           retry once with a format-correction prompt via the same Worker.
@@ -445,20 +450,31 @@ class PolicyGateway:
         - Never guesses APPROVED/CHANGES_REQUESTED/OVERTURN/UPHOLD from
           damaged text.
         """
-        worker_id = self.worker_monitor.start_worker(
-            task_id=task_id, stage=stage, profile=request["profile"],
-            prompt=request["prompt"], working_directory=request["working_directory"],
-            session_name=request.get("session_name"),
-            model=request.get("model"),
-            timeout=request.get("timeout"),
-            stall_timeout=stall_timeout,
-            resume_state=request.get("resume_state"),
-        )
-        # Persist handle status to StageStore
-        self.stages.set_handle_status(
-            task_id, stage, handle_status="RUNNING",
-            resume_state=request.get("resume_state"),
-            worker_id=worker_id)
+        # Resume path: reuse an existing RUNNING worker for this task if one
+        # exists (e.g. after a Controller SIGINT). This prevents starting a
+        # second Worker for the same stage (Goal §4 single-Worker invariant).
+        existing = self.worker_monitor.find_for_task(task_id)
+        if existing and existing.status == "RUNNING" and existing.stage == stage:
+            self.worker_monitor.safe_takeover(existing.worker_id)
+            self.stages.set_handle_status(
+                task_id, stage, handle_status="RUNNING",
+                resume_state=request.get("resume_state"),
+                worker_id=existing.worker_id)
+        else:
+            worker_id = self.worker_monitor.start_worker(
+                task_id=task_id, stage=stage, profile=request["profile"],
+                prompt=request["prompt"], working_directory=request["working_directory"],
+                session_name=request.get("session_name"),
+                model=request.get("model"),
+                timeout=request.get("timeout"),
+                stall_timeout=stall_timeout,
+                resume_state=request.get("resume_state"),
+            )
+            # Persist handle status to StageStore
+            self.stages.set_handle_status(
+                task_id, stage, handle_status="RUNNING",
+                resume_state=request.get("resume_state"),
+                worker_id=worker_id)
         # Wait for completion (blocks until COMPLETED/FAILED/STALLED)
         result = self.worker_monitor.wait_for_stage(task_id, stall_timeout=stall_timeout)
         if result.get("status") != "COMPLETED":
