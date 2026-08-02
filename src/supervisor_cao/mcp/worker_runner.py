@@ -762,7 +762,14 @@ class WorkerRunner:
             f"Findings:\n{json.dumps(findings, indent=2)}\n"
             f"Executor response:\n{executor_response}\n"
             f"Reviewer rebuttal:\n{reviewer_rebuttal}\n\n"
-            "Output OVERTURN, UPHOLD, MIXED, or UNRESOLVED.\n\n"
+            "CRITICAL: The 'ruling' field MUST be EXACTLY one of these four values "
+            "(case-sensitive, no variations):\n"
+            "  OVERTURN  — all findings are invalid/fixed; candidate should be APPROVED\n"
+            "  UPHOLD    — at least one finding is valid; candidate should NOT be approved\n"
+            "  MIXED     — some findings valid, some not\n"
+            "  UNRESOLVED — insufficient evidence to decide\n"
+            "Do NOT use variations like 'uphold_finding', 'uphold', 'overturn', etc. "
+            "Use EXACTLY the uppercase enum value shown above.\n\n"
             + _schema_hint("decision")
         )
 
