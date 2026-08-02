@@ -1322,13 +1322,30 @@ _drive_to_runtime_terminal(gw, "{task_id}", store, terminal)
 
 def _drive_to_runtime_terminal(gw, task_id: str, store, terminal: set,
                                max_stages: int = 40) -> dict:
-    """Drive run_next_stage until runtime terminal (APPROVED/FAILED/NEEDS_HUMAN)."""
+    """Drive run_next_stage until runtime terminal (APPROVED/FAILED/NEEDS_HUMAN).
+
+    A stage may raise PolicyError after the policy layer has already
+    transitioned the task to a terminal state (e.g. incremental_review JSON
+    schema failure → NEEDS_HUMAN, Goal §3). In that case the task is in a
+    legitimate terminal state and the driver must stop and return it, not
+    propagate the exception and abort the scenario before it can evaluate
+    the outcome. Non-terminal PolicyErrors are re-raised.
+    """
     for i in range(1, max_stages + 1):
         rec = gw.get_task(task_id)
         if rec["state"] in terminal:
             break
         print(f"  [stage {i}] {rec['state']} -> run_next_stage ...")
-        rec = gw.run_next_stage(task_id)
+        try:
+            rec = gw.run_next_stage(task_id)
+        except Exception as e:
+            # The policy layer may have already transitioned to a terminal
+            # state (NEEDS_HUMAN/FAILED) before raising. If so, stop.
+            after = gw.get_task(task_id)
+            if after["state"] in terminal:
+                print(f"    state={after['state']} (terminal after stage error)")
+                return after
+            raise
         print(f"    state={rec['state']} cand={rec.get('candidate_sha') or '-'}")
         if rec["state"] in terminal:
             break
