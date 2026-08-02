@@ -472,48 +472,22 @@ class PolicyGateway:
                 candidate_sha=request.get("candidate_sha"))
             return artifact
         except WorkerError as e:
-            # One format-correction retry with a stronger JSON-only prompt
-            retry_prompt = (
-                "CRITICAL: Your previous response did not contain a valid "
-                "JSON object that passes schema validation. You MUST output "
-                "ONLY a raw JSON object. No prose, no markdown, no code fences. "
-                "Start with { and end with }. Ensure all string values have "
-                "escaped quotes and no literal newlines. Ensure enum values "
-                "match exactly (APPROVED/CHANGES_REQUESTED for decision; "
-                "OVERTURN/UPHOLD/MIXED/UNRESOLVED for ruling).\n\n"
-                + request["prompt"])
-            retry_request = dict(request)
-            retry_request["prompt"] = retry_prompt
-            # Start a new Worker for the retry (same stage, stronger prompt)
-            retry_worker_id = self.worker_monitor.start_worker(
-                task_id=task_id, stage=stage, profile=retry_request["profile"],
-                prompt=retry_request["prompt"],
-                working_directory=retry_request["working_directory"],
-                session_name=retry_request.get("session_name"),
-                model=retry_request.get("model"),
-                timeout=retry_request.get("timeout"),
-                stall_timeout=stall_timeout,
-                resume_state=retry_request.get("resume_state"),
-            )
-            retry_result = self.worker_monitor.wait_for_stage(
-                task_id, stall_timeout=stall_timeout)
-            if retry_result.get("status") != "COMPLETED":
-                self.stages.fail_stage(task_id, stage,
-                                       error=f"format retry failed: {retry_result.get('error', '')}")
-                self.store.transition(task_id, TaskState.NEEDS_HUMAN,
-                                      error=f"{stage}: format correction failed after retry")
-                raise PolicyError(f"{stage}: format correction failed after retry")
-            try:
-                artifact = self.runner.finalize_result(
-                    request["stage"], task_id, retry_result,
-                    candidate_sha=request.get("candidate_sha"))
-                return artifact
-            except WorkerError:
-                self.stages.fail_stage(task_id, stage, error=str(e))
-                self.store.transition(task_id, TaskState.NEEDS_HUMAN,
-                                      error=f"{stage}: JSON schema validation failed after retry")
-                raise PolicyError(
-                    f"{stage}: JSON schema validation failed after format-correction retry")
+            # Format correction: do NOT create a second Worker.
+            # The CAO run-step interface does not support sending a follow-up
+            # message to the same terminal_id. Creating a new Worker would
+            # leave two handles for the same task+stage, violating the
+            # single-Worker invariant.
+            # Instead: save the damaged output and enter NEEDS_HUMAN.
+            self.stages.fail_stage(task_id, stage, error=str(e))
+            # Save the raw Worker output as evidence of the failure
+            run_dir = self.run_root / task_id
+            run_dir.mkdir(parents=True, exist_ok=True)
+            (run_dir / f"{stage}-damaged-output.txt").write_text(
+                result.get("last_message", "") + "\n\n--- raw_output ---\n" +
+                result.get("raw_output", ""), encoding="utf-8")
+            self.store.transition(task_id, TaskState.NEEDS_HUMAN,
+                                  error=f"{stage}: JSON schema validation failed: {e}")
+            raise PolicyError(f"{stage}: JSON schema validation failed: {e}")
 
     def _stage_research(self, task_id, rec, cfg, session_name, run_dir):
         stage = "research"

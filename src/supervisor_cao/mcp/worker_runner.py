@@ -434,14 +434,15 @@ def validate_and_stamp(stage: str, obj: dict, task_id: str,
     strip = {"stage", "schema_version"}
     if candidate_sha is not None and "candidate_sha" not in declared_props:
         strip.add("candidate_sha")
-    # Also strip fields not declared in the schema (additionalProperties: false
-    # would reject them). Codex sometimes adds extra fields like 'description'
-    # at the top level of plan/review JSON.
-    if schema.get("additionalProperties") is False:
+    # For decision stages (review/incremental_review/decision), do NOT strip
+    # extra fields — additionalProperties: false must strictly reject them.
+    # For research/plan, strip extra fields (Codex adds 'description' etc.)
+    DECISION_STAGES = {"review", "incremental_review", "decision"}
+    if stage not in DECISION_STAGES and schema.get("additionalProperties") is False:
         strip.update(k for k in obj.keys() if k not in declared_props and k not in strip)
     validation_obj = {k: v for k, v in obj.items() if k not in strip}
-    # Clean ANSI escape codes from string values (Codex/tmux output may
-    # contain \x1b[39m etc. inside string values)
+    # Clean ANSI escape codes and CRLF from string values BEFORE parsing
+    # (Codex/tmux output may contain \x1b[39m etc. inside string values)
     import re as _re
     _ansi_re = _re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')
     def _clean_ansi(val):
@@ -615,6 +616,17 @@ class WorkerRunner:
 
         last_message = worker_result.get("last_message", "")
         raw = worker_result.get("raw_output", "")
+
+        # Clean ANSI escape codes and CRLF BEFORE parsing (for all stages).
+        # This is a transport-layer cleanup, not a semantic field deletion.
+        # It removes terminal control sequences that tmux/CAO injects.
+        import re as _re
+        _ansi_re = _re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')
+        if last_message:
+            last_message = _ansi_re.sub('', last_message).replace('\r\n', '\n')
+        if raw:
+            raw = _ansi_re.sub('', raw).replace('\r\n', '\n')
+
         obj = None
 
         # Try strict JSON extraction first (always)
