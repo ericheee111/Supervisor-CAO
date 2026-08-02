@@ -666,6 +666,32 @@ class WorkerRunner:
                 obj = extract_strict_json(last_message)
             except WorkerError:
                 pass
+        # For STRICT_STAGES, try json.loads with strict=False (allows control
+        # chars in strings) as a transport-layer tolerance — the schema
+        # validation will still enforce semantic correctness.
+        if obj is None and stage in STRICT_STAGES and last_message:
+            try:
+                from supervisor_cao.mcp.worker_runner import _find_balanced_json
+                # Find the LAST balanced object (most likely the worker's response)
+                pos = 0
+                last_obj = None
+                while True:
+                    span = _find_balanced_json(last_message, pos)
+                    if span is None:
+                        break
+                    s, e = span
+                    chunk = last_message[s:e]
+                    try:
+                        candidate = json.loads(chunk, strict=False)
+                        if isinstance(candidate, dict):
+                            last_obj = candidate
+                    except json.JSONDecodeError:
+                        pass
+                    pos = e
+                if last_obj:
+                    obj = last_obj
+            except Exception:
+                pass
         if obj is None and raw:
             try:
                 obj = extract_strict_json(raw)
