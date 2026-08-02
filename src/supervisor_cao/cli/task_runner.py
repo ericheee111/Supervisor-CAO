@@ -263,13 +263,29 @@ def task_status(task_id: str) -> int:
 
 def _drive_to_terminal(gw: PolicyGateway, task_id: str,
                        stall_timeout: int = 1800, max_stages: int = 40) -> dict:
-    """Drive run_next_stage until runtime terminal. Returns final task record."""
+    """Drive run_next_stage until runtime terminal. Returns final task record.
+
+    A stage may raise PolicyError after the policy layer has already
+    transitioned the task to a terminal state (e.g. local verification
+    failure → FAILED, or JSON schema failure → NEEDS_HUMAN). In that case
+    the task is in a legitimate terminal state and the driver stops and
+    returns it instead of letting the exception crash the CLI. Non-terminal
+    PolicyErrors are re-raised.
+    """
     for i in range(1, max_stages + 1):
         rec = gw.get_task(task_id)
         if rec["state"] in RUNTIME_TERMINAL:
             break
         print(f"  [stage {i}] {rec['state']} -> run_next_stage ...")
-        rec = gw.run_next_stage(task_id)
+        try:
+            rec = gw.run_next_stage(task_id)
+        except Exception:
+            after = gw.get_task(task_id)
+            if after["state"] in RUNTIME_TERMINAL:
+                print(f"    state={after['state']} (terminal after stage error)"
+                      f" err={after.get('error') or '-'}")
+                return after
+            raise
         print(f"    state={rec['state']} cand={rec.get('candidate_sha') or '-'}"
               f" tested={rec.get('tested_sha') or '-'}"
               f" reviewed={rec.get('reviewed_sha') or '-'}"
