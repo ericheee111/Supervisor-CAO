@@ -1075,7 +1075,8 @@ cfg_data = _json.loads(cfg_path.read_text())
 from supervisor_cao.projects.config import ProjectConfig
 cfg = ProjectConfig(**cfg_data)
 
-dirs = {repr({k: Path(v) for k, v in dirs.items()})}
+_dirs_repr = {repr({k: str(v) for k, v in dirs.items()})}
+dirs = {{k: Path(v) for k, v in _dirs_repr.items()}}
 gw, store, budget, stages = _build_gateway(dirs, cfg)
 _inject_config(None, cfg)
 terminal = {{TaskState.APPROVED.value, TaskState.FAILED.value, TaskState.NEEDS_HUMAN.value}}
