@@ -340,6 +340,19 @@ def _collect_evidence(task_id: str, store, budget, stages, dirs: dict[str, Path]
     run_dir = dirs["runs"] / task_id
     if run_dir.exists():
         evidence["artifacts"] = sorted(p.name for p in run_dir.iterdir())
+    # Read Judge ruling (if any) from decision.json for safety_behavior check.
+    # Goal §5: safety_behavior_passed requires a valid Judge ruling
+    # (UPHOLD/MIXED/UNRESOLVED) when the task ended NEEDS_HUMAN, and no fake
+    # APPROVED. Reading the artifact (not the event stream) gives the exact
+    # ruling the Judge produced.
+    decision_file = run_dir / "decision.json"
+    if decision_file.exists():
+        try:
+            decision = json.loads(decision_file.read_text())
+            evidence["judge_ruling"] = decision.get("ruling")
+            evidence["judge_findings"] = decision.get("findings")
+        except Exception:
+            evidence["judge_ruling"] = None
     # draft PR URL
     pr_url_file = dirs["runs"] / task_id / "draft-pr-url.txt"
     if pr_url_file.exists():
@@ -786,6 +799,75 @@ def _run_runtime_direct(dirs: dict[str, Path], meta: dict) -> tuple[bool, dict]:
     return ok, evidence
 
 
+def _evaluate_review_fix_outcome(
+    *,
+    final_state: str,
+    had_changes_requested: bool,
+    had_fix: bool,
+    had_incremental: bool,
+    first_candidate_sha: str | None,
+    fixed_candidate_sha: str | None,
+    tested_sha: str | None,
+    reviewed_sha: str | None,
+    judge_ruling: str | None,
+    approved_state: str,
+    needs_human_state: str,
+) -> dict:
+    """Pure evaluation of the runtime review-fix scenario outcome (Goal §5).
+
+    Computes three independent results — ``protocol_passed``,
+    ``auto_fix_passed``, ``safety_behavior_passed`` — plus ``task_outcome``
+    and the scenario ``status`` (PASS / FAIL / SKIPPED_PROTOCOL). Kept pure
+    (no I/O, no store) so it can be unit-tested without a real CAO server.
+
+    Pass requires BOTH ``protocol_passed`` and ``safety_behavior_passed``:
+
+    * Result A (auto-fix success): APPROVED with the full fix loop completed.
+    * Result B (fix insufficient, safe downgrade): NEEDS_HUMAN with a valid
+      Judge UPHOLD/MIXED/UNRESOLVED ruling — the platform refused to fake
+      APPROVED. The protocol still passes; ``auto_fix_passed`` is False.
+
+    SKIPPED_PROTOCOL: Reviewer directly APPROVED with no fix loop.
+    """
+    sha_match = (fixed_candidate_sha == tested_sha == reviewed_sha)
+    sha_changed = bool(first_candidate_sha and fixed_candidate_sha
+                       and first_candidate_sha != fixed_candidate_sha)
+    protocol_passed = (had_changes_requested and had_fix and had_incremental
+                       and sha_changed and sha_match)
+    task_outcome = final_state
+    auto_fix_passed = (task_outcome == approved_state)
+    valid_downgrade_rulings = {"UPHOLD", "MIXED", "UNRESOLVED"}
+    if auto_fix_passed:
+        safety_behavior_passed = True
+    elif task_outcome == needs_human_state:
+        safety_behavior_passed = (judge_ruling in valid_downgrade_rulings
+                                  and sha_match)
+    else:
+        safety_behavior_passed = False
+    if task_outcome == approved_state and not protocol_passed:
+        ok, status = False, "SKIPPED_PROTOCOL"
+    elif protocol_passed and safety_behavior_passed:
+        ok, status = True, "PASS"
+    else:
+        ok, status = False, "FAIL"
+    return {
+        "ok": ok,
+        "status": status,
+        "protocol_passed": protocol_passed,
+        "auto_fix_passed": auto_fix_passed,
+        "safety_behavior_passed": safety_behavior_passed,
+        "task_outcome": task_outcome,
+        "judge_ruling": judge_ruling,
+        "sha_match": sha_match,
+        "sha_changed": sha_changed,
+        "had_changes_requested": had_changes_requested,
+        "had_fix": had_fix,
+        "had_incremental": had_incremental,
+        "first_candidate_sha": first_candidate_sha,
+        "fixed_candidate_sha": fixed_candidate_sha,
+    }
+
+
 def _run_runtime_review_fix(dirs: dict[str, Path], meta: dict) -> tuple[bool, dict]:
     """runtime-review-fix: controlled candidate injection → CHANGES_REQUESTED → fix → APPROVED.
 
@@ -883,34 +965,37 @@ def _run_runtime_review_fix(dirs: dict[str, Path], meta: dict) -> tuple[bool, di
     had_changes_requested = any(e.get("to_state") == "CHANGES_REQUESTED" for e in events)
     had_fix = any(e.get("to_state") == "FIXING" for e in events)
     had_incremental = any(e.get("to_state") == "INCREMENTAL_REVIEWING" for e in events)
-    protocol_passed = had_changes_requested and had_fix and had_incremental
-    task_approved = rec["state"] == TaskState.APPROVED.value
-    # Track first vs fixed candidate SHA
-    fix_events = [e for e in events if e.get("to_state") == "FIXING"]
     first_candidate = new_sha  # the injected defective candidate
+
+    # Delegate to the pure evaluator (Goal §5) so the judgment is unit-tested.
+    outcome = _evaluate_review_fix_outcome(
+        final_state=rec["state"],
+        had_changes_requested=had_changes_requested,
+        had_fix=had_fix,
+        had_incremental=had_incremental,
+        first_candidate_sha=first_candidate,
+        fixed_candidate_sha=rec.get("candidate_sha"),
+        tested_sha=rec.get("tested_sha"),
+        reviewed_sha=rec.get("reviewed_sha"),
+        judge_ruling=evidence.get("judge_ruling"),
+        approved_state=TaskState.APPROVED.value,
+        needs_human_state=TaskState.NEEDS_HUMAN.value,
+    )
+    ok = outcome["ok"]
+    status = outcome["status"]
+    protocol_passed = outcome["protocol_passed"]
+    auto_fix_passed = outcome["auto_fix_passed"]
+    safety_behavior_passed = outcome["safety_behavior_passed"]
+    task_outcome = outcome["task_outcome"]
+    judge_ruling = outcome["judge_ruling"]
+    sha_match = outcome["sha_match"]
+    sha_changed = outcome["sha_changed"]
     fixed_candidate = rec.get("candidate_sha")
-    sha_match = (rec.get("candidate_sha") == rec.get("tested_sha") == rec.get("reviewed_sha"))
-    sha_changed = (first_candidate != fixed_candidate) if fixed_candidate else False
-    evidence["protocol_passed"] = protocol_passed
-    evidence["task_approved"] = task_approved
+
+    evidence.update(outcome)
     evidence["final_state"] = rec["state"]
-    evidence["first_candidate_sha"] = first_candidate
-    evidence["fixed_candidate_sha"] = fixed_candidate
-    evidence["sha_match"] = sha_match
-    evidence["sha_changed"] = sha_changed
     evidence["injected_candidate"] = True
-    # Strict pass conditions
-    if protocol_passed and task_approved and rec["state"] == TaskState.APPROVED.value \
-            and sha_changed and sha_match:
-        ok = True
-        status = "PASS"
-    elif task_approved and not protocol_passed:
-        ok = False
-        status = "SKIPPED_PROTOCOL"
-    else:
-        ok = False
-        status = "FAIL"
-    evidence["status"] = status
+
     run_id = f"{int(time.time())}-rt-rfix"
     ev_dir = _evidence_dir(ACCEPTANCE_ROOT, "runtime-review-fix", run_id)
     _record_evidence(ev_dir, result={"passed": ok, "status": status},
@@ -924,7 +1009,10 @@ def _run_runtime_review_fix(dirs: dict[str, Path], meta: dict) -> tuple[bool, di
                                "first_candidate": first_candidate,
                                "fixed_candidate": fixed_candidate},
                      pr_content_info={"protocol_passed": protocol_passed,
-                                      "task_approved": task_approved,
+                                      "auto_fix_passed": auto_fix_passed,
+                                      "safety_behavior_passed": safety_behavior_passed,
+                                      "task_outcome": task_outcome,
+                                      "judge_ruling": judge_ruling,
                                       "sha_match": sha_match,
                                       "sha_changed": sha_changed,
                                       "injected_candidate": True})
