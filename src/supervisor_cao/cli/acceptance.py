@@ -1131,8 +1131,8 @@ _drive_to_runtime_terminal(gw, "{task_id}", store, terminal)
                     "stage": row[1],
                     "status": row[2],
                     "handle_type": row[3],
-                    "cao_handle": _json.loads(row[4]) if row[4] else None,
-                    "process_handle": _json.loads(row[5]) if row[5] else None,
+                    "cao_handle": json.loads(row[4]) if row[4] else None,
+                    "process_handle": json.loads(row[5]) if row[5] else None,
                 }
                 break  # found a RUNNING worker — proceed to interrupt
         except Exception as e:
