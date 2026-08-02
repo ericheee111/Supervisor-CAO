@@ -787,7 +787,14 @@ def _run_runtime_direct(dirs: dict[str, Path], meta: dict) -> tuple[bool, dict]:
 
 
 def _run_runtime_review_fix(dirs: dict[str, Path], meta: dict) -> tuple[bool, dict]:
-    """runtime-review-fix: real defect → CHANGES_REQUESTED → fix → APPROVED."""
+    """runtime-review-fix: controlled candidate injection → CHANGES_REQUESTED → fix → APPROVED.
+
+    Uses StateStore.inject_candidate (acceptance-only audited entry point) to
+    inject a candidate with a known safety defect (path traversal in safe_join).
+    The real Codex Reviewer must catch the defect and output CHANGES_REQUESTED.
+    The real GLM Executor must fix it and produce a new SHA.
+    The real Incremental Reviewer must APPROVED the fix.
+    """
     if not _check_cao_server():
         print("  SKIP: cao-server not running")
         return False, {"error": "cao-server not running"}
@@ -795,43 +802,81 @@ def _run_runtime_review_fix(dirs: dict[str, Path], meta: dict) -> tuple[bool, di
     subprocess.run(["git", "-C", repo_dir, "reset", "--hard", "origin/main"],
                    capture_output=True, timeout=30)
     subprocess.run(["git", "-C", repo_dir, "clean", "-fd"], capture_output=True, timeout=30)
-    # Inject a real defect: off-by-one in a simple function
+    # Prepare repo with a correct function (executor will implement this)
     src_dir = Path(repo_dir) / "src" / "scao_live"
     src_dir.mkdir(parents=True, exist_ok=True)
-    # Inject a function with a safety defect that passes basic tests:
-    # safe_join doesn't check for path traversal (.. in parts)
-    src_dir = Path(repo_dir) / "src" / "scao_live"
-    src_dir.mkdir(parents=True, exist_ok=True)
-    (src_dir / "paths.py").write_text(
-        "def safe_join(base, *parts):\n"
-        "    \"\"\"Join base with parts. Should prevent path traversal.\"\"\"\n"
-        "    import os\n"
-        "    # DEFECT: no check for '..' in parts — allows path traversal\n"
-        "    return os.path.join(base, *parts)\n"
-    )
-    (Path(repo_dir) / "tests" / "test_paths.py").write_text(
-        "from scao_live.paths import safe_join\n\n"
-        "def test_basic_join():\n"
-        "    assert safe_join('/base', 'a', 'b') == '/base/a/b'\n\n"
-        "def test_single_part():\n"
-        "    assert safe_join('/base', 'x') == '/base/x'\n"
-    )
+    (src_dir / "__init__.py").write_text("")
+    (Path(repo_dir) / "tests" / "test_smoke.py").write_text("def test_smoke():\n    assert True\n")
     subprocess.run(["git", "-C", repo_dir, "add", "-A"], capture_output=True, timeout=30)
-    subprocess.run(["git", "-C", repo_dir, "commit", "-m", "add safe_join with traversal defect"],
-                   capture_output=True, timeout=30)
+    subprocess.run(["git", "-C", repo_dir, "commit", "-m", "init repo for review-fix",
+                   "--allow-empty"], capture_output=True, timeout=30)
     cfg = _make_project_config(repo_dir, dirs)
     cfg.remote_verification_mode = "disabled"
     gw, store, budget, stages = _build_gateway(dirs, cfg)
     task_id = f"rt-rfix-{int(time.time())}"
     print(f"  task: {task_id}")
     gw.save_config_snapshot(task_id, cfg)
+    # Step 1: Create task and drive to REMOTE_VERIFIED (real research→plan→implement→verify)
     gw.create_task(task_id, "acceptance",
-                   "Review and improve src/scao_live/paths.py: the safe_join function "
-                   "should prevent path traversal (reject '..' in parts). Add a test "
-                   "for the traversal case. Run tests to verify.",
+                   "Implement safe_join(base, *parts) in src/scao_live/paths.py that "
+                   "joins paths and prevents path traversal. Add tests. Run tests to verify.",
                    baseline_sha=None)
     from supervisor_cao.state.machine import TaskState
     terminal = {TaskState.APPROVED.value, TaskState.FAILED.value, TaskState.NEEDS_HUMAN.value}
+    pre_review_states = {TaskState.REMOTE_VERIFIED.value, TaskState.APPROVED.value,
+                         TaskState.FAILED.value, TaskState.NEEDS_HUMAN.value}
+    # Drive until REMOTE_VERIFIED or terminal
+    for i in range(20):
+        rec = gw.get_task(task_id)
+        if rec["state"] in pre_review_states:
+            break
+        print(f"  [stage {i}] {rec['state']} -> run_next_stage ...")
+        rec = gw.run_next_stage(task_id)
+        print(f"    state={rec['state']}")
+    rec = gw.get_task(task_id)
+    if rec["state"] != TaskState.REMOTE_VERIFIED.value:
+        # If already APPROVED or failed, can't do review-fix
+        evidence = _collect_evidence(task_id, store, budget, stages, dirs)
+        evidence["final_state"] = rec["state"]
+        evidence["status"] = "SKIPPED_PROTOCOL" if rec["state"] == TaskState.APPROVED.value else "FAIL"
+        return False, evidence
+    # Step 2: Inject a controlled candidate with a safety defect via audited entry point
+    # The defect: safe_join doesn't check for '..' in parts (path traversal)
+    from supervisor_cao.workers.worktrees import paths_for
+    p = paths_for("acceptance", task_id)
+    wt = str(p.executor) if (p.executor / ".git").exists() else (cfg.wsl_repo or str(dirs["runs"] / task_id))
+    # Write the DEFECTIVE version into the executor worktree
+    (Path(wt) / "src" / "scao_live" / "paths.py").write_text(
+        "def safe_join(base, *parts):\n"
+        "    \"\"\"Join base with parts. Should prevent path traversal.\"\"\"\n"
+        "    import os\n"
+        "    return os.path.join(base, *parts)\n"
+    )
+    # Write tests that DON'T test path traversal (so verification passes)
+    (Path(wt) / "tests" / "test_paths.py").write_text(
+        "from scao_live.paths import safe_join\n\n"
+        "def test_basic_join():\n"
+        "    assert safe_join('/base', 'a', 'b') == '/base/a/b'\n\n"
+        "def test_single_part():\n"
+        "    assert safe_join('/base', 'x') == '/base/x'\n"
+    )
+    subprocess.run(["git", "-C", wt, "add", "-A"], capture_output=True, timeout=30)
+    subprocess.run(["git", "-C", wt, "commit", "-m", "acceptance fixture: safe_join without traversal check"],
+                   capture_output=True, timeout=30)
+    new_sha = subprocess.run(["git", "-C", wt, "rev-parse", "HEAD"],
+                            capture_output=True, text=True, timeout=15).stdout.strip()
+    # Inject the defective candidate via audited entry point
+    store.inject_candidate(task_id, new_sha, TaskState.LOCAL_VERIFYING)
+    print(f"  injected defective candidate: {new_sha[:12]} (safe_join without traversal check)")
+    # Re-verify (verification will pass because tests don't check traversal)
+    for i in range(20):
+        rec = gw.get_task(task_id)
+        if rec["state"] in {TaskState.REMOTE_VERIFIED.value} | terminal:
+            break
+        print(f"  [re-verify {i}] {rec['state']} -> run_next_stage ...")
+        rec = gw.run_next_stage(task_id)
+        print(f"    state={rec['state']}")
+    # Step 3: Now drive the rest — real Reviewer should catch the defect
     rec = _drive_to_runtime_terminal(gw, task_id, store, terminal)
     evidence = _collect_evidence(task_id, store, budget, stages, dirs)
     events = store.events(task_id)
@@ -842,22 +887,10 @@ def _run_runtime_review_fix(dirs: dict[str, Path], meta: dict) -> tuple[bool, di
     task_approved = rec["state"] == TaskState.APPROVED.value
     # Track first vs fixed candidate SHA
     fix_events = [e for e in events if e.get("to_state") == "FIXING"]
-    first_candidate = None
+    first_candidate = new_sha  # the injected defective candidate
     fixed_candidate = rec.get("candidate_sha")
-    if fix_events:
-        # The candidate before FIXING is the first candidate
-        pre_fix_events = [e for e in events if e.get("ts", 0) < fix_events[0].get("ts", 0)]
-        for e in reversed(pre_fix_events):
-            if e.get("detail"):
-                try:
-                    detail = json.loads(e["detail"]) if isinstance(e["detail"], str) else e["detail"]
-                    if "candidate_sha" in detail:
-                        first_candidate = detail["candidate_sha"]
-                        break
-                except Exception:
-                    pass
     sha_match = (rec.get("candidate_sha") == rec.get("tested_sha") == rec.get("reviewed_sha"))
-    sha_changed = (first_candidate != fixed_candidate) if first_candidate else False
+    sha_changed = (first_candidate != fixed_candidate) if fixed_candidate else False
     evidence["protocol_passed"] = protocol_passed
     evidence["task_approved"] = task_approved
     evidence["final_state"] = rec["state"]
@@ -865,18 +898,13 @@ def _run_runtime_review_fix(dirs: dict[str, Path], meta: dict) -> tuple[bool, di
     evidence["fixed_candidate_sha"] = fixed_candidate
     evidence["sha_match"] = sha_match
     evidence["sha_changed"] = sha_changed
-    # Strict pass conditions:
-    # 1. protocol_passed (CHANGES_REQUESTED + fix + incremental review)
-    # 2. task_approved (final state == APPROVED)
-    # 3. final_state == APPROVED
-    # 4. first_candidate != fixed_candidate (fix produced new SHA)
-    # 5. candidate == tested == reviewed
+    evidence["injected_candidate"] = True
+    # Strict pass conditions
     if protocol_passed and task_approved and rec["state"] == TaskState.APPROVED.value \
             and sha_changed and sha_match:
         ok = True
         status = "PASS"
     elif task_approved and not protocol_passed:
-        # Reviewer directly APPROVED without CHANGES_REQUESTED
         ok = False
         status = "SKIPPED_PROTOCOL"
     else:
@@ -898,7 +926,8 @@ def _run_runtime_review_fix(dirs: dict[str, Path], meta: dict) -> tuple[bool, di
                      pr_content_info={"protocol_passed": protocol_passed,
                                       "task_approved": task_approved,
                                       "sha_match": sha_match,
-                                      "sha_changed": sha_changed})
+                                      "sha_changed": sha_changed,
+                                      "injected_candidate": True})
     evidence["evidence_path"] = str(ev_dir)
     return ok, evidence
 
