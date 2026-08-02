@@ -622,10 +622,41 @@ class WorkerRunner:
         # It removes terminal control sequences that tmux/CAO injects.
         import re as _re
         _ansi_re = _re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')
+        def _clean_transport(text):
+            # Remove ANSI escape codes
+            text = _ansi_re.sub('', text)
+            # Replace CRLF with LF
+            text = text.replace('\r\n', '\n')
+            # Replace literal newlines inside JSON string values with \\n
+            # (json.loads strict mode rejects literal newlines in strings)
+            # Walk through tracking in-string state
+            result = []
+            in_string = False
+            escape = False
+            for ch in text:
+                if escape:
+                    result.append(ch)
+                    escape = False
+                    continue
+                if ch == '\\':
+                    result.append(ch)
+                    escape = True
+                    continue
+                if ch == '"':
+                    in_string = not in_string
+                    result.append(ch)
+                    continue
+                if in_string and ch == '\n':
+                    result.append('\\n')
+                elif in_string and ch == '\t':
+                    result.append('\\t')
+                else:
+                    result.append(ch)
+            return ''.join(result)
         if last_message:
-            last_message = _ansi_re.sub('', last_message).replace('\r\n', '\n')
+            last_message = _clean_transport(last_message)
         if raw:
-            raw = _ansi_re.sub('', raw).replace('\r\n', '\n')
+            raw = _clean_transport(raw)
 
         obj = None
 
