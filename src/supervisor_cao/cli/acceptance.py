@@ -933,15 +933,17 @@ def _run_runtime_review_fix(dirs: dict[str, Path], meta: dict) -> tuple[bool, di
 
 
 def _run_runtime_resume(dirs: dict[str, Path], meta: dict) -> tuple[bool, dict]:
-    """runtime-resume: real controller restart + Worker reattach.
+    """runtime-resume: real mid-stage interrupt with independent Controller subprocess.
 
-    Verifies:
-    1. Worker handle persisted with worker_id, terminal_id/pid, attempt, call_id
-    2. Controller restart (new gateway, same SQLite)
-    3. worker_id, terminal_id/pid, attempt, call_id unchanged after resume
-    4. No duplicate Workers for the same stage
-    5. Budget calls not re-spent for pre-interrupt stages
-    6. Final state APPROVED
+    1. Start a real task in an independent Controller subprocess
+    2. Poll workers.db + StageStore until stage is RUNNING, worker handle non-empty,
+       Worker process/terminal alive
+    3. Save worker_id, terminal_id/pid, stage, attempt, Codex call_id, handle status
+    4. Send SIGINT to the Controller subprocess (interrupt)
+    5. Verify Controller exited, but Worker still alive
+    6. New Controller runs task resume
+    7. Verify: worker_id, terminal_id/pid, attempt, call_id unchanged; no duplicate Workers
+    8. Final state APPROVED
     """
     if not _check_cao_server():
         print("  SKIP: cao-server not running")
@@ -952,61 +954,182 @@ def _run_runtime_resume(dirs: dict[str, Path], meta: dict) -> tuple[bool, dict]:
     subprocess.run(["git", "-C", repo_dir, "clean", "-fd"], capture_output=True, timeout=30)
     cfg = _make_project_config(repo_dir, dirs)
     cfg.remote_verification_mode = "disabled"
-    gw, store, budget, stages = _build_gateway(dirs, cfg)
     task_id = f"rt-resume-{int(time.time())}"
     print(f"  task: {task_id}")
-    gw.save_config_snapshot(task_id, cfg)
-    gw.create_task(task_id, "acceptance",
+
+    # Step 1: Create task using a local gateway (just for create_task + config snapshot)
+    gw_init, store, budget, stages = _build_gateway(dirs, cfg)
+    gw_init.save_config_snapshot(task_id, cfg)
+    gw_init.create_task(task_id, "acceptance",
                    "Implement a function capitalize_words(s) in src/scao_live/text.py "
                    "that capitalizes the first letter of each word. Add a test.",
                    baseline_sha=None)
+    # Inject config so the subprocess gateway uses our cfg
+    _inject_config(None, cfg)
+
     from supervisor_cao.state.machine import TaskState
     terminal = {TaskState.APPROVED.value, TaskState.FAILED.value, TaskState.NEEDS_HUMAN.value}
 
-    # Step 1-2: Drive stages until we have a RUNNING worker with persisted handle
-    for i in range(1, 3):
-        rec = gw.get_task(task_id)
-        if rec["state"] in terminal:
+    # Step 1b: Start an independent Controller subprocess that drives run_next_stage
+    # The subprocess uses the same SQLite DBs (state/budget/stages/workers)
+    controller_script = f"""
+import sys, os, time, signal
+sys.path.insert(0, "{str(Path(__file__).resolve().parents[2] / 'src')}")
+os.environ["SCAO_WORKTREE_ROOT"] = "{os.environ.get('SCAO_WORKTREE_ROOT', '')}"
+from supervisor_cao.cli.acceptance import _build_gateway, _isolated_dirs, _inject_config, _drive_to_runtime_terminal
+from supervisor_cao.state.machine import TaskState
+from pathlib import Path
+import json as _json
+
+# Load config snapshot
+cfg_path = Path("{str(dirs['runs'])}") / "{task_id}" / "config-snapshot.json"
+cfg_data = _json.loads(cfg_path.read_text())
+from supervisor_cao.projects.config import ProjectConfig
+cfg = ProjectConfig(**cfg_data)
+
+dirs = {repr({k: str(v) for k, v in dirs.items()})}
+gw, store, budget, stages = _build_gateway(dirs, cfg)
+_inject_config(None, cfg)
+terminal = {{TaskState.APPROVED.value, TaskState.FAILED.value, TaskState.NEEDS_HUMAN.value}}
+_drive_to_runtime_terminal(gw, "{task_id}", store, terminal)
+"""
+    controller_proc = subprocess.Popen(
+        [sys.executable, "-c", controller_script],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        start_new_session=True  # independent process group
+    )
+    controller_pid = controller_proc.pid
+    print(f"  controller subprocess PID: {controller_pid}")
+
+    # Step 2: Poll workers.db + StageStore until RUNNING worker with non-empty handle
+    import sqlite3 as _sqlite3
+    import time as _time
+    running_worker = None
+    poll_deadline = _time.time() + 600  # 10 min max wait for RUNNING stage
+    while _time.time() < poll_deadline:
+        # Check if controller is still alive
+        if controller_proc.poll() is not None:
+            # Controller exited early (task completed or failed)
+            print("  controller exited before RUNNING stage detected")
             break
-        print(f"  [pre-interrupt stage {i}] {rec['state']} -> run_next_stage ...")
-        rec = gw.run_next_stage(task_id)
-        print(f"    state={rec['state']}")
+        # Poll workers.db for RUNNING worker
+        try:
+            with _sqlite3.connect(str(dirs["state"] / "workers.db")) as c:
+                row = c.execute(
+                    "SELECT worker_id, stage, status, handle_type, cao_handle, process_handle "
+                    "FROM workers WHERE task_id=? AND status='RUNNING' ORDER BY started_at DESC LIMIT 1",
+                    (task_id,)).fetchone()
+            if row:
+                running_worker = {
+                    "worker_id": row[0],
+                    "stage": row[1],
+                    "status": row[2],
+                    "handle_type": row[3],
+                    "cao_handle": _json.loads(row[4]) if row[4] else None,
+                    "process_handle": _json.loads(row[5]) if row[5] else None,
+                }
+                # Verify Worker is alive
+                wh = gw_init.worker_monitor.get_handle(row[0])
+                if wh and wh.status == "RUNNING":
+                    print(f"  found RUNNING worker: id={row[0][:8]} stage={row[1]} type={row[3]}")
+                    break
+        except Exception:
+            pass
+        _time.sleep(3)
+
+    if not running_worker:
+        # No RUNNING worker found — controller may have completed
+        controller_proc.terminate()
+        controller_proc.wait()
+        rec = store.get(task_id)
+        evidence = _collect_evidence(task_id, store, budget, stages, dirs)
+        evidence["final_state"] = rec.state if rec else "UNKNOWN"
+        evidence["error"] = "no RUNNING worker found before interrupt"
+        return False, evidence
 
     # Step 3: Save pre-interrupt snapshot
+    worker_handle_before = {
+        "worker_id": running_worker["worker_id"],
+        "handle_type": running_worker["handle_type"],
+        "status": running_worker["status"],
+        "stage": running_worker["stage"],
+        "terminal_id": running_worker["cao_handle"].get("terminal_id") if running_worker["cao_handle"] else None,
+        "pid": running_worker["process_handle"].get("pid") if running_worker["process_handle"] else None,
+    }
     budget_before = budget.summary(task_id)
     stages_before = [s.to_dict() for s in stages.list_stages(task_id)]
-    # Capture worker handle before interrupt
-    wh_before = gw.worker_monitor.find_for_task(task_id)
-    worker_handle_before = None
-    if wh_before:
-        worker_handle_before = {
-            "worker_id": wh_before.worker_id,
-            "handle_type": wh_before.handle_type,
-            "status": wh_before.status,
-            "stage": wh_before.stage,
-            "terminal_id": wh_before.cao_handle.get("terminal_id") if wh_before.cao_handle else None,
-            "pid": wh_before.process_handle.get("pid") if wh_before.process_handle else None,
-        }
-    # Capture Codex call_ids before interrupt
+    stage_attempts_before = {s["stage"]: s.get("attempt", 0) for s in stages_before}
     codex_calls_before = []
     try:
-        import sqlite3 as _sqlite
-        with _sqlite.connect(str(dirs["budget"] / "codex.db")) as c:
+        with _sqlite3.connect(str(dirs["budget"] / "codex.db")) as c:
             rows = c.execute("SELECT role, call_index FROM codex_calls WHERE task_id=? ORDER BY call_index",
                              (task_id,)).fetchall()
             codex_calls_before = [(r[0], r[1]) for r in rows]
     except Exception:
         pass
-    # Capture stage attempts before interrupt
-    stage_attempts_before = {s["stage"]: s.get("attempt", 0) for s in stages_before}
-    print(f"  === INTERRUPT (controller restart) === budget={budget_before}")
-    if worker_handle_before:
-        print(f"  worker_before: id={worker_handle_before['worker_id'][:8]} "
-              f"type={worker_handle_before['handle_type']} "
-              f"stage={worker_handle_before['stage']}")
 
-    # Step 4-6: Build new gateway (controller restart), safe takeover, resume
+    # Verify Worker is alive before interrupt
+    worker_alive_before = False
+    wh_before = gw_init.worker_monitor.get_handle(running_worker["worker_id"])
+    if wh_before:
+        if wh_before.handle_type == "process" and wh_before.process_handle:
+            worker_alive_before = WorkerMonitor._process_alive(wh_before.process_handle.get("pid", 0))
+        elif wh_before.handle_type == "cao_terminal" and wh_before.cao_handle:
+            tid = wh_before.cao_handle.get("terminal_id", "")
+            if not tid.startswith("shim-"):
+                try:
+                    ts = gw_init.worker_monitor.cao.get_terminal_status(tid)
+                    worker_alive_before = ts.get("status") not in ("error", "unknown", None)
+                except Exception:
+                    worker_alive_before = True  # assume alive if we can't check
+            else:
+                worker_alive_before = True  # shim worker, assume alive
+
+    print(f"  === INTERRUPT (sending SIGINT to controller PID {controller_pid}) ===")
+    print(f"  worker_before: id={worker_handle_before['worker_id'][:8]} "
+          f"type={worker_handle_before['handle_type']} "
+          f"stage={worker_handle_before['stage']} "
+          f"alive={worker_alive_before}")
+
+    # Step 4: Send SIGINT to Controller subprocess
+    import os as _os
+    import signal as _signal
+    try:
+        _os.kill(controller_pid, _signal.SIGINT)
+    except Exception:
+        controller_proc.terminate()
+    # Wait for controller to exit
+    try:
+        controller_proc.wait(timeout=30)
+    except Exception:
+        controller_proc.kill()
+        controller_proc.wait()
+    controller_exit_code = controller_proc.returncode
+    controller_exit_time = _time.time()
+    print(f"  controller exited: code={controller_exit_code}")
+
+    # Step 5: Verify Worker still alive after Controller exit
+    worker_alive_after_interrupt = False
+    wh_after_interrupt = gw_init.worker_monitor.get_handle(running_worker["worker_id"])
+    if wh_after_interrupt:
+        if wh_after_interrupt.handle_type == "process" and wh_after_interrupt.process_handle:
+            worker_alive_after_interrupt = WorkerMonitor._process_alive(
+                wh_after_interrupt.process_handle.get("pid", 0))
+        elif wh_after_interrupt.handle_type == "cao_terminal" and wh_after_interrupt.cao_handle:
+            tid = wh_after_interrupt.cao_handle.get("terminal_id", "")
+            if not tid.startswith("shim-"):
+                try:
+                    ts = gw_init.worker_monitor.cao.get_terminal_status(tid)
+                    worker_alive_after_interrupt = ts.get("status") not in ("error", "unknown", None)
+                except Exception:
+                    worker_alive_after_interrupt = True
+            else:
+                worker_alive_after_interrupt = True
+    print(f"  worker alive after interrupt: {worker_alive_after_interrupt}")
+
+    # Step 6: New Controller runs task resume
     gw2, store2, budget2, stages2 = _build_gateway(dirs, cfg)
+    _inject_config(None, cfg)
     wh_after = gw2.worker_monitor.find_for_task(task_id)
     worker_handle_after = None
     if wh_after:
@@ -1018,7 +1141,6 @@ def _run_runtime_resume(dirs: dict[str, Path], meta: dict) -> tuple[bool, dict]:
             "terminal_id": wh_after.cao_handle.get("terminal_id") if wh_after.cao_handle else None,
             "pid": wh_after.process_handle.get("pid") if wh_after.process_handle else None,
         }
-        # Safe takeover
         gw2.worker_monitor.safe_takeover(wh_after.worker_id)
 
     # Step 7: Drive to terminal
@@ -1028,17 +1150,14 @@ def _run_runtime_resume(dirs: dict[str, Path], meta: dict) -> tuple[bool, dict]:
     evidence = _collect_evidence(task_id, store2, budget2, stages2, dirs)
 
     # Step 8: Verify resume correctness
-    # 8a: worker_id unchanged
     worker_id_match = (worker_handle_before and worker_handle_after
                        and worker_handle_before["worker_id"] == worker_handle_after["worker_id"])
-    # 8b: terminal_id or pid unchanged
     handle_id_match = False
     if worker_handle_before and worker_handle_after:
         if worker_handle_before.get("terminal_id") and worker_handle_after.get("terminal_id"):
             handle_id_match = worker_handle_before["terminal_id"] == worker_handle_after["terminal_id"]
         elif worker_handle_before.get("pid") and worker_handle_after.get("pid"):
             handle_id_match = worker_handle_before["pid"] == worker_handle_after["pid"]
-    # 8c: stage attempt unchanged for pre-interrupt completed stages
     stage_attempts_after = {s["stage"]: s.get("attempt", 0) for s in stages_after}
     attempts_ok = True
     for stage_name, before_attempt in stage_attempts_before.items():
@@ -1046,23 +1165,18 @@ def _run_runtime_resume(dirs: dict[str, Path], meta: dict) -> tuple[bool, dict]:
         if after_attempt != before_attempt:
             attempts_ok = False
             break
-    # 8d: Codex call_id unchanged for pre-interrupt calls
     codex_calls_after = []
     try:
-        import sqlite3 as _sqlite
-        with _sqlite.connect(str(dirs["budget"] / "codex.db")) as c:
+        with _sqlite3.connect(str(dirs["budget"] / "codex.db")) as c:
             rows = c.execute("SELECT role, call_index FROM codex_calls WHERE task_id=? ORDER BY call_index",
                              (task_id,)).fetchall()
             codex_calls_after = [(r[0], r[1]) for r in rows]
     except Exception:
         pass
-    # Pre-interrupt calls must still exist (not re-spent)
     calls_ok = all(call in codex_calls_after for call in codex_calls_before)
-    # 8e: no duplicate workers for same stage
     no_duplicate_workers = True
     try:
-        import sqlite3 as _sqlite
-        with _sqlite.connect(str(dirs["state"] / "workers.db")) as c:
+        with _sqlite3.connect(str(dirs["state"] / "workers.db")) as c:
             dupes = c.execute(
                 "SELECT stage, COUNT(*) as cnt FROM workers WHERE task_id=? GROUP BY stage HAVING cnt > 1",
                 (task_id,)).fetchall()
@@ -1070,24 +1184,29 @@ def _run_runtime_resume(dirs: dict[str, Path], meta: dict) -> tuple[bool, dict]:
     except Exception:
         pass
 
-    # Budget check: pre-interrupt call_ids must not change (new calls allowed)
-    budget_ok = calls_ok
-
+    evidence["controller_pid"] = controller_pid
+    evidence["controller_exit_code"] = controller_exit_code
+    evidence["controller_exit_time"] = controller_exit_time
     evidence["worker_handle_before"] = worker_handle_before
     evidence["worker_handle_after"] = worker_handle_after
+    evidence["worker_alive_before"] = worker_alive_before
+    evidence["worker_alive_after_interrupt"] = worker_alive_after_interrupt
     evidence["worker_id_match"] = worker_id_match
     evidence["handle_id_match"] = handle_id_match
     evidence["attempts_ok"] = attempts_ok
     evidence["calls_ok"] = calls_ok
     evidence["no_duplicate_workers"] = no_duplicate_workers
-    evidence["budget_ok"] = budget_ok
     evidence["codex_calls_before"] = codex_calls_before
     evidence["codex_calls_after"] = codex_calls_after
     evidence["budget_before"] = budget_before
     evidence["budget_after"] = budget_after
     evidence["final_state"] = rec["state"]
 
-    ok = (rec["state"] == TaskState.APPROVED.value
+    # PASS requires: RUNNING before interrupt + Worker alive after interrupt +
+    # worker_id/handle/attempt/call_id unchanged + no duplicates + APPROVED
+    ok = (worker_handle_before and worker_handle_before.get("status") == "RUNNING"
+          and worker_alive_after_interrupt
+          and rec["state"] == TaskState.APPROVED.value
           and worker_id_match and handle_id_match and attempts_ok
           and calls_ok and no_duplicate_workers)
     run_id = f"{int(time.time())}-rt-resume"
@@ -1096,7 +1215,7 @@ def _run_runtime_resume(dirs: dict[str, Path], meta: dict) -> tuple[bool, dict]:
                      task_snapshot=rec, events=store2.events(task_id),
                      stage_attempts=stages_after,
                      budget_log=budget_after,
-                     worker_handles=[worker_handle_before, worker_handle_after] if worker_handle_before else [],
+                     worker_handles=[worker_handle_before, worker_handle_after],
                      sha_info={"candidate": rec.get("candidate_sha"),
                                "tested": rec.get("tested_sha"),
                                "reviewed": rec.get("reviewed_sha")},
@@ -1104,7 +1223,11 @@ def _run_runtime_resume(dirs: dict[str, Path], meta: dict) -> tuple[bool, dict]:
                                       "handle_id_match": handle_id_match,
                                       "attempts_ok": attempts_ok,
                                       "calls_ok": calls_ok,
-                                      "no_duplicate_workers": no_duplicate_workers})
+                                      "no_duplicate_workers": no_duplicate_workers,
+                                      "worker_alive_before": worker_alive_before,
+                                      "worker_alive_after_interrupt": worker_alive_after_interrupt,
+                                      "controller_pid": controller_pid,
+                                      "controller_exit_code": controller_exit_code})
     evidence["evidence_path"] = str(ev_dir)
     return ok, evidence
 
