@@ -1033,6 +1033,7 @@ def _run_runtime_resume(dirs: dict[str, Path], meta: dict) -> tuple[bool, dict]:
     7. Verify: worker_id, terminal_id/pid, attempt, call_id unchanged; no duplicate Workers
     8. Final state APPROVED
     """
+    from supervisor_cao.mcp.worker_monitor import WorkerMonitor
     if not _check_cao_server():
         print("  SKIP: cao-server not running")
         return False, {"error": "cao-server not running"}
@@ -1095,9 +1096,7 @@ _drive_to_runtime_terminal(gw, "{task_id}", store, terminal)
     import time as _time
     running_worker = None
     poll_deadline = _time.time() + 600  # 10 min max wait for RUNNING stage
-    _poll_iter = 0
     while _time.time() < poll_deadline:
-        _poll_iter += 1
         # Check if controller is still alive
         _poll_rc = controller_proc.poll()
         if _poll_rc is not None:
@@ -1123,8 +1122,6 @@ _drive_to_runtime_terminal(gw, "{task_id}", store, terminal)
                     "SELECT worker_id, stage, status, handle_type, cao_handle, process_handle "
                     "FROM workers WHERE task_id=? AND status='RUNNING' ORDER BY started_at DESC LIMIT 1",
                     (task_id,)).fetchone()
-            if _poll_iter <= 5 or _poll_iter % 10 == 0:
-                print(f"  poll#{_poll_iter} poll_rc={_poll_rc} row={'Y' if row else 'N'}")
             if row:
                 running_worker = {
                     "worker_id": row[0],
@@ -1135,9 +1132,8 @@ _drive_to_runtime_terminal(gw, "{task_id}", store, terminal)
                     "process_handle": json.loads(row[5]) if row[5] else None,
                 }
                 break  # found a RUNNING worker — proceed to interrupt
-        except Exception as e:
-            if _poll_iter <= 3:
-                print(f"  poll#{_poll_iter} db error: {e}")
+        except Exception:
+            pass
         _time.sleep(3)
 
     if not running_worker:
