@@ -336,3 +336,26 @@ class StateStore:
         with self._lock, self._conn() as c:
             rows = c.execute("SELECT * FROM events WHERE task_id=? ORDER BY id", (task_id,)).fetchall()
         return [dict(r) for r in rows]
+
+    def inject_candidate(self, task_id: str, new_sha: str,
+                         from_state: TaskState) -> TaskRecord:
+        """ACCEPTANCE ONLY: inject a controlled candidate for review-fix testing.
+
+        This is an audited entry point — NOT for production use. It records a
+        controlled_candidate_injection event and clears tested/reviewed SHAs
+        (the new candidate has not been tested or reviewed yet).
+        """
+        with self._lock, self._conn() as c:
+            row = c.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+            if not row:
+                raise KeyError(f"task not found: {task_id}")
+            from_str = row["state"]
+            c.execute(
+                "UPDATE tasks SET candidate_sha=?, tested_sha=NULL, reviewed_sha=NULL, "
+                "state=?, updated_at=? WHERE task_id=?",
+                (new_sha, from_state.value, time.time(), task_id))
+            self._log_event(c, task_id, "CONTROLLED_CANDIDATE_INJECTION",
+                            from_str, from_state.value,
+                            {"new_sha": new_sha, "reason": "acceptance_review_fix"})
+            c.commit()
+        return self.get(task_id)
