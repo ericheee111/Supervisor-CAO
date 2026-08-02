@@ -1095,9 +1095,12 @@ _drive_to_runtime_terminal(gw, "{task_id}", store, terminal)
     import time as _time
     running_worker = None
     poll_deadline = _time.time() + 600  # 10 min max wait for RUNNING stage
+    _poll_iter = 0
     while _time.time() < poll_deadline:
+        _poll_iter += 1
         # Check if controller is still alive
-        if controller_proc.poll() is not None:
+        _poll_rc = controller_proc.poll()
+        if _poll_rc is not None:
             # Controller exited early (task completed or failed)
             print("  controller exited before RUNNING stage detected")
             # Drain stdout/stderr to diagnose why the controller exited early.
@@ -1120,6 +1123,8 @@ _drive_to_runtime_terminal(gw, "{task_id}", store, terminal)
                     "SELECT worker_id, stage, status, handle_type, cao_handle, process_handle "
                     "FROM workers WHERE task_id=? AND status='RUNNING' ORDER BY started_at DESC LIMIT 1",
                     (task_id,)).fetchone()
+            if _poll_iter <= 5 or _poll_iter % 10 == 0:
+                print(f"  poll#{_poll_iter} poll_rc={_poll_rc} row={'Y' if row else 'N'}")
             if row:
                 running_worker = {
                     "worker_id": row[0],
@@ -1129,13 +1134,10 @@ _drive_to_runtime_terminal(gw, "{task_id}", store, terminal)
                     "cao_handle": _json.loads(row[4]) if row[4] else None,
                     "process_handle": _json.loads(row[5]) if row[5] else None,
                 }
-                # Verify Worker is alive
-                wh = gw_init.worker_monitor.get_handle(row[0])
-                if wh and wh.status == "RUNNING":
-                    print(f"  found RUNNING worker: id={row[0][:8]} stage={row[1]} type={row[3]}")
-                    break
-        except Exception:
-            pass
+                break  # found a RUNNING worker — proceed to interrupt
+        except Exception as e:
+            if _poll_iter <= 3:
+                print(f"  poll#{_poll_iter} db error: {e}")
         _time.sleep(3)
 
     if not running_worker:
