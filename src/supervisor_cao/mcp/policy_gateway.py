@@ -768,12 +768,21 @@ class PolicyGateway:
         from supervisor_cao.workers.worktrees import current_sha
         # Use the candidate_sha from the Worker's artifact first (the executor
         # commits and reports the real SHA). Fall back to git HEAD.
+        # Fix .git path (Windows binary may have rewritten it with Windows path)
+        from supervisor_cao.mcp.worker_runner import _fix_worktree_git_path
+        try:
+            _fix_worktree_git_path(executor_wt)
+        except Exception:
+            pass  # best-effort fix
         real_sha = impl.get("candidate_sha") or current_sha(executor_wt)
         if not real_sha:
             raise PolicyError("FIXING: cannot read git HEAD from worktree")
         # NO_PROGRESS check: fix must produce a new SHA (different from old candidate)
         # Only fail if BOTH the artifact SHA and git HEAD match the old candidate
-        git_sha = current_sha(executor_wt)
+        try:
+            git_sha = current_sha(executor_wt)
+        except Exception:
+            git_sha = None  # git path may be corrupted, rely on artifact SHA
         if real_sha == fix_base and (not git_sha or git_sha == fix_base):
             self.stages.fail_stage(task_id, stage, error="NO_PROGRESS: fix did not produce a new commit")
             self.store.transition(task_id, TaskState.NEEDS_HUMAN,
